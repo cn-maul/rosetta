@@ -1,7 +1,6 @@
 package rosetta
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,20 +8,17 @@ import (
 	"sync"
 )
 
-//go:embed registry_data/models.json
-var builtinModelsJSON []byte
-
-// Registry merges model metadata from three sources, in descending
-// priority: manual configuration, remote discovery (GET /models), and the
-// built-in knowledge base. Higher layers override lower ones field by
-// field; empty fields inherit from the layer below.
+// Registry merges model metadata from two sources, in descending
+// priority: manual configuration (WithModelInfo / WithModelsFile) and
+// remote discovery (GET /models via ListModels). Higher layers override
+// lower ones field by field; empty fields inherit from the layer below.
 //
-// Following the "presets are reliable, custom models are not guessed"
-// principle: entries learned purely from /models carry Known=false and no
-// inferred capability data.
+// Following the "custom models are not guessed" principle: entries
+// learned purely from /models carry Known=false and no inferred
+// capability data, so thinking gating and context validation only apply
+// to what was explicitly declared.
 type Registry struct {
 	mu       sync.RWMutex
-	builtin  map[string]ModelInfo
 	remote   map[string]ModelInfo
 	manual   map[string]ModelInfo
 	alias    map[string]string
@@ -31,29 +27,16 @@ type Registry struct {
 
 func newRegistry() *Registry {
 	r := &Registry{
-		builtin: map[string]ModelInfo{},
-		remote:  map[string]ModelInfo{},
-		manual:  map[string]ModelInfo{},
-		alias:   map[string]string{},
-	}
-	var doc struct {
-		Models []ModelInfo `json:"models"`
-	}
-	if err := json.Unmarshal(builtinModelsJSON, &doc); err == nil {
-		for _, m := range doc.Models {
-			if m.ID == "" {
-				continue
-			}
-			m.Known = true
-			r.builtin[m.ID] = m
-		}
+		remote: map[string]ModelInfo{},
+		manual: map[string]ModelInfo{},
+		alias:  map[string]string{},
 	}
 	r.rebuild()
 	return r
 }
 
-// LoadFile loads manual model configuration from a JSON file with the
-// same schema as the built-in knowledge base ({"models":[...]}).
+// LoadFile loads manual model configuration from a JSON file:
+// {"models":[...]} with the same fields as ModelInfo.
 func (r *Registry) LoadFile(path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -108,10 +91,10 @@ func (r *Registry) SetRemote(infos []ModelInfo) {
 
 // rebuild recomputes the merged view and alias index. Callers hold mu.
 func (r *Registry) rebuild() {
-	resolved := make(map[string]ModelInfo, len(r.builtin)+len(r.remote)+len(r.manual))
+	resolved := make(map[string]ModelInfo, len(r.remote)+len(r.manual))
 	alias := make(map[string]string)
-	add := func(layer string, src map[string]ModelInfo) {
-		for id, m := range src {
+	for _, layer := range []map[string]ModelInfo{r.remote, r.manual} {
+		for id, m := range layer {
 			if prev, ok := resolved[id]; ok {
 				resolved[id] = mergeInfo(m, prev)
 			} else {
@@ -124,9 +107,6 @@ func (r *Registry) rebuild() {
 			}
 		}
 	}
-	add("builtin", r.builtin)
-	add("remote", r.remote)
-	add("manual", r.manual)
 	r.resolved = resolved
 	r.alias = alias
 }

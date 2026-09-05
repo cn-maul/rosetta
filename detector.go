@@ -6,55 +6,18 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 )
 
-// knownHosts maps well-known API hosts to their protocol. Hosts not in
-// this table fall through to active probing.
-var knownHosts = map[string]Protocol{
-	"api.openai.com":         ProtoOpenAIChat,
-	"api.anthropic.com":      ProtoAnthropic,
-	"api.deepseek.com":       ProtoOpenAIChat,
-	"api.moonshot.cn":        ProtoOpenAIChat,
-	"api.moonshot.ai":        ProtoOpenAIChat,
-	"dashscope.aliyuncs.com": ProtoOpenAIChat,
-	"open.bigmodel.cn":       ProtoOpenAIChat,
-	"api.siliconflow.cn":     ProtoOpenAIChat,
-	"openrouter.ai":          ProtoOpenAIChat,
-	"api.groq.com":           ProtoOpenAIChat,
-	"api.together.xyz":       ProtoOpenAIChat,
-	"api.fireworks.ai":       ProtoOpenAIChat,
-	"api.x.ai":               ProtoOpenAIChat,
-	"api.mistral.ai":         ProtoOpenAIChat,
-	"router.huggingface.co":  ProtoOpenAIChat,
-}
-
-// DetectProtocol determines which protocol an endpoint speaks:
-//
-//  1. known-host table (no network);
-//  2. active probe of GET /models — OpenAI-style catalogs carry
-//     object:"model" entries, Anthropic's carry type:"model";
-//  3. falls back to OpenAI Chat, the de-facto compatibility lingua
-//     franca (Responses-capable endpoints also serve /chat/completions).
-//
-// Both /v1/responses and /v1/chat/completions live behind the OpenAI
-// family, so detection cannot (and need not) separate them; override with
-// WithProtocol when Responses semantics are required.
+// DetectProtocol determines which protocol an endpoint speaks by active
+// probing of GET /models: OpenAI-style catalogs carry object:"model"
+// entries, Anthropic's carry type:"model". Both auth styles are tried
+// (Bearer first, then x-api-key). It falls back to OpenAI Chat, the
+// de-facto compatibility lingua franca — Responses-capable endpoints
+// also serve /chat/completions. Override with WithProtocol when
+// Responses semantics are required or probing is impossible.
 func DetectProtocol(ctx context.Context, endpoint, apiKey string) (Protocol, error) {
-	if p, ok := detectKnownHost(endpoint); ok {
-		return p, nil
-	}
 	return detectByProbe(ctx, endpoint, apiKey)
-}
-
-func detectKnownHost(endpoint string) (Protocol, bool) {
-	u, err := url.Parse(trimTrailingSlash(endpoint))
-	if err != nil {
-		return "", false
-	}
-	p, ok := knownHosts[u.Hostname()]
-	return p, ok
 }
 
 // detectByProbe probes GET /models, first with Bearer auth then with

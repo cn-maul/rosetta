@@ -26,7 +26,7 @@ import (
 
 func main() {
 	client, err := rosetta.NewClient(
-		rosetta.WithVendor("deepseek"), // 或 rosetta.WithEndpoint(url)
+		rosetta.WithEndpoint("https://api.deepseek.com/v1"),
 		rosetta.WithAPIKey(os.Getenv("DEEPSEEK_API_KEY")),
 	)
 	if err != nil {
@@ -52,7 +52,7 @@ func main() {
 |---|---|
 | [基础指南](docs/guide.md) | 客户端配置、消息与工具调用、thinking、上下文校验、错误处理、全部选项 |
 | [流式响应](docs/streaming.md) | 统一事件模型、迭代惯用法、中断恢复、工具调用流 |
-| [模型体系](docs/models.md) | 内置知识库与三级合并、协议探测、厂商预设、能力门控 |
+| [模型体系](docs/models.md) | 两级合并注册表、协议探测、能力声明与门控 |
 | [协议与兼容](docs/protocols.md) | 三协议映射、自动降级、quirks、脏数据处理、重试策略 |
 | [用量统计](docs/usage-stats.md) | Usage 字段、Tracker 接口、Snapshot 查询 |
 | [设计文档](PLAN.md) | 架构决策、里程碑、参考研究 |

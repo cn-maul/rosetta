@@ -11,7 +11,7 @@ client, err := rosetta.NewClient(
 )
 ```
 
-- endpoint 与 API key 必须可用：显式给出、由 `WithVendor` 预设补全、或使用所选协议的官方默认端点。
+- endpoint 与 API key 必须可用：显式给出，或使用所选协议的官方默认端点。
 - endpoint 规则：带版本路径（`/v1`、`/api/paas/v4`）原样保留；裸主机自动补 `/v1`。
 - 凭证发送方式由协议决定：OpenAI 系 `Authorization: Bearer`，Anthropic `x-api-key`（同时附带 Bearer 以兼容网关）。
 - `Client` 并发安全，可多 goroutine 共享；`Stream` 不并发。
@@ -22,8 +22,7 @@ client, err := rosetta.NewClient(
 |---|---|---|
 | `WithEndpoint(url)` | 协议官方地址 | API 基地址，见上方规则 |
 | `WithAPIKey(key)` | 无（必填） | 凭证 |
-| `WithProtocol(p)` | `ProtoOpenAIChat` | `ProtoOpenAIChat` / `ProtoOpenAIResponses` / `ProtoAnthropic`；也可由 vendor 预设或 `DetectClient` 决定 |
-| `WithVendor(name)` | 无 | 14 家厂商预设（endpoint+协议+quirks 一次设置），显式选项永远优先；见[模型体系](models.md) |
+| `WithProtocol(p)` | `ProtoOpenAIChat` | `ProtoOpenAIChat` / `ProtoOpenAIResponses` / `ProtoAnthropic`；也可由 `DetectClient` 探测决定 |
 | `WithHTTPClient(c)` | `&http.Client{}` | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式 |
 | `WithTimeout(d)` | 无 | 仅约束非流式调用（Chat / ListModels / ModelInfo） |
 | `WithMaxRetries(n)` | 2 | 可重试失败（网络错误、408/429/5xx/529）的重试次数，见[重试策略](protocols.md#重试策略) |

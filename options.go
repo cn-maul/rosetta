@@ -28,7 +28,6 @@ type settings struct {
 	endpoint         string
 	apiKey           string
 	protocol         Protocol
-	vendor           string
 	httpClient       *http.Client
 	timeout          time.Duration
 	maxRetries       int
@@ -71,18 +70,9 @@ func WithAPIKey(v string) Option {
 }
 
 // WithProtocol forces a wire protocol. When omitted, it resolves from
-// WithVendor, then auto-detection (DetectClient), then OpenAI Chat.
+// auto-detection (DetectClient), then OpenAI Chat.
 func WithProtocol(p Protocol) Option {
 	return func(s *settings) { s.protocol = p }
-}
-
-// WithVendor selects a built-in provider preset (deepseek, moonshot,
-// qwen, zhipu, siliconflow, openrouter, groq, together, fireworks, xai,
-// mistral, ollama, openai, anthropic). It fills in the default endpoint,
-// protocol and quirks for anything the caller left unset. See
-// VendorNames for the full list.
-func WithVendor(name string) Option {
-	return func(s *settings) { s.vendor = normalizeVendor(name) }
 }
 
 // WithModelInfo installs manual model metadata (highest merge priority in

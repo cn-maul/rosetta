@@ -3,7 +3,6 @@ package rosetta
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
@@ -26,29 +25,12 @@ type Client struct {
 	registry *Registry
 }
 
-// buildSettings applies options and resolves vendor/protocol/endpoint
-// defaults. Explicit options always win over vendor presets.
+// buildSettings applies options and resolves protocol/endpoint defaults.
 func buildSettings(opts []Option) (*settings, error) {
 	st := defaultSettings()
 	for _, o := range opts {
 		if o != nil {
 			o(st)
-		}
-	}
-	if st.vendor != "" {
-		v, ok := builtinVendors[st.vendor]
-		if !ok {
-			return nil, fmt.Errorf("rosetta: unknown vendor %q (available: %s)",
-				st.vendor, strings.Join(VendorNames(), ", "))
-		}
-		if st.endpoint == "" {
-			st.endpoint = v.Endpoint
-		}
-		if st.protocol == "" {
-			st.protocol = v.Protocol
-		}
-		if !st.quirksSet {
-			st.quirks = v.Quirks
 		}
 	}
 	if st.protocol == "" {
@@ -66,8 +48,7 @@ func buildSettings(opts []Option) (*settings, error) {
 }
 
 // NewClient builds a Client from options. Endpoint and API key are
-// required — directly, via WithVendor, or through the per-protocol
-// official default.
+// required — explicitly or through the per-protocol official default.
 func NewClient(opts ...Option) (*Client, error) {
 	st, err := buildSettings(opts)
 	if err != nil {
@@ -196,7 +177,7 @@ func (c *Client) RefreshModels(ctx context.Context) ([]ModelInfo, error) {
 }
 
 // ModelInfo returns merged metadata for one model id (aliases accepted).
-// If the model is unknown to manual+builtin layers, a best-effort remote
+// If the model is unknown to the manual layer, a best-effort remote
 // discovery is attempted before failing with ErrUnknownModel.
 func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
 	if _, ok := c.registry.Lookup(id); !ok {

@@ -11,7 +11,7 @@ import (
 // Sentinel errors returned by the SDK. Use errors.Is to match.
 var (
 	// ErrNoEndpoint is returned when no endpoint could be determined.
-	ErrNoEndpoint = errors.New("rosetta: endpoint is required (WithEndpoint/WithVendor)")
+	ErrNoEndpoint = errors.New("rosetta: endpoint is required (WithEndpoint)")
 	// ErrNoAPIKey is returned when no API key was configured. Local
 	// servers that ignore auth still expect a non-empty placeholder.
 	ErrNoAPIKey = errors.New("rosetta: api key is required (WithAPIKey)")

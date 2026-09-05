@@ -1,10 +1,10 @@
-// Command models demonstrates the model registry: vendor presets,
-// protocol detection and merged model metadata.
+// Command models demonstrates the model registry: protocol detection,
+// manual capability configuration and remote catalog discovery.
 //
-// Optional environment:
+// Required environment:
 //
 //	ROSETTA_API_KEY   your key (local servers accept a placeholder)
-//	ROSETTA_ENDPOINT  overrides the vendor preset endpoint
+//	ROSETTA_ENDPOINT  the API base URL, e.g. https://api.deepseek.com/v1
 package main
 
 import (
@@ -19,39 +19,45 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// 1) Vendor preset: endpoint + protocol in one line.
-	endpoint := os.Getenv("ROSETTA_ENDPOINT")
-	opts := []rosetta.Option{rosetta.WithAPIKey(os.Getenv("ROSETTA_API_KEY"))}
-	if endpoint == "" {
-		opts = append(opts, rosetta.WithVendor("deepseek"))
-	} else {
-		opts = append(opts, rosetta.WithEndpoint(endpoint))
-	}
-
-	// 2) Protocol auto-detection: known-host table -> /models probe ->
-	//    OpenAI Chat fallback.
-	client, err := rosetta.DetectClient(ctx, opts...)
+	// 1) Protocol auto-detection: probe /models, then classify the
+	//    catalog shape (OpenAI vs Anthropic); falls back to OpenAI Chat.
+	client, err := rosetta.DetectClient(ctx,
+		rosetta.WithEndpoint(os.Getenv("ROSETTA_ENDPOINT")),
+		rosetta.WithAPIKey(os.Getenv("ROSETTA_API_KEY")),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("endpoint=%s protocol=%s\n", client.Endpoint(), client.Protocol())
 
-	// 3) Merged model metadata: manual > remote > builtin knowledge base.
-	for _, id := range []string{"deepseek-reasoner", "gpt-4o", "claude-sonnet-4-5"} {
-		info, err := client.ModelInfo(ctx, id)
-		if err != nil {
-			fmt.Printf("- %s: unknown (%v)\n", id, err)
-			continue
-		}
+	// 2) Manual capability declarations drive gating and validation.
+	client, _ = rosetta.NewClient(
+		rosetta.WithEndpoint(client.Endpoint()),
+		rosetta.WithAPIKey(os.Getenv("ROSETTA_API_KEY")),
+		rosetta.WithProtocol(client.Protocol()),
+		rosetta.WithModelInfo(rosetta.ModelInfo{
+			ID:               "my-model",
+			ContextWindow:    131072,
+			MaxOutputTokens:  8192,
+			SupportsThinking: true,
+		}),
+	)
+	if info, err := client.ModelInfo(ctx, "my-model"); err == nil {
 		fmt.Printf("- %s: context=%d max_out=%d thinking=%v known=%v\n",
 			info.ID, info.ContextWindow, info.MaxOutputTokens, info.SupportsThinking, info.Known)
 	}
 
-	// 4) Remote catalog discovery merges into the registry.
+	// 3) Remote catalog discovery merges into the registry (Known=false).
 	models, err := client.ListModels(ctx)
 	if err != nil {
 		log.Println("list models skipped:", err)
 		return
 	}
-	fmt.Printf("remote catalog: %d models (merged view)\n", len(models))
+	fmt.Printf("remote catalog: %d models\n", len(models))
+	for i, m := range models {
+		if i >= 5 {
+			break
+		}
+		fmt.Printf("- %s (known=%v)\n", m.ID, m.Known)
+	}
 }
