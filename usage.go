@@ -8,14 +8,14 @@ import (
 
 // Usage is token accounting for one request, unified across protocols.
 type Usage struct {
-	InputTokens  int64
-	OutputTokens int64
-	TotalTokens  int64
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	TotalTokens  int64 `json:"total_tokens"`
 	// CachedInputTokens counts input tokens served from cache (OpenAI
 	// prompt_tokens_details.cached_tokens; Anthropic cache_read_input_tokens).
-	CachedInputTokens int64
+	CachedInputTokens int64 `json:"cached_input_tokens"`
 	// ReasoningTokens counts tokens spent on thinking (where reported).
-	ReasoningTokens int64
+	ReasoningTokens int64 `json:"reasoning_tokens"`
 }
 
 // IsZero reports whether no token accounting was reported at all.

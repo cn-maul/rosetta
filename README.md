@@ -59,8 +59,6 @@ func main() {
 
 可运行示例见 [examples/](examples/)：chat / stream / responses / anthropic / usage / models。
 
-另有本地 Web 测试台（添加服务商/模型、上下文与输出配置、流式对话、用量面板）：`go run ./webui` 后访问 http://127.0.0.1:8787。
-
 ## 许可证
 
 MIT，见 [LICENSE](LICENSE)。
