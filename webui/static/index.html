@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rosetta Playground</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --panel2: #1d2130; --border: #2a2f42;
+    --text: #e6e8ef; --muted: #8b90a3; --accent: #6c8cff; --accent2: #8ad0ff;
+    --ok: #4cc38a; --err: #ff7a7a; --think: #b48cff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.55 "Segoe UI", "Microsoft YaHei", sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 10px 18px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+  header h1 { font-size: 16px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .layout { flex: 1; display: grid; grid-template-columns: 330px 1fr; min-height: 0; }
+  aside { border-right: 1px solid var(--border); overflow-y: auto; padding: 12px; background: var(--panel); }
+  main { display: flex; flex-direction: column; min-height: 0; }
+  .card { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+  .card h2 { font-size: 13px; margin: 0 0 10px; color: var(--accent2); letter-spacing: .5px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  input, select, textarea { width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font: inherit; }
+  textarea { resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  .row { display: flex; gap: 8px; } .row > * { flex: 1; }
+  button { background: var(--accent); border: none; color: #fff; border-radius: 6px;
+    padding: 7px 14px; font: inherit; cursor: pointer; }
+  button:hover { filter: brightness(1.15); }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 3px 9px; font-size: 12px; }
+  button.ghost:hover { color: var(--text); border-color: var(--accent); }
+  button.danger:hover { color: var(--err); border-color: var(--err); }
+  .list { margin-top: 8px; }
+  .item { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid var(--border);
+    border-radius: 8px; margin-bottom: 6px; background: var(--panel); }
+  .item .meta { flex: 1; min-width: 0; }
+  .item .name { font-weight: 600; font-size: 13px; }
+  .item .desc { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { font-size: 10px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 12px; }
+  .stats div { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; }
+  .stats b { color: var(--accent2); font-weight: 600; }
+  .toolbar { display: flex; gap: 8px; padding: 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: flex-end; }
+  .toolbar .field { display: flex; flex-direction: column; }
+  .toolbar label { margin: 0 0 3px; }
+  .toolbar input, .toolbar select { width: auto; min-width: 90px; }
+  #providerSel { min-width: 170px; } #modelInput { min-width: 170px; }
+  #msgs { flex: 1; overflow-y: auto; padding: 18px 22px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 78%; border-radius: 12px; padding: 10px 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: #2b3a67; }
+  .msg.assistant { align-self: flex-start; background: var(--panel2); border: 1px solid var(--border); }
+  .msg.error { align-self: center; background: #3a1f24; border: 1px solid var(--err); color: var(--err); font-size: 13px; }
+  details.think { margin-bottom: 6px; }
+  details.think summary { cursor: pointer; color: var(--think); font-size: 12px; user-select: none; }
+  details.think .body { color: var(--muted); font-size: 12.5px; border-left: 2px solid var(--think);
+    padding: 4px 10px; margin-top: 6px; white-space: pre-wrap; }
+  .composer { border-top: 1px solid var(--border); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .composer .inputrow { display: flex; gap: 8px; align-items: flex-end; }
+  .composer textarea { flex: 1; min-height: 46px; max-height: 160px; }
+  .usagebar { font-size: 12px; color: var(--muted); display: flex; gap: 18px; }
+  .usagebar b { color: var(--accent2); font-weight: 600; }
+  .empty { color: var(--muted); text-align: center; margin-top: 40px; }
+  .cursor { display: inline-block; width: 7px; height: 15px; background: var(--accent2);
+    vertical-align: text-bottom; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Rosetta Playground</h1>
+  <span class="sub">本地测试台 · OpenAI Chat / Responses / Anthropic 三协议</span>
+</header>
+<div class="layout">
+  <aside>
+    <div class="card">
+      <h2>服务商</h2>
+      <label>名称</label><input id="pName" placeholder="例如 DeepSeek">
+      <label>厂商预设（可选，自动填端点和协议）</label>
+      <select id="pVendor"><option value="">自定义</option></select>
+      <label>Endpoint</label><input id="pEndpoint" placeholder="https://api.deepseek.com/v1">
+      <label>API Key</label><input id="pKey" type="password" placeholder="sk-...">
+      <label>协议</label>
+      <select id="pProto">
+        <option value="">跟随预设 / 默认 openai-chat</option>
+        <option value="openai-chat">openai-chat</option>
+        <option value="openai-responses">openai-responses</option>
+        <option value="anthropic">anthropic</option>
+      </select>
+      <div style="margin-top:10px"><button id="addProvider">添加服务商</button></div>
+      <div class="list" id="providerList"></div>
+    </div>
+    <div class="card">
+      <h2>模型（能力上限声明）</h2>
+      <label>所属服务商</label><select id="mProvider"></select>
+      <label>模型 ID</label><input id="mId" placeholder="deepseek-chat">
+      <div class="row">
+        <div><label>上下文窗口</label><input id="mCtx" type="number" min="0" placeholder="131072"></div>
+        <div><label>输出上限</label><input id="mOut" type="number" min="0" placeholder="8192"></div>
+      </div>
+      <label style="display:flex;gap:6px;align-items:center;margin-top:8px">
+        <input type="checkbox" id="mThink" style="width:auto"> 支持思考
+      </label>
+      <div style="margin-top:10px"><button id="addModel">添加模型</button></div>
+      <div class="list" id="modelList"></div>
+    </div>
+    <div class="card">
+      <h2>累计用量（服务端）</h2>
+      <div class="stats" id="stats"></div>
+    </div>
+  </aside>
+  <main>
+    <div class="toolbar">
+      <div class="field"><label>服务商</label><select id="providerSel"></select></div>
+      <div class="field"><label>模型</label><input id="modelInput" list="modelDL" placeholder="模型 ID"><datalist id="modelDL"></datalist></div>
+      <div class="field"><label>思考</label>
+        <select id="thinking"><option value="">关闭</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select>
+      </div>
+      <div class="field"><label>输出上限</label><input id="maxTok" type="number" min="0" placeholder="默认"></div>
+      <div class="field"><label>温度</label><input id="temp" type="number" step="0.1" min="0" max="2" placeholder="默认"></div>
+      <div class="field"><label>系统提示</label><input id="sysPrompt" placeholder="可选" style="min-width:180px"></div>
+      <div class="field"><label>流式</label><input type="checkbox" id="streamChk" checked style="width:auto;margin:8px 0"></div>
+      <button class="ghost" id="newChat">新对话</button>
+    </div>
+    <div id="msgs"><div class="empty">添加服务商与模型后开始对话</div></div>
+    <div class="composer">
+      <div class="usagebar" id="usageBar"><span>最近一次：<b>—</b></span><span>服务端累计：<b id="cumTotal">—</b></span></div>
+      <div class="inputrow">
+        <textarea id="input" placeholder="输入消息，Ctrl+Enter 发送"></textarea>
+        <button id="send">发送</button>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let state = { providers: [], models: [] };
+let history = [];          // [{role, content, thinking}]
+let lastUsage = null;      // cumulative tokens of the current conversation
+
+const VENDORS = ["openai","anthropic","deepseek","moonshot","qwen","zhipu","siliconflow",
+                 "openrouter","groq","together","fireworks","xai","mistral","ollama"];
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+async function refresh() {
+  state = await api("/api/state");
+  renderProviders(); renderModels(); renderStats(); renderSelectors();
+}
+
+function renderProviders() {
+  $("providerList").innerHTML = state.providers.map(p => `
+    <div class="item">
+      <div class="meta">
+        <div class="name">${esc(p.name)} <span class="badge">${esc(p.protocol || "openai-chat")}</span></div>
+        <div class="desc">${esc(p.vendor ? "vendor: " + p.vendor : p.endpoint)}</div>
+      </div>
+      <button class="ghost" onclick="testProvider('${p.id}')">测试</button>
+      <button class="ghost danger" onclick="delProvider('${p.id}')">删</button>
+    </div>`).join("") || '<div class="desc" style="color:var(--muted)">暂无</div>';
+  $("pVendor").innerHTML = '<option value="">自定义</option>' +
+    VENDORS.map(v => `<option>${v}</option>`).join("");
+  const opts = state.providers.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
+  $("providerSel").innerHTML = opts || "<option value=''>未配置</option>";
+  $("mProvider").innerHTML = opts || "<option value=''>未配置</option>";
+}
+
+function renderModels() {
+  $("modelList").innerHTML = state.models.map(m => `
+    <div class="item">
+      <div class="meta">
+        <div class="name">${esc(m.id)}</div>
+        <div class="desc">ctx ${m.contextWindow || "—"} · out ${m.maxOutputTokens || "—"}${m.supportsThinking ? " · 思考" : ""}</div>
+      </div>
+      <button class="ghost danger" onclick="delModel('${m.providerId}','${esc(m.id)}')">删</button>
+    </div>`).join("") || '<div class="desc" style="color:var(--muted)">未声明（能力校验关闭）</div>';
+  $("modelDL").innerHTML = state.models.map(m => `<option value="${esc(m.id)}">`).join("");
+}
+
+function renderStats() {
+  const s = state.stats || {};
+  $("stats").innerHTML = [
+    ["请求", s.totalRequests], ["输入", s.inputTokens], ["输出", s.outputTokens],
+    ["总计", s.totalTokens], ["缓存命中", s.cachedInputTokens], ["思考", s.reasoningTokens],
+    ["无用量", s.usageMissing],
+  ].map(([k, v]) => `<div>${k} <b>${v ?? 0}</b></div>`).join("");
+  $("cumTotal").textContent = fmtTokens(s.totalTokens, s.inputTokens, s.outputTokens);
+}
+
+function renderSelectors() {
+  const cur = $("modelInput").value;
+  const providerModels = state.models.filter(m => m.providerId === $("providerSel").value);
+  $("modelDL").innerHTML = providerModels.map(m => `<option value="${esc(m.id)}">`).join("");
+  if (cur === "") $("modelInput").value = providerModels[0]?.id || "";
+}
+
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtTokens = (t, i, o) => `${t ?? 0} tok（入 ${i ?? 0} / 出 ${o ?? 0}）`;
+
+$("addProvider").onclick = async () => {
+  try {
+    await api("/api/providers", { method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ name: $("pName").value.trim(), vendor: $("pVendor").value,
+        endpoint: $("pEndpoint").value.trim(), apiKey: $("pKey").value.trim(),
+        protocol: $("pProto").value }) });
+    $("pName").value = $("pEndpoint").value = $("pKey").value = "";
+    await refresh();
+  } catch (e) { alert("添加失败: " + e.message); }
+};
+
+window.testProvider = async id => {
+  const p = state.providers.find(x => x.id === id);
+  const btn = event.target; btn.textContent = "…";
+  try {
+    const r = await api("/api/providers/test", { method: "POST",
+      headers: {"Content-Type":"application/json"}, body: JSON.stringify(p) });
+    btn.textContent = r.ok ? `✓ ${r.models} 模型` : "✗ 失败";
+  } catch (e) { btn.textContent = "✗ 失败"; }
+  setTimeout(() => btn.textContent = "测试", 2500);
+};
+
+window.delProvider = async id => {
+  if (!confirm("删除该服务商及其模型？")) return;
+  await api("/api/providers/" + id, { method: "DELETE" });
+  await refresh();
+};
+
+$("addModel").onclick = async () => {
+  try {
+    await api("/api/models", { method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ providerId: $("mProvider").value, id: $("mId").value.trim(),
+        contextWindow: +$("mCtx").value || 0, maxOutputTokens: +$("mOut").value || 0,
+        supportsThinking: $("mThink").checked }) });
+    $("mId").value = $("mCtx").value = $("mOut").value = ""; $("mThink").checked = false;
+    await refresh();
+  } catch (e) { alert("添加失败: " + e.message); }
+};
+
+window.delModel = async (pid, id) => {
+  await api(`/api/models/${pid}/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await refresh();
+};
+
+$("providerSel").onchange = renderSelectors;
+
+$("newChat").onclick = () => { history = []; lastUsage = null;
+  $("msgs").innerHTML = '<div class="empty">新对话</div>';
+  $("usageBar").children[0].innerHTML = "最近一次：<b>—</b>"; };
+
+function addMsg(role, content, thinking) {
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  if (role === "assistant") {
+    if (thinking) el.innerHTML = `<details class="think" open><summary>思考</summary><div class="body"></div></details><div class="txt"></div>`;
+    else el.innerHTML = `<div class="txt"></div>`;
+    el.querySelector(".txt").textContent = content || "";
+    if (thinking) el.querySelector(".body").textContent = thinking;
+  } else if (role === "error") {
+    el.textContent = content;
+  } else {
+    el.textContent = content;
+  }
+  $("msgs").appendChild(el);
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+  return el;
+}
+
+function setLastUsage(u) {
+  $("usageBar").children[0].innerHTML =
+    `最近一次：<b>入 ${u.inputTokens} · 出 ${u.outputTokens} · 计 ${u.totalTokens}</b>` +
+    (u.cachedInputTokens ? ` · 缓存 ${u.cachedInputTokens}` : "") +
+    (u.reasoningTokens ? ` · 思考 ${u.reasoningTokens}` : "");
+}
+
+function payload(stream) {
+  const messages = [...history];
+  if ($("sysPrompt").value.trim()) messages.unshift({ role: "system", content: $("sysPrompt").value.trim() });
+  const temp = $("temp").value;
+  return {
+    providerId: $("providerSel").value,
+    model: $("modelInput").value.trim(),
+    messages,
+    thinking: $("thinking").value,
+    maxTokens: +$("maxTok").value || 0,
+    temperature: temp === "" ? null : +temp,
+    stream,
+  };
+}
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text) return;
+  if (!$("providerSel").value || !$("modelInput").value.trim()) { alert("请先选择服务商和模型"); return; }
+  $("input").value = "";
+  addMsg("user", text);
+  history.push({ role: "user", content: text });
+  const body = payload($("streamChk").checked);
+  const el = addMsg("assistant", "");
+  const txtEl = el.querySelector(".txt");
+  let thinkEl = el.querySelector(".body");
+  const cursor = document.createElement("span"); cursor.className = "cursor";
+  txtEl.appendChild(cursor);
+  const acc = { text: "", think: "" };
+
+  const finish = (err) => {
+    cursor.remove();
+    history.push({ role: "assistant", content: acc.text, thinking: acc.think });
+    if (err) {
+      el.querySelector(".txt").textContent = acc.text;
+      addMsg("error", "✗ " + err);
+    }
+    refresh(); // update cumulative stats
+  };
+
+  try {
+    const resp = await fetch(body.stream ? "/api/chat/stream" : "/api/chat", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body), signal: AbortSignal.timeout(300000),
+    });
+    const j = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(j.error || resp.statusText);
+
+    if (!body.stream) {
+      if (j.error) throw new Error(j.error);
+      acc.text = j.content || ""; acc.think = j.think || "";
+      if (acc.think) { thinkEl.textContent = acc.think; }
+      txtEl.textContent = acc.text;
+      if (j.usage) { lastUsage = j.usage; setLastUsage(j.usage); }
+      finish(null);
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2);
+        if (!line.startsWith("data: ")) continue;
+        const ev = JSON.parse(line.slice(6));
+        if (ev.type === "text") { acc.text += ev.text; txtEl.textContent = acc.text;
+          $("msgs").scrollTop = $("msgs").scrollHeight; }
+        else if (ev.type === "thinking") { acc.think += ev.text;
+          el.querySelector("details.think").open = true; thinkEl.textContent = acc.think; }
+        else if (ev.type === "usage") { lastUsage = ev.usage; setLastUsage(ev.usage); }
+        else if (ev.type === "error") { throw new Error(ev.error); }
+        else if (ev.type === "stop") { /* StreamEnd reason; shown via usage bar */ }
+      }
+    }
+    finish(null);
+  } catch (e) {
+    finish(e.message);
+  }
+}
+
+$("send").onclick = send;
+$("input").addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send();
+});
+
+refresh();
+</script>
+</body>
+</html>

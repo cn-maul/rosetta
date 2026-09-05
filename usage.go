@@ -36,26 +36,26 @@ type UsageRecord struct {
 
 // ModelUsage aggregates usage for one key (model or protocol).
 type ModelUsage struct {
-	Requests          int64
-	InputTokens       int64
-	OutputTokens      int64
-	TotalTokens       int64
-	CachedInputTokens int64
-	ReasoningTokens   int64
-	UsageMissing      int64
+	Requests          int64 `json:"requests"`
+	InputTokens       int64 `json:"input_tokens"`
+	OutputTokens      int64 `json:"output_tokens"`
+	TotalTokens       int64 `json:"total_tokens"`
+	CachedInputTokens int64 `json:"cached_input_tokens"`
+	ReasoningTokens   int64 `json:"reasoning_tokens"`
+	UsageMissing      int64 `json:"usage_missing"`
 }
 
 // UsageSnapshot is a point-in-time view of accumulated usage.
 type UsageSnapshot struct {
-	TotalRequests     int64
-	InputTokens       int64
-	OutputTokens      int64
-	TotalTokens       int64
-	CachedInputTokens int64
-	ReasoningTokens   int64
-	UsageMissing      int64
-	ByModel           map[string]ModelUsage
-	ByProtocol        map[Protocol]ModelUsage
+	TotalRequests     int64                   `json:"total_requests"`
+	InputTokens       int64                   `json:"input_tokens"`
+	OutputTokens      int64                   `json:"output_tokens"`
+	TotalTokens       int64                   `json:"total_tokens"`
+	CachedInputTokens int64                   `json:"cached_input_tokens"`
+	ReasoningTokens   int64                   `json:"reasoning_tokens"`
+	UsageMissing      int64                   `json:"usage_missing"`
+	ByModel           map[string]ModelUsage   `json:"by_model"`
+	ByProtocol        map[Protocol]ModelUsage `json:"by_protocol"`
 }
 
 // UsageTracker receives usage observations. Implementations must be safe

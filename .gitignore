@@ -1,0 +1,5 @@
+# local playground state (contains API keys)
+webui/data.json
+
+# binaries
+*.exe
