@@ -74,10 +74,12 @@ func (s *Scanner) Next() (*Event, error) {
 }
 
 // take flushes the accumulated event, or returns nil when no data lines
-// were collected (per the SSE spec an event without data is not dispatched).
+// were collected (per the SSE spec an event without data is not
+// dispatched). Its fields are reset either way so a discarded event never
+// leaks its name or id into the next dispatched one.
 func (s *Scanner) take() *Event {
 	if len(s.data) == 0 {
-		s.name = ""
+		s.name, s.id = "", ""
 		return nil
 	}
 	ev := &Event{Name: s.name, ID: s.id, Data: bytes.Join(s.data, []byte("\n"))}
@@ -110,13 +112,13 @@ func chomp(line []byte) []byte {
 
 // splitField splits "field: value" / "field:value" / "field".
 func splitField(line []byte) (field, value []byte) {
-	i := bytes.IndexByte(line, ':')
-	if i < 0 {
+	before, after, ok := bytes.Cut(line, []byte{':'})
+	if !ok {
 		return line, nil
 	}
-	value = line[i+1:]
+	value = after
 	if len(value) > 0 && value[0] == ' ' {
 		value = value[1:]
 	}
-	return line[:i], value
+	return before, value
 }

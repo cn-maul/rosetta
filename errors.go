@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 // Sentinel errors returned by the SDK. Use errors.Is to match.
@@ -88,26 +89,16 @@ func retryableStatus(code int) bool {
 	return false
 }
 
-// truncateBody bounds an error body stored in APIError.Raw.
+// truncateBody bounds an error body stored in APIError.Raw, backing off
+// to a rune boundary so the result stays valid UTF-8.
 func truncateBody(body []byte) json.RawMessage {
 	const max = 4 << 10
-	if len(body) > max {
-		return json.RawMessage(body[:max])
+	if len(body) <= max {
+		return json.RawMessage(body)
 	}
-	return json.RawMessage(body)
-}
-
-// genericAPIError builds an APIError for a body that could not be parsed.
-func genericAPIError(status int, method, url, body string) *APIError {
-	msg := strings.TrimSpace(body)
-	if msg == "" {
-		msg = http.StatusText(status)
+	b := body[:max]
+	for i := 0; i < utf8.UTFMax && len(b) > 0 && !utf8.Valid(b); i++ {
+		b = b[:len(b)-1]
 	}
-	return &APIError{
-		StatusCode: status,
-		Message:    msg,
-		Method:     method,
-		URL:        url,
-		Retryable:  retryableStatus(status),
-	}
+	return json.RawMessage(b)
 }

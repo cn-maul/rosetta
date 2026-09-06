@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
@@ -145,9 +147,7 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 	if stream {
 		payload["stream"] = true
 	}
-	for k, v := range req.Extra {
-		payload[k] = v
-	}
+	maps.Copy(payload, req.Extra)
 	return payload, nil
 }
 
@@ -190,9 +190,6 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 	}
 	if len(msgs) == 0 {
 		return "", nil, fmt.Errorf("%w: anthropic requires at least one non-system message", ErrInvalidRequest)
-	}
-	if msgs[0].role != "user" {
-		return "", nil, fmt.Errorf("%w: anthropic requires the first message to be user role", ErrInvalidRequest)
 	}
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
@@ -243,6 +240,15 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 		}
 		out = append(out, map[string]any{"role": m.role, "content": blocks})
 	}
+	// Checked after empty messages are dropped: a user message with no
+	// renderable blocks must not leave an assistant turn first (Anthropic
+	// requires the conversation to open with a user turn).
+	if len(out) == 0 {
+		return "", nil, fmt.Errorf("%w: anthropic requires at least one non-system message", ErrInvalidRequest)
+	}
+	if out[0]["role"] != "user" {
+		return "", nil, fmt.Errorf("%w: anthropic requires the first message to be user role", ErrInvalidRequest)
+	}
 	return strings.Join(sysParts, "\n\n"), out, nil
 }
 
@@ -269,15 +275,15 @@ func splitDataURL(u string) (media, data string, ok bool) {
 		return "", "", false
 	}
 	rest := u[len(prefix):]
-	i := strings.Index(rest, ",")
-	if i < 0 {
+	before, after, ok := strings.Cut(rest, ",")
+	if !ok {
 		return "", "", false
 	}
-	head := rest[:i]
+	head := before
 	if !strings.HasSuffix(head, ";base64") {
 		return "", "", false
 	}
-	return strings.TrimSuffix(head, ";base64"), rest[i+1:], true
+	return strings.TrimSuffix(head, ";base64"), after, true
 }
 
 // parseToolInput converts a tool-call arguments JSON string into an object
@@ -361,7 +367,9 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 		}
 		return nil, apiErr
 	}
-	return newStream(p.streamEvents(resp.Body), nil), nil
+	s := newStream(p.streamEvents(resp.Body), nil)
+	s.attachCloser(resp.Body)
+	return s, nil
 }
 
 // streamEvents maps Anthropic's typed SSE stream onto unified events.
@@ -392,6 +400,11 @@ func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) 
 	}
 	return func() (*Event, error) {
 		for {
+			// Once message_stop (or EOF) was seen, never emit further
+			// events even if the server keeps sending.
+			if ended {
+				return nil, io.EOF
+			}
 			ssev, err := sc.Next()
 			if err != nil {
 				if errors.Is(err, io.EOF) && !ended {
@@ -413,7 +426,13 @@ func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) 
 			case "ping":
 				continue
 			case "error":
-				return nil, ch.Error.apiError(200)
+				// Tolerate a malformed error event with no error body
+				// (seen on third-party Anthropic-compatible gateways):
+				// surface a generic APIError instead of a nil event.
+				if ch.Error != nil {
+					return nil, ch.Error.apiError(200)
+				}
+				return nil, &APIError{StatusCode: 200, Type: "api_error", Message: "stream error event without details"}
 			case "message_start":
 				if ch.Message != nil {
 					if ch.Message.Usage != nil {
@@ -477,37 +496,56 @@ func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) 
 	}
 }
 
-// ListModels queries GET /v1/models. Entries carry no capability metadata.
+// ListModels queries GET /v1/models, following the has_more/after_id
+// pagination (the catalog is served in pages of ~20 by default). Entries
+// carry no capability metadata.
 func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	const method = http.MethodGet
-	url := joinEndpoint(p.c.settings.endpoint, "/models")
-	call := &httpx.Call{Method: method, URL: url, Header: p.headers(false)}
-	resp, err := p.c.http.Do(ctx, call)
-	if err != nil {
-		return nil, transport(err, method, url)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, parseAnthropicError(resp.StatusCode, body, method, url, requestID(resp.Header))
-	}
-	var list struct {
-		Data []struct {
-			ID          string `json:"id"`
-			DisplayName string `json:"display_name"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding model list: %w", err)
-	}
-	models := make([]ModelInfo, 0, len(list.Data))
-	for _, m := range list.Data {
-		if m.ID == "" {
+	base := joinEndpoint(p.c.settings.endpoint, "/models")
+	var models []ModelInfo
+	after := ""
+	for page := 0; ; page++ {
+		pageURL := base + "?limit=100"
+		if after != "" {
+			pageURL += "&after_id=" + url.QueryEscape(after)
+		}
+		call := &httpx.Call{Method: method, URL: pageURL, Header: p.headers(false)}
+		resp, err := p.c.http.Do(ctx, call)
+		if err != nil {
+			return nil, transport(err, method, pageURL)
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header))
+		}
+		var list struct {
+			Data []struct {
+				ID          string `json:"id"`
+				DisplayName string `json:"display_name"`
+			} `json:"data"`
+			HasMore bool   `json:"has_more"`
+			LastID  string `json:"last_id"`
+		}
+		if err := json.Unmarshal(body, &list); err != nil {
+			return nil, fmt.Errorf("rosetta: decoding model list: %w", err)
+		}
+		for _, m := range list.Data {
+			if m.ID == "" {
+				continue
+			}
+			models = append(models, ModelInfo{ID: m.ID, DisplayName: m.DisplayName, Protocol: ProtoAnthropic})
+		}
+		if !list.HasMore || page > 100 {
+			return models, nil
+		}
+		if next := list.LastID; next != "" && len(list.Data) > 0 {
+			after = next
 			continue
 		}
-		models = append(models, ModelInfo{ID: m.ID, DisplayName: m.DisplayName, Protocol: ProtoAnthropic})
+		// has_more without a usable cursor: stop rather than loop forever.
+		return models, nil
 	}
-	return models, nil
 }
 
 func mapAnthropicStop(s string) StopReason {

@@ -181,6 +181,11 @@ func (c *Client) RefreshModels(ctx context.Context) ([]ModelInfo, error) {
 // discovery is attempted before failing with ErrUnknownModel.
 func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
 	if _, ok := c.registry.Lookup(id); !ok {
+		if c.settings.timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, c.settings.timeout)
+			defer cancel()
+		}
 		if infos, err := c.provider.ListModels(ctx); err == nil {
 			c.registry.SetRemote(infos)
 		}

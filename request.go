@@ -99,10 +99,14 @@ type ChatRequest struct {
 }
 
 // Float returns a pointer to v (for Temperature/TopP fields).
-func Float(v float64) *float64 { return &v }
+//
+//go:fix inline
+func Float(v float64) *float64 { return new(v) }
 
 // Bool returns a pointer to v.
-func Bool(v bool) *bool { return &v }
+//
+//go:fix inline
+func Bool(v bool) *bool { return new(v) }
 
 // validate checks structural requirements shared by all protocols.
 func (r *ChatRequest) validate() error {

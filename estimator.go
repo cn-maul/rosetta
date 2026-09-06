@@ -2,8 +2,9 @@ package rosetta
 
 // EstimateTokens gives a rough token count for a piece of text. CJK
 // characters are ≈1 token each; ASCII text ≈4 characters per token. The
-// estimate is deliberately conservative and is NOT a tokenizer — plug a
-// real one in at the call site if precision matters.
+// estimate rounds up so it errs on the high side (a context-window
+// warning must never undercount) and is NOT a tokenizer — plug a real one
+// in at the call site if precision matters.
 func EstimateTokens(text string) int {
 	ascii, other := 0, 0
 	for _, r := range text {
@@ -13,7 +14,7 @@ func EstimateTokens(text string) int {
 			other++
 		}
 	}
-	return ascii/4 + other
+	return (ascii+3)/4 + other
 }
 
 // estimateInputTokens approximates the prompt size of a request, including

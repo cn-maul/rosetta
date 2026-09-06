@@ -2,6 +2,7 @@ package rosetta
 
 import (
 	"context"
+	"maps"
 	"sync"
 	"time"
 )
@@ -122,11 +123,7 @@ func (t *MemoryUsageTracker) Snapshot() UsageSnapshot {
 		ByModel:           make(map[string]ModelUsage, len(t.byModel)),
 		ByProtocol:        make(map[Protocol]ModelUsage, len(t.byProto)),
 	}
-	for k, v := range t.byModel {
-		snap.ByModel[k] = v
-	}
-	for k, v := range t.byProto {
-		snap.ByProtocol[k] = v
-	}
+	maps.Copy(snap.ByModel, t.byModel)
+	maps.Copy(snap.ByProtocol, t.byProto)
 	return snap
 }

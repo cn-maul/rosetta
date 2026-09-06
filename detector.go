@@ -91,5 +91,8 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rosetta: detecting protocol for %s: %w", st.endpoint, err)
 	}
-	return NewClient(append(opts, WithProtocol(proto))...)
+	// Force a copy so the appended option cannot leak into the caller's
+	// backing array.
+	opts = append(opts[:len(opts):len(opts)], WithProtocol(proto))
+	return NewClient(opts...)
 }

@@ -8,7 +8,7 @@
 go get github.com/cn-maul/rosetta
 ```
 
-要求 Go 1.22+。零第三方依赖，`go get` 即取即用。
+要求 Go 1.27+（SDK 自身使用 `encoding/json/v2` 等新标准库能力；零第三方依赖）。
 
 ## 使用
 
@@ -45,6 +45,8 @@ func main() {
 ```
 
 换服务商只需换 endpoint、key 和 model id；协议不对时加一行 `rosetta.WithProtocol(...)`，或改用 `rosetta.DetectClient` 自动探测。
+
+> **Go 1.26+ 提示**：可选字段可直接用内建的 `new(expr)` 写法（`Temperature: new(0.7)`），不必借助 `rosetta.Float`；`Float`/`Bool` 仍然保留，且带 `//go:fix inline` 标记，跑 `go fix` 会自动把旧调用内联成 `new(...)`。错误匹配同理，`errors.AsType[*rosetta.APIError](err)` 可替代声明变量的 `errors.As`。
 
 ## 文档
 

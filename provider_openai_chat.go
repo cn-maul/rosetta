@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -47,18 +48,19 @@ func (p *openaiChatProvider) initialState() *oaSendState {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.c.settings.quirks.LegacyMaxTokens {
-		st.tokensField = "max_tokens"
-	}
-	if p.c.settings.maxTokensField != "" {
-		st.tokensField = p.c.settings.maxTokensField
-	}
+	// Precedence: explicit WithMaxTokensField pin > probed sticky state >
+	// LegacyMaxTokens quirk > modern default.
 	switch {
-	case p.stickyLegacy == nil:
-	case *p.stickyLegacy:
+	case p.c.settings.maxTokensField != "":
+		st.tokensField = p.c.settings.maxTokensField
+	case p.stickyLegacy != nil:
+		if *p.stickyLegacy {
+			st.tokensField = "max_tokens"
+		} else {
+			st.tokensField = "max_completion_tokens"
+		}
+	case p.c.settings.quirks.LegacyMaxTokens:
 		st.tokensField = "max_tokens"
-	default:
-		st.tokensField = "max_completion_tokens"
 	}
 	if p.stickyNoStreamOpt != nil && *p.stickyNoStreamOpt {
 		st.streamOptions = false
@@ -124,9 +126,7 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 			pl["stream_options"] = map[string]any{"include_usage": true}
 		}
 	}
-	for k, v := range req.Extra {
-		pl[k] = v
-	}
+	maps.Copy(pl, req.Extra)
 	return pl, nil
 }
 
@@ -233,9 +233,15 @@ func containsAny(low string, words ...string) bool {
 
 // sanitize inspects a 400 error message and downgrades one optional field.
 // It returns true when the payload changed and the request should be
-// retried. Downgrades are remembered for the client lifetime.
-func (p *openaiChatProvider) sanitize(st *oaSendState, msg string, stream bool) bool {
+// retried. Downgrades are remembered for the client lifetime. To keep the
+// keyword matching from misfiring on unrelated 400s, a non-empty error
+// type must look like an invalid-request error; and a field pinned via
+// WithMaxTokensField is never flipped.
+func (p *openaiChatProvider) sanitize(st *oaSendState, msg, errType string, stream bool) bool {
 	low := strings.ToLower(msg)
+	if errType != "" && !strings.Contains(strings.ToLower(errType), "invalid_request") {
+		return false
+	}
 	note := func(slot **bool, v bool) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -244,6 +250,7 @@ func (p *openaiChatProvider) sanitize(st *oaSendState, msg string, stream bool) 
 			*slot = &b
 		}
 	}
+	pinned := p.c.settings.maxTokensField != ""
 	switch {
 	case st.reasoning && containsAny(low, "reasoning_effort") && containsAny(low, hintWords...):
 		st.reasoning = false
@@ -255,13 +262,13 @@ func (p *openaiChatProvider) sanitize(st *oaSendState, msg string, stream bool) 
 		note(&p.stickyNoStreamOpt, true)
 		p.c.settings.logger.Debug("openai-chat: upstream rejected stream_options; dropping include_usage")
 		return true
-	case st.tokensField == "max_completion_tokens" &&
+	case !pinned && st.tokensField == "max_completion_tokens" &&
 		containsAny(low, "max_tokens", "max_completion_tokens") && containsAny(low, hintWords...):
 		st.tokensField = "max_tokens"
 		note(&p.stickyLegacy, true)
 		p.c.settings.logger.Debug("openai-chat: falling back to legacy max_tokens field")
 		return true
-	case st.tokensField == "max_tokens" &&
+	case !pinned && st.tokensField == "max_tokens" &&
 		containsAny(low, "max_tokens", "max_completion_tokens") && containsAny(low, hintWords...):
 		st.tokensField = "max_completion_tokens"
 		note(&p.stickyLegacy, false)
@@ -299,7 +306,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 		}
 		if resp.StatusCode != http.StatusOK {
 			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
-			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, false) {
+			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, apiErr.Type, false) {
 				sanitizes++
 				continue
 			}
@@ -338,13 +345,15 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		r.Body.Close()
 		apiErr := parseOpenAIError(r.StatusCode, body, method, url, r.Header.Get("X-Request-Id"))
-		if r.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, true) {
+		if r.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, apiErr.Type, true) {
 			sanitizes++
 			continue
 		}
 		return nil, apiErr
 	}
-	return newStream(p.streamEvents(resp.Body), nil), nil
+	s := newStream(p.streamEvents(resp.Body), nil)
+	s.attachCloser(resp.Body)
+	return s, nil
 }
 
 // streamEvents maps the OpenAI chunk SSE stream onto unified events.
@@ -379,6 +388,11 @@ func (p *openaiChatProvider) streamEvents(body io.Reader) func() (*Event, error)
 			return ev, nil
 		}
 		for {
+			// Once the terminal signal ([DONE] or EOF) was seen, never
+			// emit further events even if the server keeps sending.
+			if ended {
+				return nil, io.EOF
+			}
 			ssev, err := sc.Next()
 			if err != nil {
 				if errors.Is(err, io.EOF) && !ended {

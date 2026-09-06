@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -73,7 +74,9 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 		resp.Body.Close()
 		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
 	}
-	return newStream(p.streamEvents(resp.Body), nil), nil
+	s := newStream(p.streamEvents(resp.Body), nil)
+	s.attachCloser(resp.Body)
+	return s, nil
 }
 
 // ListModels queries GET /models via the shared OpenAI-family helper.
@@ -138,9 +141,7 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool) (m
 	if stream {
 		payload["stream"] = true
 	}
-	for k, v := range req.Extra {
-		payload[k] = v
-	}
+	maps.Copy(payload, req.Extra)
 	return payload, nil
 }
 
@@ -249,6 +250,11 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader) func() (*Event, e
 	}
 	return func() (*Event, error) {
 		for {
+			// Once response.completed/incomplete (or EOF) was seen, never
+			// emit further events even if the server keeps sending.
+			if ended {
+				return nil, io.EOF
+			}
 			ssev, err := sc.Next()
 			if err != nil {
 				if errors.Is(err, io.EOF) && !ended {

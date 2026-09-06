@@ -7,7 +7,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"time"
@@ -62,6 +62,9 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 			if ra := retryAfter(resp.Header.Get("Retry-After")); ra > wait {
 				wait = ra
 			}
+			if wait > maxRetryAfter {
+				wait = maxRetryAfter
+			}
 			drain(resp)
 		} else {
 			wait = c.backoff(attempt)
@@ -103,7 +106,11 @@ func (c *Client) backoff(attempt int) time.Duration {
 		d = c.Cap
 	}
 	j := 0.8 + 0.4*rand.Float64() // ±20% jitter
-	return time.Duration(float64(d) * j)
+	d = time.Duration(float64(d) * j)
+	if d > c.Cap { // Cap is a hard ceiling, even under jitter
+		d = c.Cap
+	}
+	return d
 }
 
 func (c *Client) log(msg string, args ...any) {
@@ -138,6 +145,10 @@ func retryAfter(v string) time.Duration {
 	}
 	return 0
 }
+
+// maxRetryAfter bounds a server-provided Retry-After so a hostile or
+// misconfigured gateway cannot stall callers for arbitrarily long.
+const maxRetryAfter = 60 * time.Second
 
 func drain(resp *http.Response) {
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))

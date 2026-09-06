@@ -158,6 +158,14 @@ default:
 }
 ```
 
+Go 1.26+ 可以用泛型的 `errors.AsType` 省去变量声明：
+
+```go
+if apiErr, ok := errors.AsType[*rosetta.APIError](err); ok {
+	fmt.Println(apiErr.StatusCode, apiErr.Retryable)
+}
+```
+
 哨兵错误（`errors.Is` 匹配）：`ErrNoEndpoint`、`ErrNoAPIKey`、`ErrUnknownModel`、`ErrContextTooLong`、`ErrThinkingUnsupported`、`ErrInvalidRequest`。
 
 `APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / Raw`，由三协议的错误体归一而来。
@@ -165,4 +173,11 @@ default:
 ## 附注
 
 - Windows 本地跑 `go test -race` 需要 CGO（gcc）；无 gcc 环境用 `go test ./...` 即可，CI（Linux）会跑 race。
+- **MinGW 装在含空格的路径下（如 `C:\Program Files\mingw64`）会导致所有 cgo 链接失败**（gcc 的 `*endfile` spec 引用 `default-manifest.o` 时路径未加引号）。把 MinGW 移到无空格路径是根治方案；临时绕过：导出并打补丁 specs 后在 `-ldflags` 中引用：
+  ```bash
+  gcc -dumpspecs > C:/Users/<you>/mingw64-specs.txt
+  sed -i 's/%{!shared:%:if-exists(default-manifest\.o%s)}//' C:/Users/<you>/mingw64-specs.txt
+  go build -ldflags "-extldflags=-specs=C:/Users/<you>/mingw64-specs.txt" ./...
+  ```
+- Windows Insider 构建（本机 build 29648）上 `-race` 可编译链接，但 TSan 运行时在固定地址分配 shadow memory 会报 `error code: 87` 而无法启动——属 OS 层限制，本地以 `go test ./...` 为准，race 由 CI（Linux）执行。
 - 示例程序读 `ROSETTA_ENDPOINT` / `ROSETTA_API_KEY` / `ROSETTA_MODEL` 环境变量：`go run ./examples/chat`。

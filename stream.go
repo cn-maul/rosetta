@@ -81,6 +81,7 @@ type streamCore struct {
 	next   func() (*Event, error)
 	onEnd  func(Usage, error)
 	cancel context.CancelFunc
+	closer io.Closer
 
 	done     bool
 	released bool
@@ -103,6 +104,12 @@ func (s *streamCore) attachCancel(cancel context.CancelFunc) {
 	s.cancel = cancel
 }
 
+// attachCloser registers the response body for closing when the stream
+// terminates, so early Close and clean end both free the connection.
+func (s *streamCore) attachCloser(c io.Closer) {
+	s.closer = c
+}
+
 func (s *streamCore) Next() bool {
 	if s.done {
 		return false
@@ -113,6 +120,14 @@ func (s *streamCore) Next() bool {
 		if !errors.Is(err, io.EOF) {
 			s.err = err
 		}
+		s.release()
+		return false
+	}
+	if ev == nil {
+		// Defense in depth: a producer returning (nil, nil) must fail
+		// the stream, never panic the consumer.
+		s.done = true
+		s.err = errors.New("rosetta: internal error: stream produced a nil event")
 		s.release()
 		return false
 	}
@@ -145,8 +160,9 @@ func (s *streamCore) Close() error {
 	return nil
 }
 
-// release finalizes the stream exactly once: cancels the request context
-// (freeing the connection on early Close) and notifies the owner.
+// release finalizes the stream exactly once: cancels the request context,
+// closes the response body (freeing the connection on early Close) and
+// notifies the owner.
 func (s *streamCore) release() {
 	if s.released {
 		return
@@ -154,6 +170,9 @@ func (s *streamCore) release() {
 	s.released = true
 	if s.cancel != nil {
 		s.cancel()
+	}
+	if s.closer != nil {
+		s.closer.Close()
 	}
 	if s.onEnd != nil {
 		s.onEnd(s.usage, s.err)

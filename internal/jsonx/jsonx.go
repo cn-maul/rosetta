@@ -3,13 +3,32 @@
 // strings, message content as an array of parts instead of a string,
 // nulls where scalars are promised. Decoders never fail the whole payload
 // on a single odd field — they fall back to zero values.
+//
+// The decoders are implemented once on top of encoding/json/v2
+// (jsontext token streaming, stable since Go 1.27): values are dispatched
+// on their token kind, so no byte round-trips are needed. The legacy
+// encoding/json UnmarshalJSON entry points delegate to the same logic, so
+// behavior is identical whether the program is built with GOEXPERIMENT
+// jsonv2 (the default) or with the v1-only opt-out.
 package jsonx
 
 import (
+	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"strconv"
 	"strings"
 )
+
+// fromBytes adapts the legacy encoding/json entry point (a single JSON
+// value as raw bytes) to the streaming v2 implementation.
+func fromBytes(b []byte, fn func(d *jsontext.Decoder) error) error {
+	if len(bytes.TrimSpace(b)) == 0 {
+		return nil // empty input: leave the zero value untouched
+	}
+	return fn(jsontext.NewDecoder(bytes.NewReader(b)))
+}
 
 // FlexString accepts a JSON string, number, boolean or null and always
 // yields a string. Numbers and booleans are taken verbatim from their raw
@@ -19,58 +38,102 @@ type FlexString struct {
 	Set   bool
 }
 
-func (f *FlexString) UnmarshalJSON(b []byte) error {
+func (f *FlexString) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	f.Value, f.Set = "", true
-	s := strings.TrimSpace(string(b))
-	if s == "null" || s == "" {
+	switch dec.PeekKind() {
+	case '"':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.Value = tok.String()
+	case '0', 't', 'f':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.Value = tok.String()
+	case 'n':
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
 		f.Set = false
-		return nil
+	default:
+		// Objects and arrays leave the field unset instead of failing.
+		f.Set = false
+		return dec.SkipValue()
 	}
-	if s[0] == '"' {
-		return json.Unmarshal(b, &f.Value)
-	}
-	f.Value = strings.Trim(s, `"`)
 	return nil
+}
+
+func (f *FlexString) UnmarshalJSON(b []byte) error {
+	return fromBytes(b, f.UnmarshalJSONFrom)
 }
 
 func (f FlexString) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }
 
 // FlexInt64 accepts a JSON number or a numeric string ("120" counts the
-// same as 120) and yields an int64.
+// same as 120) and yields an int64. Values that cannot be interpreted
+// ("N/A") degrade to unset rather than failing the payload.
 type FlexInt64 struct {
 	Value int64
 	Set   bool
 }
 
-func (f *FlexInt64) UnmarshalJSON(b []byte) error {
+func (f *FlexInt64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	f.Value, f.Set = 0, true
-	s := strings.TrimSpace(string(b))
-	if s == "null" || s == "" {
-		f.Set = false
-		return nil
-	}
-	if s[0] == '"' {
-		var str string
-		if err := json.Unmarshal(b, &str); err != nil {
+	switch dec.PeekKind() {
+	case '0':
+		tok, err := dec.ReadToken()
+		if err != nil {
 			return err
 		}
-		s = strings.TrimSpace(str)
+		if v, ierr := tok.Int(); ierr == nil {
+			f.Value = v
+			return nil
+		}
+		// Tolerate floats like 1.2e3 or 120.0 from sloppy serializers.
+		if fv, ferr := tok.Float(); ferr == nil {
+			f.Value = int64(fv)
+			return nil
+		}
+		f.Set = false
+		return nil
+	case '"':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		s := strings.TrimSpace(tok.String())
 		if s == "" {
 			f.Set = false
 			return nil
 		}
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err == nil {
-		f.Value = v
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err == nil {
+			f.Value = v
+			return nil
+		}
+		if fv, ferr := strconv.ParseFloat(s, 64); ferr == nil {
+			f.Value = int64(fv)
+			return nil
+		}
+		f.Set = false
 		return nil
-	}
-	// Tolerate floats like 1.2e3 or 120.0 from sloppy serializers.
-	if fv, ferr := strconv.ParseFloat(s, 64); ferr == nil {
-		f.Value = int64(fv)
+	case 'n':
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
+		f.Set = false
 		return nil
+	default:
+		f.Set = false
+		return dec.SkipValue()
 	}
-	return err
+}
+
+func (f *FlexInt64) UnmarshalJSON(b []byte) error {
+	return fromBytes(b, f.UnmarshalJSONFrom)
 }
 
 func (f FlexInt64) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }
@@ -84,21 +147,26 @@ type ContentString struct {
 	Set   bool
 }
 
-func (f *ContentString) UnmarshalJSON(b []byte) error {
+func (f *ContentString) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	f.Value, f.Set = "", false
-	s := strings.TrimSpace(string(b))
-	switch {
-	case s == "null" || s == "":
+	switch dec.PeekKind() {
+	case '"':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.Value, f.Set = tok.String(), true
 		return nil
-	case s[0] == '"':
-		f.Set = true
-		return json.Unmarshal(b, &f.Value)
-	case s[0] == '[':
+	case '[':
+		val, err := dec.ReadValue()
+		if err != nil {
+			return err
+		}
 		var parts []struct {
 			Text string `json:"text"`
 			Type string `json:"type"`
 		}
-		if err := json.Unmarshal(b, &parts); err != nil {
+		if err := jsonv2.Unmarshal(val, &parts); err != nil {
 			return nil // unexpected element shapes: leave unset
 		}
 		var sb strings.Builder
@@ -113,9 +181,18 @@ func (f *ContentString) UnmarshalJSON(b []byte) error {
 		}
 		f.Value, f.Set = sb.String(), true
 		return nil
-	default:
+	case 'n':
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
 		return nil
+	default:
+		return dec.SkipValue() // objects and scalars: leave unset
 	}
+}
+
+func (f *ContentString) UnmarshalJSON(b []byte) error {
+	return fromBytes(b, f.UnmarshalJSONFrom)
 }
 
 func (f ContentString) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }

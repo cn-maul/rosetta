@@ -30,7 +30,7 @@ func main() {
 		System:          "你是一个简洁的助手。",
 		Messages:        []rosetta.Message{rosetta.User("用一句话解释什么是 SSE 流式响应。")},
 		MaxOutputTokens: 200,
-		Temperature:     rosetta.Float(0.7),
+		Temperature:     new(0.7),
 	})
 	if err != nil {
 		log.Fatal(err)

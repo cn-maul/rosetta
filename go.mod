@@ -1,3 +1,3 @@
 module github.com/cn-maul/rosetta
 
-go 1.22
+go 1.27

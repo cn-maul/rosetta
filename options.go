@@ -40,7 +40,6 @@ type settings struct {
 	maxTokensField   string
 	strictContext    bool
 	quirks           Quirks
-	quirksSet        bool
 	modelsFile       string
 	manualModels     []ModelInfo
 }
@@ -169,8 +168,5 @@ func WithMaxTokensField(v string) Option {
 
 // WithQuirks applies explicit compatibility adjustments for the endpoint.
 func WithQuirks(q Quirks) Option {
-	return func(s *settings) {
-		s.quirks = q
-		s.quirksSet = true
-	}
+	return func(s *settings) { s.quirks = q }
 }
