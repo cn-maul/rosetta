@@ -27,9 +27,6 @@ type ThinkingConfig struct {
 	// value as-is (minimum 1024); OpenAI protocols map to the nearest
 	// Effort level.
 	BudgetTokens int
-	// IncludeThoughts asks the provider to return thinking content in
-	// the response where supported.
-	IncludeThoughts bool
 }
 
 // effortFromBudget maps an explicit token budget to the nearest Effort.

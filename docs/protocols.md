@@ -9,7 +9,7 @@
 | 端点 | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
 | 认证 | `Authorization: Bearer` | 同左 | `x-api-key` + `anthropic-version`（另附 Bearer 兼容网关） |
 | system | `messages` 里的 system 角色 | `input` 里的 message item | 顶层 `system` 字段（与消息内 system 合并，`\n\n` 连接） |
-| 输出上限 | `max_completion_tokens`（探测）或 `max_tokens` | `max_output_tokens` | `max_tokens`（必填；兜底链：请求值 → WithDefaultMaxOutputTokens → 4096） |
+| 输出上限 | `max_completion_tokens`（探测）或 `max_tokens` | `max_output_tokens` | `max_tokens`（必填；兜底链：请求值 → 模型元数据 → WithDefaultMaxOutputTokens → 4096） |
 | thinking | `reasoning_effort` | `reasoning.effort` | `thinking.budget_tokens` |
 | stop | `stop` | 不支持（丢弃并记日志） | `stop_sequences` |
 | 工具定义 | `{type:"function", function:{...}}` | 扁平 `{type:"function", name, parameters}` | `{name, description, input_schema}` |

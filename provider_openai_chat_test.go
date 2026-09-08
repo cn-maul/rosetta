@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func newTestClient(t *testing.T, opts ...Option) *Client {
@@ -25,6 +26,8 @@ func TestJoinEndpoint(t *testing.T) {
 		{"http://localhost:11434", "/chat/completions", "http://localhost:11434/v1/chat/completions"},
 		{"http://localhost:11434/", "/chat/completions", "http://localhost:11434/v1/chat/completions"},
 		{"https://gateway.example.com/api/paas/v4", "/chat/completions", "https://gateway.example.com/api/paas/v4/chat/completions"},
+		{"https://host/v1?x=1", "/chat/completions", "https://host/v1/chat/completions?x=1"},
+		{"https://host?x=1", "/chat/completions", "https://host/v1/chat/completions?x=1"},
 	}
 	for _, tt := range tests {
 		if got := joinEndpoint(tt.base, tt.path); got != tt.want {
@@ -160,6 +163,40 @@ func TestOpenAIChatPinBeatsSticky(t *testing.T) {
 	}
 }
 
+// The output cap falls back through the model's declared metadata when the
+// request leaves it unset; the request value always wins when present.
+func TestOpenAIChatMaxOutputFallbackChain(t *testing.T) {
+	c := newTestClient(t, WithModelInfo(
+		ModelInfo{ID: "declared", MaxOutputTokens: 64},
+		ModelInfo{ID: "undeclared"},
+	), WithDefaultMaxOutputTokens(32))
+	p := c.provider.(*openaiChatProvider)
+
+	pl, err := p.buildPayload(&ChatRequest{Model: "declared", Messages: []Message{User("hi")}}, false, p.initialState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl["max_completion_tokens"] != 64 {
+		t.Fatalf("declared metadata cap = %v, want 64", pl["max_completion_tokens"])
+	}
+
+	pl, err = p.buildPayload(&ChatRequest{Model: "declared", Messages: []Message{User("hi")}, MaxOutputTokens: 100}, false, p.initialState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl["max_completion_tokens"] != 100 {
+		t.Fatalf("request cap = %v, want 100", pl["max_completion_tokens"])
+	}
+
+	pl, err = p.buildPayload(&ChatRequest{Model: "undeclared", Messages: []Message{User("hi")}}, false, p.initialState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl["max_completion_tokens"] != 32 {
+		t.Fatalf("default cap = %v, want 32", pl["max_completion_tokens"])
+	}
+}
+
 func TestOpenAIChatEncodeMessages(t *testing.T) {
 	c := newTestClient(t)
 	p := c.provider.(*openaiChatProvider)
@@ -224,6 +261,34 @@ func TestOpenAIChatEncodeMessages(t *testing.T) {
 	// Unsupported roles are rejected.
 	if _, err := p.encodeMessages(&ChatRequest{Messages: []Message{{Role: Role("bogus")}}}); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// A message carrying several tool results (parallel calls) must emit one
+// tool message per result — dropping any of them silently corrupts the
+// conversation the model sees.
+func TestOpenAIChatEncodeMultipleToolResults(t *testing.T) {
+	c := newTestClient(t)
+	p := c.provider.(*openaiChatProvider)
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: RoleTool, Blocks: []Block{
+				{Type: BlockToolResult, ToolCallID: "a", ToolName: "fn1", Content: "A"},
+				{Type: BlockToolResult, ToolCallID: "b", ToolName: "fn2", Content: "B"},
+			}},
+		},
+	}
+	msgs, err := p.encodeMessages(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2: %+v", len(msgs), msgs)
+	}
+	for i, want := range []struct{ id, content string }{{"a", "A"}, {"b", "B"}} {
+		if msgs[i]["role"] != "tool" || msgs[i]["tool_call_id"] != want.id || msgs[i]["content"] != want.content {
+			t.Fatalf("message %d wrong: %+v", i, msgs[i])
+		}
 	}
 }
 
@@ -359,6 +424,62 @@ func TestOpenAIChatDecodeResponseEdgeCases(t *testing.T) {
 	// No choices at all.
 	if _, err := decodeOpenAIChatResponse([]byte(`{"choices":[]}`)); err == nil {
 		t.Fatal("empty choices must error")
+	}
+}
+
+// Raw must stay valid JSON so ChatResponse/APIError can be re-marshaled
+// (logs, telemetry) even when the source body is truncated or not JSON.
+func TestRawAlwaysValidJSON(t *testing.T) {
+	// Truncated (over 4KB) response body.
+	big := strings.Repeat("x", 6000)
+	body := []byte(`{"id":"c1","choices":[{"message":{"content":"` + big + `"},"finish_reason":"stop"}]}`)
+	resp, err := decodeOpenAIChatResponse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(resp.Raw) {
+		t.Fatal("Raw must be valid JSON after truncation")
+	}
+	if _, err := json.Marshal(resp); err != nil {
+		t.Fatalf("json.Marshal(ChatResponse) = %v", err)
+	}
+
+	// Non-JSON error body (HTML gateway page).
+	apiErr := parseOpenAIError(502, []byte("<html><body>Bad Gateway</body></html>"), "GET", "http://u", "")
+	if !json.Valid(apiErr.Raw) {
+		t.Fatal("APIError.Raw must be valid JSON for a non-JSON body")
+	}
+	if _, err := json.Marshal(apiErr); err != nil {
+		t.Fatalf("json.Marshal(APIError) = %v", err)
+	}
+}
+
+// Truncation must back off to a UTF-8 rune boundary: a cut in the middle
+// of a multi-byte character yields invalid UTF-8 (and thus invalid JSON).
+func TestTruncateBodyRuneBoundary(t *testing.T) {
+	// 5000 × 3-byte runes = 15000 bytes, far past the 4096-byte cap; a
+	// naive byte cut is guaranteed to land inside a "你".
+	body := append([]byte(`{"content":"`), []byte(strings.Repeat("你", 5000))...)
+	body = append(body, []byte(`"}`)...)
+	raw := truncateBody(body)
+	if !json.Valid(raw) {
+		t.Fatal("truncateBody result must be valid JSON")
+	}
+	if !utf8.Valid(raw) {
+		t.Fatal("truncateBody result must be valid UTF-8")
+	}
+	// Bounded, with slack for the quote/escape overhead of the JSON-string
+	// degradation (the untruncated body is ~15KB, so this catches any
+	// failure to truncate).
+	if len(raw) > 4200 {
+		t.Fatalf("truncateBody result too large: %d", len(raw))
+	}
+
+	// Non-JSON bodies degrade to a JSON string via the error-path wrapper.
+	html := []byte("<html><body>error</body></html>")
+	raw = safeTruncateBody(html)
+	if !json.Valid(raw) {
+		t.Fatalf("non-JSON body must degrade to valid JSON, got %q", raw)
 	}
 }
 

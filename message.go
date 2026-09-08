@@ -118,13 +118,3 @@ func (m Message) text() string {
 	}
 	return b.String()
 }
-
-// firstBlock returns the first block of the given type, or nil.
-func (m Message) firstBlock(t BlockType) *Block {
-	for i := range m.Blocks {
-		if m.Blocks[i].Type == t {
-			return &m.Blocks[i]
-		}
-	}
-	return nil
-}

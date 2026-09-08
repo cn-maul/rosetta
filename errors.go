@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/cn-maul/rosetta/internal/httpx"
 )
 
 // Sentinel errors returned by the SDK. Use errors.Is to match.
@@ -77,20 +78,20 @@ func transport(err error, method, url string) error {
 	return &TransportError{Method: method, URL: url, Err: err}
 }
 
-// retryableStatus reports whether an HTTP status is worth retrying.
-// 529 is Anthropic's non-standard "overloaded" status.
+// retryableStatus reports whether an HTTP status is worth retrying. The
+// list lives in the transport layer; this is a thin alias so error typing
+// and retry decisions can never drift apart.
 func retryableStatus(code int) bool {
-	switch code {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests,
-		http.StatusInternalServerError, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 529:
-		return true
-	}
-	return false
+	return httpx.RetryableStatus(code)
 }
 
-// truncateBody bounds an error body stored in APIError.Raw, backing off
-// to a rune boundary so the result stays valid UTF-8.
+// truncateBody bounds a successfully-decoded response body for storage in
+// Raw, backing off to a rune boundary so the result stays valid UTF-8.
+// The input is known-valid JSON (callers only reach it after a successful
+// Unmarshal), so no validity scan is performed: bodies at or under the
+// cap pass through untouched, larger ones are truncated and — since
+// truncation breaks JSON validity — stored as a JSON string so Raw never
+// breaks re-marshaling.
 func truncateBody(body []byte) json.RawMessage {
 	const max = 4 << 10
 	if len(body) <= max {
@@ -100,5 +101,18 @@ func truncateBody(body []byte) json.RawMessage {
 	for i := 0; i < utf8.UTFMax && len(b) > 0 && !utf8.Valid(b); i++ {
 		b = b[:len(b)-1]
 	}
-	return json.RawMessage(b)
+	s, _ := json.Marshal(string(b))
+	return json.RawMessage(s)
+}
+
+// safeTruncateBody wraps response bodies of unknown provenance (error
+// pages, gateway HTML) for storage in Raw: anything that is not valid
+// JSON is degraded to a JSON string.
+func safeTruncateBody(body []byte) json.RawMessage {
+	raw := truncateBody(body)
+	if json.Valid(raw) {
+		return raw
+	}
+	s, _ := json.Marshal(string(raw))
+	return json.RawMessage(s)
 }

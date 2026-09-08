@@ -249,13 +249,13 @@ func TestBackoffJitterBounds(t *testing.T) {
 
 func TestRetryStatus(t *testing.T) {
 	for _, code := range []int{408, 429, 500, 502, 503, 504, 529} {
-		if !retryStatus(code) {
-			t.Errorf("retryStatus(%d) = false, want true", code)
+		if !RetryableStatus(code) {
+			t.Errorf("RetryableStatus(%d) = false, want true", code)
 		}
 	}
 	for _, code := range []int{200, 400, 401, 404, 422} {
-		if retryStatus(code) {
-			t.Errorf("retryStatus(%d) = true, want false", code)
+		if RetryableStatus(code) {
+			t.Errorf("RetryableStatus(%d) = true, want false", code)
 		}
 	}
 }

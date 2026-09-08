@@ -10,9 +10,11 @@
 ```
 
 - 合并按字段逐层覆盖：上层只覆盖非零字段，其余继承下层。稀疏的手动条目可以只写关心的字段。
+- 手动层内部，`WithModelInfo` 与 `WithModelsFile` 的条目合并；id 冲突时 `WithModelInfo` 显式条目优先。
 - 布尔字段遵循 OR 语义：手动条目声明 `SupportsThinking: true` 后，远端条目无法撤销它。
 - **Known 语义**（原则：自定义模型不猜测）：手动配置 `Known=true`；仅靠 `/models` 发现的条目 `Known=false`，不推断任何能力。thinking 门控与上下文校验只对 `Known=true` 的条目生效。
 - 别名：手动条目可声明 `Aliases`，查询时自动归一到规范 ID。
+- **声明的元数据参与请求门控**：`ContextWindow` 用于上下文校验；`MaxOutputTokens` 在请求未显式给出输出上限时作为输出上限生效（回退链：请求值 → 注册表 → `WithDefaultMaxOutputTokens`）。
 
 ## 手动配置
 
@@ -30,7 +32,7 @@ rosetta.WithModelsFile("models.json")
 {"models": [{"id": "my-finetune", "context_window": 32768, "max_output_tokens": 8192}]}
 ```
 
-文件不存在或格式非法时 `NewClient` 直接报错。
+文件不存在或格式非法时 `NewClient` 直接报错。两种方式可同时使用：文件放公共配置，代码补少量覆盖，id 冲突时 `WithModelInfo` 显式条目优先。
 
 ## 查询
 
@@ -53,6 +55,8 @@ client, err := rosetta.DetectClient(ctx,
 ```
 
 判定方式：主动探测 `GET /models`（先 Bearer 后 x-api-key），响应条目含 `type:"model"` → Anthropic，含 `object:"model"` → OpenAI；探测失败兜底 OpenAI Chat（兼容服务的最大公约数；需要 Responses 语义时用 `WithProtocol` 显式指定）。
+
+`DetectClient` 的探测尊重 `WithHTTPClient`（自定义传输/代理）与 `WithTimeout`（探测总时限）；单独调用 `DetectProtocol` 则使用内置的 10s 超时客户端。
 
 ## 能力门控
 

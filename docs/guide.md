@@ -12,7 +12,7 @@ client, err := rosetta.NewClient(
 ```
 
 - endpoint 与 API key 必须可用：显式给出，或使用所选协议的官方默认端点。
-- endpoint 规则：带版本路径（`/v1`、`/api/paas/v4`）原样保留；裸主机自动补 `/v1`。
+- endpoint 规则：带版本路径（`/v1`、`/api/paas/v4`）原样保留；裸主机自动补 `/v1`；base 上的 query 参数保留在拼接后 URL 的末尾。
 - 凭证发送方式由协议决定：OpenAI 系 `Authorization: Bearer`，Anthropic `x-api-key`（同时附带 Bearer 以兼容网关）。
 - `Client` 并发安全，可多 goroutine 共享；`Stream` 不并发。
 
@@ -23,8 +23,8 @@ client, err := rosetta.NewClient(
 | `WithEndpoint(url)` | 协议官方地址 | API 基地址，见上方规则 |
 | `WithAPIKey(key)` | 无（必填） | 凭证 |
 | `WithProtocol(p)` | `ProtoOpenAIChat` | `ProtoOpenAIChat` / `ProtoOpenAIResponses` / `ProtoAnthropic`；也可由 `DetectClient` 探测决定 |
-| `WithHTTPClient(c)` | `&http.Client{}` | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式 |
-| `WithTimeout(d)` | 无 | 仅约束非流式调用（Chat / ListModels / ModelInfo） |
+| `WithHTTPClient(c)` | `&http.Client{}` | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式；也用于 `DetectClient` 的协议探测 |
+| `WithTimeout(d)` | 无 | 仅约束非流式调用（Chat / ListModels / ModelInfo），以及 `DetectClient` 的协议探测 |
 | `WithMaxRetries(n)` | 2 | 可重试失败（网络错误、408/429/5xx/529）的重试次数，见[重试策略](protocols.md#重试策略) |
 | `WithRetryBase(d)` | 400ms | 退避基数（逐次翻倍 ±20%，上限 8s） |
 | `WithDefaultMaxOutputTokens(n)` | 无 | 请求未指定输出上限时的默认值 |
@@ -34,8 +34,8 @@ client, err := rosetta.NewClient(
 | `WithThinkingRectify(v)` | true | Anthropic 预算错误的响应式整流开关 |
 | `WithMaxTokensField(f)` | 自动探测 | 强制 OpenAI Chat 的输出上限字段（`max_completion_tokens` / `max_tokens`） |
 | `WithStrictContextCheck(v)` | false | 上下文超限从告警变为报错 |
-| `WithModelInfo(...)` | 无 | 手动注入模型元数据（可多次调用），见[模型体系](models.md) |
-| `WithModelsFile(path)` | 无 | 从 JSON 文件加载模型元数据 |
+| `WithModelInfo(...)` | 无 | 手动注入模型元数据（可多次调用，与文件配置合并，id 冲突时优先），见[模型体系](models.md) |
+| `WithModelsFile(path)` | 无 | 从 JSON 文件加载模型元数据（与 `WithModelInfo` 合并进同一手动层） |
 | `WithQuirks(q)` | 无 | 声明第三方兼容性偏差，见[协议与兼容](protocols.md) |
 
 ## 消息与内容块
@@ -73,7 +73,7 @@ type ChatRequest struct {
 	Model           string             // 必填
 	Messages        []Message          // 与 System 至少有一项
 	System          string             // 顶层系统提示
-	MaxOutputTokens int                // 0 = 用 WithDefaultMaxOutputTokens；Anthropic 兜底 4096
+	MaxOutputTokens int                // 0 = 依次回退：注册表元数据 → WithDefaultMaxOutputTokens；Anthropic 兜底 4096
 	Temperature     *float64           // 指针，nil = 不发送；用 rosetta.Float(0.7) 构造
 	TopP            *float64
 	StopSequences   []string           // Responses 协议不支持，会被丢弃并记日志
@@ -116,11 +116,11 @@ Thinking: &rosetta.ThinkingConfig{Effort: rosetta.EffortMedium} // 低/中/高�
 
 Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；thinking 模式下丢弃 temperature/top_p；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。
 
-**能力门控**：对内置已知的非思考模型（`ModelInfo.Known && !SupportsThinking`），请求 thinking 默认报 `ErrThinkingUnsupported`；`WithThinkingFallback(true)` 改为静默去掉 thinking 配置。未知模型不做猜测、原样透传。
+**能力门控**：对已知的非思考模型（手动配置的 `ModelInfo.Known && !SupportsThinking`），请求 thinking 默认报 `ErrThinkingUnsupported`；`WithThinkingFallback(true)` 改为静默去掉 thinking 配置。未知模型不做猜测、原样透传。
 
 ## 上下文校验
 
-请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每条消息 +4）比较 `估算输入 + 输出上限` 与窗口：
+请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每条消息 +4、每个工具定义 +24 与 schema 文本）比较 `估算输入 + 输出上限` 与窗口：
 
 - 超限默认**仅告警**（进日志），请求照发；
 - `WithStrictContextCheck(true)` 改为返回 `ErrContextTooLong`。
@@ -135,7 +135,7 @@ type ChatResponse struct {
 	Content    []Block    // 生成内容：text / thinking / tool_call，按协议原始顺序
 	StopReason StopReason
 	Usage      Usage
-	Raw        json.RawMessage // 原始响应体（截断至 4KB）
+	Raw        json.RawMessage // 原始响应体（截断至 4KB；本身不是合法 JSON 时降级为 JSON 字符串，保证可再序列化）
 }
 ```
 

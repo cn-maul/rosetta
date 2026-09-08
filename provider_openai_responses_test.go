@@ -1,9 +1,15 @@
 package rosetta
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 )
 
 func TestResponsesBuildPayload(t *testing.T) {
@@ -253,6 +259,29 @@ func TestResponsesStreamEventsErrors(t *testing.T) {
 	}
 }
 
+// Events after response.completed must not leak past MessageEnd (same
+// end-discipline as the [DONE]/message_stop guards on the other two
+// protocols).
+func TestResponsesStreamEventsEndDiscipline(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoOpenAIResponses))
+	p := c.provider.(*openaiResponsesProvider)
+	body := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"m\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	next := p.streamEvents(strings.NewReader(body))
+
+	if ev, err := next(); err != nil || ev.Type != EventMessageStart {
+		t.Fatalf("first = %v %v", ev, err)
+	}
+	if ev, err := next(); err != nil || ev.Type != EventMessageEnd || ev.StopReason != StopEnd {
+		t.Fatalf("second = %v %v", ev, err)
+	}
+	if ev, err := next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("after completed got ev=%v err=%v, want io.EOF", ev, err)
+	}
+}
+
 func TestMapResponsesStop(t *testing.T) {
 	tests := []struct {
 		status, reason string
@@ -269,4 +298,119 @@ func TestMapResponsesStop(t *testing.T) {
 			t.Errorf("mapResponsesStop(%q,%q) = %s, want %s", tt.status, tt.reason, got, tt.want)
 		}
 	}
+}
+
+// Full unary round trip over the Responses protocol: the request hits
+// POST /responses with the unified payload and the response decodes.
+func TestResponsesChatE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/responses" {
+				w.WriteHeader(404)
+				return
+			}
+			if r.Header.Get("Authorization") != "Bearer k" {
+				w.WriteHeader(401)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			var pl map[string]any
+			if err := json.Unmarshal(body, &pl); err != nil {
+				w.WriteHeader(400)
+				return
+			}
+			if pl["model"] != "gpt-5" || pl["max_output_tokens"] != float64(200) {
+				w.WriteHeader(400)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"id":"r1","model":"gpt-5","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello responses"}]}],"usage":{"input_tokens":4,"output_tokens":2,"total_tokens":6}}`)
+		}))
+		c := newTestClient(t, WithProtocol(ProtoOpenAIResponses), WithHTTPClient(srv.Client()))
+		resp, err := c.Chat(context.Background(), &ChatRequest{
+			Model:           "gpt-5",
+			Messages:        []Message{User("hi")},
+			MaxOutputTokens: 200,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Text() != "hello responses" || resp.StopReason != StopEnd {
+			t.Fatalf("resp = %+v", resp)
+		}
+		if resp.Usage.TotalTokens != 6 {
+			t.Fatalf("usage = %+v", resp.Usage)
+		}
+	})
+}
+
+// Streaming round trip: typed SSE events fold into unified events, usage
+// arrives with response.completed and the stream ends there.
+func TestResponsesStreamChatE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "event: response.created\n"+
+				"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5\",\"status\":\"in_progress\"}}\n\n"+
+				"event: response.output_text.delta\n"+
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n"+
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n"+
+				"event: response.completed\n"+
+				"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2,\"total_tokens\":6}}}\n\n")
+		}))
+		c := newTestClient(t, WithProtocol(ProtoOpenAIResponses), WithHTTPClient(srv.Client()))
+		stream, err := c.ChatStream(context.Background(), &ChatRequest{Model: "gpt-5", Messages: []Message{User("hi")}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer stream.Close()
+
+		var sb strings.Builder
+		var startID string
+		for stream.Next() {
+			switch ev := stream.Event(); ev.Type {
+			case EventMessageStart:
+				startID = ev.ID
+			case EventTextDelta:
+				sb.WriteString(ev.Text)
+			}
+		}
+		if err := stream.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if startID != "r1" || sb.String() != "hello" {
+			t.Fatalf("id=%q text=%q", startID, sb.String())
+		}
+		if u := stream.Usage(); u.TotalTokens != 6 {
+			t.Fatalf("usage = %+v", u)
+		}
+		if p := stream.Partial(); p.StopReason != StopEnd {
+			t.Fatalf("partial stop = %s", p.StopReason)
+		}
+	})
+}
+
+// Model catalog round trip over the shared OpenAI-family endpoint.
+func TestResponsesListModelsE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/v1/models" {
+				w.WriteHeader(404)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"data":[{"id":"gpt-5"},{"id":"gpt-5-mini"}]}`)
+		}))
+		c := newTestClient(t, WithProtocol(ProtoOpenAIResponses), WithHTTPClient(srv.Client()))
+		models, err := c.ListModels(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(models) != 2 || models[0].ID != "gpt-5" || models[1].ID != "gpt-5-mini" {
+			t.Fatalf("models = %+v", models)
+		}
+		if models[0].Known {
+			t.Fatal("remote entries must not be Known")
+		}
+	})
 }

@@ -81,7 +81,8 @@ func WithModelInfo(infos ...ModelInfo) Option {
 }
 
 // WithModelsFile loads manual model metadata from a JSON file with the
-// same schema as the built-in knowledge base: {"models":[...]}.
+// same schema as WithModelInfo: {"models":[...]}. Its entries merge with
+// WithModelInfo values; explicit values win on duplicate ids.
 func WithModelsFile(path string) Option {
 	return func(s *settings) { s.modelsFile = path }
 }

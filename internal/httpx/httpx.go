@@ -50,7 +50,7 @@ func New() *Client {
 func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
 		resp, err := c.attempt(ctx, call)
-		if err == nil && !retryStatus(resp.StatusCode) {
+		if err == nil && !RetryableStatus(resp.StatusCode) {
 			return resp, nil
 		}
 		if attempt >= c.MaxRetries || ctx.Err() != nil {
@@ -119,7 +119,9 @@ func (c *Client) log(msg string, args ...any) {
 	}
 }
 
-func retryStatus(code int) bool {
+// RetryableStatus reports whether an HTTP status code is worth retrying.
+// It is the single source of truth shared with the SDK's error typing.
+func RetryableStatus(code int) bool {
 	switch code {
 	case http.StatusRequestTimeout, http.StatusTooManyRequests,
 		http.StatusInternalServerError, http.StatusBadGateway,

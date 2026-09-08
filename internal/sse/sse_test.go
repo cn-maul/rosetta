@@ -134,6 +134,16 @@ func TestSplitReads(t *testing.T) {
 	}
 }
 
+// A data line far larger than the internal buffer must be reassembled
+// without truncation or failure.
+func TestVeryLongLine(t *testing.T) {
+	long := strings.Repeat("x", 1<<20) // 1 MiB in a single line
+	evs := collect(t, "data: "+long+"\n\n", nil)
+	if len(evs) != 1 || string(evs[0].Data) != long {
+		t.Fatalf("long line mangled: %d events, data len %d", len(evs), len(evs[0].Data))
+	}
+}
+
 func TestEmptyStream(t *testing.T) {
 	if evs := collect(t, "", nil); len(evs) != 0 {
 		t.Fatalf("got %d events", len(evs))

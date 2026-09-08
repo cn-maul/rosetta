@@ -6,29 +6,20 @@
 //
 // The decoders are implemented once on top of encoding/json/v2
 // (jsontext token streaming, stable since Go 1.27): values are dispatched
-// on their token kind, so no byte round-trips are needed. The legacy
-// encoding/json UnmarshalJSON entry points delegate to the same logic, so
-// behavior is identical whether the program is built with GOEXPERIMENT
-// jsonv2 (the default) or with the v1-only opt-out.
+// on their token kind, so no byte round-trips are needed. The v2
+// UnmarshalJSONFrom entry point is called directly by the v1
+// encoding/json API (v2-backed since Go 1.27); this package therefore
+// requires the default jsonv2 build mode and does not support the
+// GOEXPERIMENT=nojsonv2 opt-out.
 package jsonx
 
 import (
-	"bytes"
 	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"strconv"
 	"strings"
 )
-
-// fromBytes adapts the legacy encoding/json entry point (a single JSON
-// value as raw bytes) to the streaming v2 implementation.
-func fromBytes(b []byte, fn func(d *jsontext.Decoder) error) error {
-	if len(bytes.TrimSpace(b)) == 0 {
-		return nil // empty input: leave the zero value untouched
-	}
-	return fn(jsontext.NewDecoder(bytes.NewReader(b)))
-}
 
 // FlexString accepts a JSON string, number, boolean or null and always
 // yields a string. Numbers and booleans are taken verbatim from their raw
@@ -64,10 +55,6 @@ func (f *FlexString) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		return dec.SkipValue()
 	}
 	return nil
-}
-
-func (f *FlexString) UnmarshalJSON(b []byte) error {
-	return fromBytes(b, f.UnmarshalJSONFrom)
 }
 
 func (f FlexString) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }
@@ -132,10 +119,6 @@ func (f *FlexInt64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	}
 }
 
-func (f *FlexInt64) UnmarshalJSON(b []byte) error {
-	return fromBytes(b, f.UnmarshalJSONFrom)
-}
-
 func (f FlexInt64) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }
 
 // ContentString decodes an OpenAI-style "content" field: usually a plain
@@ -189,10 +172,6 @@ func (f *ContentString) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	default:
 		return dec.SkipValue() // objects and scalars: leave unset
 	}
-}
-
-func (f *ContentString) UnmarshalJSON(b []byte) error {
-	return fromBytes(b, f.UnmarshalJSONFrom)
 }
 
 func (f ContentString) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }

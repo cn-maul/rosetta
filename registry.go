@@ -36,17 +36,30 @@ func newRegistry() *Registry {
 }
 
 // LoadFile loads manual model configuration from a JSON file:
-// {"models":[...]} with the same fields as ModelInfo.
+// {"models":[...]} with the same fields as ModelInfo. It replaces the
+// manual configuration layer.
 func (r *Registry) LoadFile(path string) error {
+	infos, err := parseModelsFile(path)
+	if err != nil {
+		return err
+	}
+	r.SetManual(infos)
+	return nil
+}
+
+// parseModelsFile reads and validates a manual model configuration file,
+// marking every entry Known. It does not touch the registry, so callers
+// can merge the result with other manual sources before installing it.
+func parseModelsFile(path string) ([]ModelInfo, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("rosetta: reading models file: %w", err)
+		return nil, fmt.Errorf("rosetta: reading models file: %w", err)
 	}
 	var doc struct {
 		Models []ModelInfo `json:"models"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
-		return fmt.Errorf("rosetta: parsing models file %s: %w", path, err)
+		return nil, fmt.Errorf("rosetta: parsing models file %s: %w", path, err)
 	}
 	infos := make([]ModelInfo, 0, len(doc.Models))
 	for _, m := range doc.Models {
@@ -55,8 +68,7 @@ func (r *Registry) LoadFile(path string) error {
 			infos = append(infos, m)
 		}
 	}
-	r.SetManual(infos)
-	return nil
+	return infos, nil
 }
 
 // SetManual installs (replacing) the manual configuration layer.

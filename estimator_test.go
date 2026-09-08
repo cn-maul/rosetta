@@ -1,6 +1,9 @@
 package rosetta
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestEstimateTokens(t *testing.T) {
 	tests := []struct {
@@ -50,5 +53,19 @@ func TestEstimateInputTokens(t *testing.T) {
 	// result (6 ascii→2)+4 = 39
 	if got := req.estimateInputTokens(); got != 39 {
 		t.Fatalf("estimateInputTokens() = %d, want 39", got)
+	}
+
+	// Tool definitions add their overhead, name, description and schema.
+	req = &ChatRequest{
+		Messages: []Message{User("hi")},
+		Tools: []ToolDefinition{
+			{Name: "get_weather", Description: "current weather",
+				Parameters: json.RawMessage(`{"type":"object","properties":{}}`)},
+		},
+	}
+	// user 2+4; tool: 24 + name (11 ascii→3) + desc (15 ascii→4) + schema
+	// (33 ascii→9) = 40; total 45
+	if got := req.estimateInputTokens(); got != 45 {
+		t.Fatalf("estimateInputTokens() with tools = %d, want 45", got)
 	}
 }

@@ -73,9 +73,13 @@ func NewClient(opts ...Option) (*Client, error) {
 
 	c := &Client{settings: st, http: hx, registry: newRegistry()}
 	if st.modelsFile != "" {
-		if err := c.registry.LoadFile(st.modelsFile); err != nil {
+		infos, err := parseModelsFile(st.modelsFile)
+		if err != nil {
 			return nil, err
 		}
+		// File entries and explicit WithModelInfo values merge into one
+		// manual layer; explicit entries win on duplicate ids.
+		st.manualModels = append(infos, st.manualModels...)
 	}
 	if len(st.manualModels) > 0 {
 		c.registry.SetManual(st.manualModels)
@@ -154,8 +158,8 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, erro
 }
 
 // ListModels fetches the endpoint's model catalog and merges it into the
-// registry's remote layer (below manual configuration, above the built-in
-// knowledge base). The merged catalog is returned.
+// registry's remote layer (below manual configuration). The merged catalog
+// is returned.
 func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	if c.settings.timeout > 0 {
 		var cancel context.CancelFunc
@@ -281,22 +285,15 @@ func (c *Client) record(model string, u Usage, missing bool) {
 }
 
 // effectiveMaxOutput resolves the output cap: request value, then the
-// client default. Zero means "let the provider decide" (only safe on
-// OpenAI protocols; Anthropic substitutes its own floor of 4096).
+// model's declared metadata, then the client default. Zero means "let the
+// provider decide" (only safe on OpenAI protocols; Anthropic substitutes
+// its own floor of 4096).
 func (c *Client) effectiveMaxOutput(req *ChatRequest) int {
 	if req.MaxOutputTokens > 0 {
 		return req.MaxOutputTokens
 	}
-	return c.settings.defaultMaxOutput
-}
-
-// joinEndpoint appends an API path to the configured base URL. A base
-// without a path (bare host) gets "/v1" inserted, matching OpenAI-style
-// versioning; explicit version paths are preserved.
-func joinEndpoint(base, path string) string {
-	b := trimTrailingSlash(base)
-	if u, err := parseURL(b); err == nil && (u.Path == "" || u.Path == "/") {
-		b += "/v1"
+	if mi, ok := c.registry.Lookup(req.Model); ok && mi.MaxOutputTokens > 0 {
+		return mi.MaxOutputTokens
 	}
-	return b + path
+	return c.settings.defaultMaxOutput
 }

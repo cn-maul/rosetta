@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -33,6 +34,10 @@ func main() {
 		Temperature:     new(0.7),
 	})
 	if err != nil {
+		// Go 1.26+ 的 errors.AsType 免去声明变量的 errors.As。
+		if apiErr, ok := errors.AsType[*rosetta.APIError](err); ok {
+			log.Fatalf("API error %d (%s): %s", apiErr.StatusCode, apiErr.Type, apiErr.Message)
+		}
 		log.Fatal(err)
 	}
 

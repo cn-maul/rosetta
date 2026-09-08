@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 )
 
 // EventType enumerates unified stream event kinds.
@@ -144,6 +145,7 @@ func (s *streamCore) Usage() Usage { return s.usage }
 
 func (s *streamCore) Partial() *ChatResponse {
 	cp := s.partial
+	cp.Content = slices.Clone(cp.Content) // snapshots must not mutate with the live stream
 	return &cp
 }
 
@@ -151,6 +153,7 @@ func (s *streamCore) Collect() (*ChatResponse, error) {
 	for s.Next() {
 	}
 	resp := s.partial
+	resp.Content = slices.Clone(resp.Content)
 	return &resp, s.err
 }
 

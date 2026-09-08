@@ -170,7 +170,13 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 			}
 			out = append(out, mm)
 		case RoleTool:
-			if b := m.firstBlock(BlockToolResult); b != nil {
+			// Each tool result is its own message on this protocol; a
+			// message may carry several results (parallel tool calls) and
+			// every one of them must reach the model.
+			for _, b := range m.Blocks {
+				if b.Type != BlockToolResult {
+					continue
+				}
 				out = append(out, map[string]any{
 					"role":         "tool",
 					"tool_call_id": b.ToolCallID,
@@ -642,7 +648,7 @@ func parseOpenAIError(status int, body []byte, method, url, requestID string) *A
 		URL:        url,
 		RequestID:  requestID,
 		Retryable:  retryableStatus(status),
-		Raw:        truncateBody(body),
+		Raw:        safeTruncateBody(body),
 	}
 	var top struct {
 		Error json.RawMessage `json:"error"`

@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -81,6 +83,25 @@ func TestCheckContext(t *testing.T) {
 	small := &ChatRequest{Model: "m1", Messages: []Message{User("hi")}, MaxOutputTokens: 5}
 	if _, err := c2.prepare(small); err != nil {
 		t.Fatalf("small request err = %v", err)
+	}
+}
+
+// WithModelsFile and WithModelInfo must merge into one manual layer —
+// the file must not silently overwrite the code-level entries.
+func TestModelsFileAndManualMerge(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "models.json")
+	if err := os.WriteFile(path, []byte(`{"models":[{"id":"from-file","context_window":1000}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := newTestClient(t,
+		WithModelsFile(path),
+		WithModelInfo(ModelInfo{ID: "from-code", ContextWindow: 2000}),
+	)
+	for _, want := range []string{"from-file", "from-code"} {
+		if _, ok := c.registry.Lookup(want); !ok {
+			t.Fatalf("model %q missing after merge", want)
+		}
 	}
 }
 
@@ -337,6 +358,84 @@ func TestDetectClientPinsProtocol(t *testing.T) {
 	}
 	if c.Protocol() != ProtoAnthropic {
 		t.Fatalf("protocol = %s", c.Protocol())
+	}
+}
+
+// roundTripCounter wraps a transport to observe whether it was used.
+type roundTripCounter struct {
+	base  http.RoundTripper
+	calls int
+}
+
+func (rt *roundTripCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.calls++
+	return rt.base.RoundTrip(req)
+}
+
+// The probe must run through the caller's HTTP client, not a throwaway
+// default one.
+func TestDetectClientUsesCustomHTTPClient(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":[{"object":"model","id":"gpt-4o"}]}`)
+	}))
+	defer srv.Close()
+	rt := &roundTripCounter{base: srv.Client().Transport}
+	if _, err := DetectClient(context.Background(),
+		WithEndpoint(srv.URL), WithAPIKey("k"),
+		WithHTTPClient(&http.Client{Transport: rt}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if rt.calls == 0 {
+		t.Fatal("custom HTTP client was not used for the probe")
+	}
+}
+
+// WithTimeout must bound the probe; a hanging endpoint fails fast instead
+// of silently falling back.
+func TestDetectClientAppliesTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(10 * time.Second)
+		}))
+		_, err := DetectClient(context.Background(),
+			WithEndpoint(srv.URL), WithAPIKey("k"),
+			WithHTTPClient(srv.Client()), WithTimeout(1*time.Second),
+		)
+		if err == nil {
+			t.Fatal("hanging endpoint must fail under WithTimeout, not fall back")
+		}
+	})
+}
+
+// DetectClient must not write its protocol pin into the caller's options
+// backing array: the caller's later appends would then silently pick up a
+// stale WithProtocol.
+func TestDetectClientDoesNotMutateCallerOpts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"data":[{"type":"model","id":"claude-x"}]}`)
+	}))
+	defer srv.Close()
+
+	// Pre-allocated cap > len so an unbounded append inside DetectClient
+	// would write into our backing array.
+	opts := make([]Option, 0, 4)
+	opts = append(opts, WithEndpoint(srv.URL), WithAPIKey("k"))
+	if _, err := DetectClient(context.Background(), opts...); err != nil {
+		t.Fatal(err)
+	}
+	// The caller appends its own protocol pin. If DetectClient had written
+	// into the shared array, the third slot would already hold a stale
+	// WithProtocol(ProtoAnthropic).
+	opts = append(opts, WithProtocol(ProtoOpenAIChat))
+	c, err := NewClient(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Protocol() != ProtoOpenAIChat {
+		t.Fatalf("caller options mutated by DetectClient: protocol = %s", c.Protocol())
 	}
 }
 

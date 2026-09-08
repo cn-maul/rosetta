@@ -18,7 +18,8 @@ func EstimateTokens(text string) int {
 }
 
 // estimateInputTokens approximates the prompt size of a request, including
-// per-message overhead and a flat estimate per image.
+// per-message overhead, a flat estimate per image, and the tool
+// definitions offered to the model.
 func (r *ChatRequest) estimateInputTokens() int {
 	total := 0
 	if r.System != "" {
@@ -40,6 +41,11 @@ func (r *ChatRequest) estimateInputTokens() int {
 				total += EstimateTokens(b.Content)
 			}
 		}
+	}
+	for _, t := range r.Tools {
+		// Per-tool overhead plus the name, description and schema text.
+		total += 24 + EstimateTokens(t.Name) + EstimateTokens(t.Description)
+		total += EstimateTokens(string(t.Parameters))
 	}
 	return total
 }

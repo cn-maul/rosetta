@@ -1,0 +1,8 @@
+# Go sources must stay LF everywhere so gofmt -l stays clean on Windows
+# checkouts (core.autocrlf would otherwise produce CRLF working trees).
+*.go text eol=lf
+
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.mod text eol=lf

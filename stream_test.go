@@ -86,6 +86,52 @@ func TestStreamCoreCollect(t *testing.T) {
 	}
 }
 
+// Partial snapshots must be point-in-time: later events may not mutate a
+// snapshot the caller already holds.
+func TestStreamCorePartialSnapshotIsolated(t *testing.T) {
+	s := newStream(seqNext(
+		&Event{Type: EventTextDelta, Text: "hel"},
+		&Event{Type: EventTextDelta, Text: "lo"},
+		&Event{Type: EventTextDelta, Text: "!"},
+	), nil)
+	defer s.Close()
+
+	if !s.Next() {
+		t.Fatal("Next must be true")
+	}
+	snap := s.Partial()
+	if snap.Text() != "hel" {
+		t.Fatalf("snapshot = %q, want %q", snap.Text(), "hel")
+	}
+	for s.Next() {
+	}
+	if err := s.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Text() != "hel" {
+		t.Fatalf("snapshot mutated by later events: %q", snap.Text())
+	}
+	if got := s.Partial().Text(); got != "hello!" {
+		t.Fatalf("live partial = %q, want %q", got, "hello!")
+	}
+
+	// Collect's result is isolated from the live stream too.
+	s2 := newStream(seqNext(
+		&Event{Type: EventTextDelta, Text: "x"},
+		&Event{Type: EventTextDelta, Text: "y"},
+	), nil)
+	resp, err := s2.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s2.Partial().Text(); got != "xy" {
+		t.Fatalf("live partial after Collect = %q", got)
+	}
+	if resp.Text() != "xy" {
+		t.Fatalf("collect result = %q", resp.Text())
+	}
+}
+
 func TestStreamCoreErrorSurfaced(t *testing.T) {
 	boom := errors.New("boom")
 	var endCalls int
@@ -149,5 +195,54 @@ func TestStreamCoreNilEventFailsNotPanics(t *testing.T) {
 	}
 	if s.Err() == nil {
 		t.Fatal("nil event must surface as an error")
+	}
+}
+
+// The attached closer releases the response body exactly once, on early
+// Close and on natural end alike — the connection must never leak.
+type closerRecorder struct{ n int }
+
+func (c *closerRecorder) Close() error { c.n++; return nil }
+
+func TestStreamCoreCloserCalledOnce(t *testing.T) {
+	// Early Close mid-stream.
+	cl := &closerRecorder{}
+	s := newStream(func() (*Event, error) { return &Event{Type: EventTextDelta, Text: "x"}, nil }, nil)
+	s.attachCloser(cl)
+	if !s.Next() {
+		t.Fatal("Next must be true")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil { // idempotent
+		t.Fatal(err)
+	}
+	if cl.n != 1 {
+		t.Fatalf("closer called %d times after early Close, want 1", cl.n)
+	}
+
+	// Natural end also releases.
+	cl = &closerRecorder{}
+	s2 := newStream(seqNext(&Event{Type: EventMessageEnd, StopReason: StopEnd}), nil)
+	s2.attachCloser(cl)
+	for s2.Next() {
+	}
+	if err := s2.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if cl.n != 1 {
+		t.Fatalf("closer called %d times after natural end, want 1", cl.n)
+	}
+
+	// Error end releases too.
+	cl = &closerRecorder{}
+	boom := errors.New("boom")
+	s3 := newStream(func() (*Event, error) { return nil, boom }, nil)
+	s3.attachCloser(cl)
+	for s3.Next() {
+	}
+	if cl.n != 1 {
+		t.Fatalf("closer called %d times after error end, want 1", cl.n)
 	}
 }

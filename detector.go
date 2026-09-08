@@ -17,14 +17,14 @@ import (
 // also serve /chat/completions. Override with WithProtocol when
 // Responses semantics are required or probing is impossible.
 func DetectProtocol(ctx context.Context, endpoint, apiKey string) (Protocol, error) {
-	return detectByProbe(ctx, endpoint, apiKey)
+	return detectByProbe(ctx, endpoint, apiKey, &http.Client{Timeout: 10 * time.Second})
 }
 
 // detectByProbe probes GET /models, first with Bearer auth then with
-// x-api-key, and classifies the catalog shape.
-func detectByProbe(ctx context.Context, endpoint, apiKey string) (Protocol, error) {
+// x-api-key, and classifies the catalog shape. The caller supplies the
+// HTTP client so custom transports and deadlines are honored.
+func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client) (Protocol, error) {
 	probeURL := joinEndpoint(endpoint, "/models")
-	client := &http.Client{Timeout: 10 * time.Second}
 	try := func(auth string) (int, []byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 		if err != nil {
@@ -39,7 +39,7 @@ func detectByProbe(ctx context.Context, endpoint, apiKey string) (Protocol, erro
 				req.Header.Set("anthropic-version", anthropicVersion)
 			}
 		}
-		resp, err := client.Do(req)
+		resp, err := hc.Do(req)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -78,7 +78,8 @@ func detectByProbe(ctx context.Context, endpoint, apiKey string) (Protocol, erro
 
 // DetectClient builds a Client with automatic protocol detection: the
 // endpoint is classified via DetectProtocol and the result is pinned as
-// the client's protocol. Other options behave exactly as in NewClient.
+// the client's protocol. Other options behave exactly as in NewClient;
+// WithHTTPClient and WithTimeout apply to the probe too.
 func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 	st, err := buildSettings(opts)
 	if err != nil {
@@ -87,7 +88,16 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 	if st.endpoint == "" {
 		return nil, ErrNoEndpoint
 	}
-	proto, err := DetectProtocol(ctx, st.endpoint, st.apiKey)
+	hc := st.httpClient
+	if hc == nil {
+		hc = &http.Client{Timeout: 10 * time.Second}
+	}
+	if st.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, st.timeout)
+		defer cancel()
+	}
+	proto, err := detectByProbe(ctx, st.endpoint, st.apiKey, hc)
 	if err != nil {
 		return nil, fmt.Errorf("rosetta: detecting protocol for %s: %w", st.endpoint, err)
 	}

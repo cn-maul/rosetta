@@ -13,6 +13,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+      - name: Format
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
       - name: Build
         run: go build ./...
       - name: Vet
@@ -21,3 +27,9 @@ jobs:
         run: go test ./... -race -coverprofile=coverage.out
       - name: Coverage
         run: go tool cover -func=coverage.out
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
+          if [ "$(echo "$total < 75" | bc)" = "1" ]; then
+            echo "coverage $total% below 75% gate"; exit 1
+          fi
