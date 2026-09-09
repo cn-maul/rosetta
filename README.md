@@ -46,7 +46,7 @@ func main() {
 
 换服务商只需换 endpoint、key 和 model id；协议不对时加一行 `rosetta.WithProtocol(...)`，或改用 `rosetta.DetectClient` 自动探测。
 
-> **Go 1.26+ 提示**：可选字段可直接用内建的 `new(expr)` 写法（`Temperature: new(0.7)`），不必借助 `rosetta.Float`；`Float`/`Bool` 仍然保留，且带 `//go:fix inline` 标记，跑 `go fix` 会自动把旧调用内联成 `new(...)`。错误匹配同理，`errors.AsType[*rosetta.APIError](err)` 可替代声明变量的 `errors.As`。
+> **Go 版本提示**：SDK 最低要求 Go 1.27。Go 1.26 引入的可选字段 `new(expr)` 写法（例如 `Temperature: new(0.7)`）可用于兼容代码；`Float`/`Bool` 仍然保留。错误匹配同理，`errors.AsType[*rosetta.APIError](err)` 可替代声明变量的 `errors.As`。
 
 ## 文档
 

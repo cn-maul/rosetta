@@ -3,6 +3,7 @@ package rosetta
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
@@ -19,10 +20,13 @@ type protocolProvider interface {
 // Client is a unified client for one endpoint+credential pair. It is safe
 // for concurrent use by multiple goroutines.
 type Client struct {
-	settings *settings
-	http     *httpx.Client
-	provider protocolProvider
-	registry *Registry
+	settings         *settings
+	http             *httpx.Client
+	provider         protocolProvider
+	registry         *Registry
+	modelsMu         sync.Mutex
+	modelsRefreshing bool
+	modelsDone       chan struct{}
 }
 
 // buildSettings applies options and resolves protocol/endpoint defaults.
@@ -43,6 +47,9 @@ func buildSettings(opts []Option) (*settings, error) {
 	}
 	if st.endpoint == "" {
 		st.endpoint = defaultEndpoint(st.protocol)
+	}
+	if err := validateEndpoint(st.endpoint); err != nil {
+		return nil, fmt.Errorf("rosetta: invalid endpoint %q: %w", st.endpoint, err)
 	}
 	return st, nil
 }
@@ -83,6 +90,9 @@ func NewClient(opts ...Option) (*Client, error) {
 	}
 	if len(st.manualModels) > 0 {
 		c.registry.SetManual(st.manualModels)
+		if err := c.registry.Validate(); err != nil {
+			return nil, err
+		}
 	}
 	switch st.protocol {
 	case ProtoOpenAIChat:
@@ -178,6 +188,34 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 // of ListModels kept for API clarity (ListModels always fetches fresh).
 func (c *Client) RefreshModels(ctx context.Context) ([]ModelInfo, error) {
 	return c.ListModels(ctx)
+}
+
+func (c *Client) refreshModels(ctx context.Context) error {
+	c.modelsMu.Lock()
+	if c.modelsRefreshing {
+		done := c.modelsDone
+		c.modelsMu.Unlock()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	c.modelsRefreshing = true
+	c.modelsDone = make(chan struct{})
+	done := c.modelsDone
+	c.modelsMu.Unlock()
+
+	infos, err := c.provider.ListModels(ctx)
+	if err == nil {
+		c.registry.SetRemote(infos)
+	}
+	c.modelsMu.Lock()
+	c.modelsRefreshing = false
+	close(done)
+	c.modelsMu.Unlock()
+	return err
 }
 
 // ModelInfo returns merged metadata for one model id (aliases accepted).

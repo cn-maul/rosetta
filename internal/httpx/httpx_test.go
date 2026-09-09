@@ -174,9 +174,10 @@ func TestBodyRebuiltPerAttempt(t *testing.T) {
 		c := New()
 		c.HTTP = srv.Client()
 		call := &Call{
-			Method: http.MethodPost,
-			URL:    srv.URL,
-			Body:   func() ([]byte, error) { builds.Add(1); return []byte("{}"), nil },
+			Method:      http.MethodPost,
+			RetryPolicy: RetryAlways,
+			URL:         srv.URL,
+			Body:        func() ([]byte, error) { builds.Add(1); return []byte("{}"), nil },
 		}
 		resp, err := c.Do(context.Background(), call)
 		if err != nil {

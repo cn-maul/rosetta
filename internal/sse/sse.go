@@ -14,6 +14,13 @@ import (
 	"io"
 )
 
+const (
+	maxLineBytes  = 2 << 20
+	maxEventBytes = 16 << 20
+)
+
+var ErrTooLarge = errors.New("sse: event exceeds size limit")
+
 // Event is a single decoded SSE event.
 type Event struct {
 	Name string // value of the "event:" field; "" when absent
@@ -58,11 +65,21 @@ func (s *Scanner) Next() (*Event, error) {
 			}
 		case line[0] == ':': // comment / keep-alive
 		default:
+			if len(line) > maxLineBytes {
+				return nil, ErrTooLarge
+			}
 			field, value := splitField(line)
 			switch string(field) {
 			case "event":
 				s.name = string(value)
 			case "data":
+				size := len(value)
+				for _, part := range s.data {
+					size += len(part) + 1
+				}
+				if size > maxEventBytes {
+					return nil, ErrTooLarge
+				}
 				s.data = append(s.data, value)
 			case "id":
 				s.id = string(value)
@@ -89,6 +106,9 @@ func (s *Scanner) take() *Event {
 
 func (s *Scanner) readLine() ([]byte, error) {
 	line, err := s.r.ReadBytes('\n')
+	if len(line) > maxLineBytes+1 {
+		return nil, ErrTooLarge
+	}
 	switch {
 	case err == nil:
 		return chomp(line), nil

@@ -151,6 +151,29 @@ func mergeInfo(high, low ModelInfo) ModelInfo {
 	return out
 }
 
+// Validate checks that aliases resolve deterministically without shadowing
+// another canonical model id.
+func (r *Registry) Validate() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for alias, id := range r.alias {
+		if canonical, ok := r.resolved[alias]; ok && canonical.ID != id {
+			return fmt.Errorf("rosetta: alias %q conflicts with model id %q", alias, alias)
+		}
+		for otherID, model := range r.resolved {
+			if otherID == id {
+				continue
+			}
+			for _, otherAlias := range model.Aliases {
+				if otherAlias == alias {
+					return fmt.Errorf("rosetta: alias %q maps to both %q and %q", alias, id, otherID)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // Lookup resolves a model id (or alias) against the merged view.
 func (r *Registry) Lookup(id string) (ModelInfo, bool) {
 	r.mu.RLock()

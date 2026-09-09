@@ -107,11 +107,16 @@ func WithTimeout(d time.Duration) Option {
 	return func(s *settings) { s.timeout = d }
 }
 
-// WithMaxRetries sets how many times a failed attempt (transport error or
-// 408/429/5xx) is retried with backoff. Streams are retried only before
-// the first byte of the response body. Default 2.
+// WithMaxRetries sets how many times an eligible failed attempt (transport
+// error or 408/429/5xx) is retried with backoff. GET-like methods retry by
+// default; POST requests require an explicit internal idempotency policy.
+// Default 2.
 func WithMaxRetries(n int) Option {
-	return func(s *settings) { s.maxRetries = n }
+	return func(s *settings) {
+		if n >= 0 {
+			s.maxRetries = n
+		}
+	}
 }
 
 // WithRetryBase sets the initial backoff duration (doubled per attempt,

@@ -13,23 +13,31 @@ import (
 	"time"
 )
 
+type RetryPolicy int
+
+const (
+	RetryDefault RetryPolicy = iota
+	RetryNever
+	RetryIdempotent
+	RetryAlways
+)
+
 // Call describes one HTTP request. Body is re-invoked on every retry
 // attempt so the payload can be rebuilt cheaply.
 type Call struct {
-	Method string
-	URL    string
-	Header http.Header
-	Body   func() ([]byte, error) // nil for bodyless requests
+	Method      string
+	URL         string
+	Header      http.Header
+	Body        func() ([]byte, error) // nil for bodyless requests
+	RetryPolicy RetryPolicy
 }
 
-// Client wraps *http.Client with retries on transport errors and retryable
-// status codes (408/429/500/502/503/504), honoring the Retry-After header.
-// It never sets a global timeout: callers control deadlines via context.
+// Client wraps *http.Client with bounded retries and exponential backoff.
 type Client struct {
 	HTTP       *http.Client
 	MaxRetries int
-	Base       time.Duration // initial backoff, doubled per attempt
-	Cap        time.Duration // backoff ceiling
+	Base       time.Duration
+	Cap        time.Duration
 	Logger     *slog.Logger
 }
 
@@ -53,7 +61,7 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 		if err == nil && !RetryableStatus(resp.StatusCode) {
 			return resp, nil
 		}
-		if attempt >= c.MaxRetries || ctx.Err() != nil {
+		if !c.canRetry(call) || attempt >= c.MaxRetries || ctx.Err() != nil {
 			return resp, err
 		}
 		var wait time.Duration
@@ -70,10 +78,30 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 			wait = c.backoff(attempt)
 		}
 		c.log("retrying request", "url", call.URL, "attempt", attempt+1, "wait", wait.String())
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return nil, ctx.Err()
-		case <-time.After(wait):
+		case <-timer.C:
+		}
+	}
+}
+
+func (c *Client) canRetry(call *Call) bool {
+	switch call.RetryPolicy {
+	case RetryNever:
+		return false
+	case RetryAlways, RetryIdempotent:
+		return true
+	default:
+		switch call.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+			return true
+		default:
+			return false
 		}
 	}
 }

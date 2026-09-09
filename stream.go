@@ -86,6 +86,7 @@ type streamCore struct {
 
 	done     bool
 	released bool
+	closeErr error
 	err      error
 	cur      *Event
 	partial  ChatResponse
@@ -160,12 +161,11 @@ func (s *streamCore) Collect() (*ChatResponse, error) {
 func (s *streamCore) Close() error {
 	s.done = true
 	s.release()
-	return nil
+	return s.closeErr
 }
 
 // release finalizes the stream exactly once: cancels the request context,
-// closes the response body (freeing the connection on early Close) and
-// notifies the owner.
+// closes the response body and notifies the owner.
 func (s *streamCore) release() {
 	if s.released {
 		return
@@ -175,7 +175,10 @@ func (s *streamCore) release() {
 		s.cancel()
 	}
 	if s.closer != nil {
-		s.closer.Close()
+		s.closeErr = s.closer.Close()
+		if s.err == nil {
+			s.err = s.closeErr
+		}
 	}
 	if s.onEnd != nil {
 		s.onEnd(s.usage, s.err)

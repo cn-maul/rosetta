@@ -55,6 +55,19 @@ func TestRegistryAliases(t *testing.T) {
 	}
 }
 
+func TestRegistryAliasConflicts(t *testing.T) {
+	r := newRegistry()
+	r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"shared"}}, {ID: "m2", Aliases: []string{"shared"}}})
+	if err := r.Validate(); err == nil {
+		t.Fatal("duplicate alias must error")
+	}
+
+	r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"m2"}}, {ID: "m2"}})
+	if err := r.Validate(); err == nil {
+		t.Fatal("alias shadowing canonical id must error")
+	}
+}
+
 func TestRegistryListSorted(t *testing.T) {
 	r := newRegistry()
 	r.SetManual([]ModelInfo{{ID: "b"}, {ID: "a"}})
