@@ -57,14 +57,24 @@ func TestRegistryAliases(t *testing.T) {
 
 func TestRegistryAliasConflicts(t *testing.T) {
 	r := newRegistry()
-	r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"shared"}}, {ID: "m2", Aliases: []string{"shared"}}})
-	if err := r.Validate(); err == nil {
+	if err := r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"shared"}}, {ID: "m2", Aliases: []string{"shared"}}}); err == nil {
 		t.Fatal("duplicate alias must error")
 	}
+	// The rejected install must leave the previous state intact.
+	if len(r.List()) != 0 {
+		t.Fatalf("rejected install must not take effect: %+v", r.List())
+	}
 
-	r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"m2"}}, {ID: "m2"}})
-	if err := r.Validate(); err == nil {
+	if err := r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"m2"}}, {ID: "m2"}}); err == nil {
 		t.Fatal("alias shadowing canonical id must error")
+	}
+
+	// Cross-layer conflicts are rejected too, not resolved by map order.
+	if err := r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"shared"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.SetRemote([]ModelInfo{{ID: "m2", Aliases: []string{"shared"}}}); err == nil {
+		t.Fatal("cross-layer alias conflict must error")
 	}
 }
 

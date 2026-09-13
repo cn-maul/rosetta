@@ -7,11 +7,34 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"strings"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
 )
+
+// fileDataURL normalizes inline file content into the data: URL form the
+// OpenAI protocols expect ("data:<media>;base64,<data>"). A data: URL
+// passes through; raw base64 gets the media type applied, defaulting to
+// application/pdf (the document type both OpenAI protocols document).
+// http(s) URLs are rejected: those protocols want inline data or an
+// uploaded file_id (Anthropic is the one that accepts URL sources).
+func fileDataURL(b Block) (string, error) {
+	if strings.HasPrefix(b.FileData, "data:") {
+		return b.FileData, nil
+	}
+	if strings.HasPrefix(b.FileData, "http://") || strings.HasPrefix(b.FileData, "https://") {
+		return "", fmt.Errorf("%w: openai protocols accept inline file data or FileID, not a URL; use an http(s) URL only with Anthropic", ErrInvalidRequest)
+	}
+	if b.FileData == "" {
+		return "", fmt.Errorf("%w: file block needs FileData or FileID", ErrInvalidRequest)
+	}
+	media := b.MimeType
+	if media == "" {
+		media = "application/pdf"
+	}
+	return "data:" + media + ";base64," + b.FileData, nil
+}
 
 // openAIHeaders builds the common header set for OpenAI-family calls.
 func openAIHeaders(c *Client, accept string) http.Header {
@@ -36,7 +59,10 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		return nil, transport(err, method, url)
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := httpx.ReadBody(resp.Body, 8<<20)
+	if err != nil {
+		return nil, transport(err, method, url)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
 	}

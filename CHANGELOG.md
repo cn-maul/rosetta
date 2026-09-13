@@ -1,5 +1,97 @@
 # 更新日志
 
+## v0.4.0 (2026-09-13)
+
+新能力批次：检索配套 API（Embeddings / Rerank）与多模态输入扩展。
+
+### 新增
+
+- **`Client.Embed`：统一的文本向量接口**。走 OpenAI `/embeddings` 事实标准（OpenAI、Ollama、vLLM、Qwen、GLM、Moonshot、SiliconFlow 等兼容），`EmbeddingRequest{Model, Input, Dimensions, User, Extra}` → `EmbeddingResponse{Model, Data[]{Index, Embedding []float32}, Usage}`。无流式、无 thinking 门控，usage（仅输入侧 token）记入与 chat 同一个 tracker；幂等 POST，按重试策略重试。
+- **`Client.Rerank`：统一的重排序接口**。走 **Cohere `/rerank` 线格式**（Cohere、Jina、SiliconFlow、vLLM 等兼容；注意 Voyage 的 `top_k`/`data[]` 与 DashScope 的专用路径/嵌套结构和 Cohere 格式**不兼容**，当前未适配，请勿直连），`RerankRequest{Model, Query, Documents, TopN, ReturnDocuments, Extra}` → `RerankResponse{Results[]{Index, RelevanceScore, Document}}` 按相关度降序。各家 usage 口径不一（Cohere `meta.billed_units`/`meta.tokens`、Jina 平铺 `usage.total_tokens`）尽力映射，取不到时按 UsageMissing 记账。
+- **`WithEmbeddingEndpoint` / `WithEmbeddingAPIKey`**：Embed / Rerank 的独立基地址与凭证。典型场景 chat 与 embedding 不同服务商（如 chat 在 DeepSeek、embedding 在本地 Ollama）；未设置时用主 endpoint/key。
+- **Anthropic 客户端可用 Embed / Rerank 的唯一途径**：Anthropic 官方没有这两个 API，未配置 `WithEmbeddingEndpoint` 时调用返回新哨兵错误 `ErrNotSupported`，而不是发出注定失败的请求。
+- **`ModelInfo.Type` 模型分类字段**：`chat` / `embedding` / `rerank`（`ModelType*` 常量），手动配置层与合并逻辑生效；OpenAI 系 `/models` 不声明类型，SDK 不猜测，需要时手动声明。
+- **多模态输入扩展：`BlockAudio` / `BlockFile`**。音频（`AudioContent`/`UserAudio`，base64 + `wav`/`mp3`）与文档（`FileContent`/`UserFile`，base64、`data:` URL、http(s) URL；`FileRef` 引用已上传文件）作为新内容块进入统一消息模型。三协议映射（能力子集差异在请求构建期即报 `ErrInvalidRequest`，不支持一律显式报错、绝不静默丢弃）：OpenAI Chat → `input_audio` part / `file` part（`file_data`/`file_id`）；Responses → `input_file` part（`file_data`/`file_url`/`file_id`，**不支持音频**——官方输入类型联合仅 text/image/file）；Anthropic → `document` block（PDF 用 base64 source、`text/plain` 用官方 text source、http(s) PDF URL 用 url source、`FileRef` 用 file source，其他 MIME 拒绝；**不支持音频**）。媒体载荷做本地 base64/`data:` URL 语法校验；`FileData` 与 `FileID` 双来源报错。
+- 上下文估算计入新块类型（每段音频 +500、每份文档 +3000 的保守平估）。
+
+### 工程
+
+- 辅助 API 族（embedding/rerank）的公共管线收敛在 `auxiliary.go`：endpoint/key 解析、Bearer 头、`RetryIdempotent` 的 JSON POST 助手；64 MiB 响应读取上限（批量向量远大于 chat 响应）。
+- 新增测试：Embedding / Rerank 端到端（httptest + synctest，覆盖负载形状、aux 路由、凭证切换、usage 记账、错误路径、Anthropic 无 override 拦截）与三协议新块映射（含非法组合的构建期报错、data URL 直通、MimeType 缺省推导）。
+- 新增示例 `examples/embedding`、`examples/rerank`；文档：基础指南新增「音频与文件输入的协议差异」「嵌入与重排」，模型体系新增 `Type` 说明。
+
+### 修复（2026-09-13 审计）
+
+- **流完整性**：SSE 事件 JSON 解析失败不再静默跳过（三协议一致）——畸形事件可能携带文本或工具调用增量，丢弃会静默损坏回答，现在直接以结构化错误终止流。
+- **流截断检测**：流在收到 provider 终止事件（`message_stop` / `[DONE]` / `response.completed`）之前 EOF 时，仍会交付结束事件（StopOther、部分 usage），但随后 `Next()` 返回错误并以新哨兵 `ErrStreamTruncated` 匹配；部分结果保留在 `Stream.Partial()`。调用方从此能区分"干净结束"与"连接被掐断"。
+- **流内错误补齐上下文**：SSE `error` / `response.failed` 事件构造的 `APIError` 现在携带 `Method` / `URL` / `RequestID`。
+- **Registry 快照隔离**：`Aliases` 切片在安装与返回（`Lookup`/`List`）时均深拷贝，调用方无法绕过锁篡改注册表状态或制造数据竞争。
+- **alias 冲突确定性处理**：同一 alias 映射到多个 canonical id（同层、跨层或遮蔽其他模型 id）一律报错，不再依赖 Go map 随机遍历顺序决定归属。
+- **`Registry.SetManual` / `SetRemote` / `LoadFile` 返回 `error`**：拒绝非法状态而不是静默安装（见下方破坏性变更）。
+- **`refreshModels` 错误传播**：并发刷新的等待者现在读取同一轮刷新的真实结果；`ModelInfo` 的未知模型远程发现改走 `refreshModels`，并发查询共享一次 `/models` 请求，不再各自触发。
+- **响应体超限检测**：`httpx.ReadBody` 以 limit+1 字节探测溢出，超限报 `httpx.ErrBodyTooLarge` 而不是让截断的 JSON 冒充解码错误；chat（1 MiB）、models（8 MiB）、embedding/rerank（64 MiB）读取点全部接入，模型列表响应此前被忽略的读取错误现在也会上报。
+- **Embedding 响应校验**：`data` 非空、向量数与输入数一致、index 在 `[0, len(Input))` 内且不重复、向量非空，违规一律报协议错误；usage 兼容 `input_tokens` 变体（此前只认 `prompt_tokens`）。
+- **Rerank 响应校验**：`results` 非空、index 在 `[0, len(Documents))` 内且不重复、score 非有限值报错（防止调用方按 index 取文档越界 panic）。
+- **Rerank usage 口径**：Cohere `meta.billed_units.search_units` 是计费单位不是 token，不再回填 `Usage.InputTokens`/`TotalTokens` 污染统计。
+- **Embedding/Rerank 负值参数**：`Dimensions < 0`、`TopN < 0` 显式报 `ErrInvalidRequest`（此前被静默当作未设置）。
+- **endpoint 拒绝 query**：`WithEndpoint` / `WithEmbeddingEndpoint` 含查询串时构建报错——query 可能藏有凭据，会原样泄入错误信息与重试日志。
+- **`APIError.Raw` 敏感内容脱敏**：错误体存入 `Raw` 前做保守脱敏——敏感键（api_key/token/password/authorization/secret/credential 等）的字符串值替换为 `[redacted]`，OpenAI 风格的 `sk-…` 密钥材料在 JSON 与非 JSON 错误体（网关 HTML 等）中统一掩码；Raw 保持合法 JSON 且保留非敏感字段用于诊断。
+- **Responses 协议兼容降级重试**：对齐 Chat 的 sticky probe——第三方网关以 400 + 关键词拒绝 `reasoning` 或 `max_output_tokens` 时，去掉该可选字段重发一次并按客户端记忆降级；非 invalid_request 错误与无关 400 不会触发降级（此前 Responses 请求遇可选字段被拒直接失败）。
+- **Anthropic 认证头收敛**：默认只发送 `x-api-key`；需要 Bearer 的兼容网关用新选项 `WithAnthropicBearerAuth(true)` 显式开启，凭证不再默认复制到第二个认证通道。
+- 文档同步：`PLAN.md` 待确认事项的 Go 最低版本定为 1.27+；`APIError.Retryable` 语义在指南中明确。
+
+### 加固（2026-09-13 审计·第三阶段）
+
+- **统一请求结构校验**：`ChatRequest.validate` 现在拒绝未知角色、无内容块的消息、块缺必填字段（图片 URL、音频数据/格式、文件数据、工具调用 ID/参数 JSON、工具结果 ID）、负的 `MaxOutputTokens`、越界的 `Temperature`/`TopP`、未知的 `Thinking.Effort` 与负的 `BudgetTokens`——明显非法的请求在本地即报 `ErrInvalidRequest`，不再等到 provider 侧以各不相同的 400 表现。
+- **`Extra` 保留字段保护**：`Extra` 中与 SDK 管理的负载字段（`model`/`messages`/`stream`/输出上限/采样参数等，含 Embed/Rerank 负载）冲突的键默认报 `ErrInvalidRequest`，防止意外覆盖绕过校验；确有需要时用新选项 `WithExtraOverrides(true)` 显式放行。
+- **Stream 并发加固**：`streamCore` 状态迁移与资源释放改为互斥保护——`Close` / `Err` / `Usage` / `Partial` 可安全地与阻塞中的 `Next` 并发（例如看门狗超时关闭流），release 恰好执行一次，不会双重释放；`Next` 仍须单 goroutine 驱动。
+- **多媒体 token 估算可配置**：新选项 `WithMultimediaTokenEstimates`（Image/Audio/File，默认 1500/500/3000），strict 上下文校验在多媒体场景下的误判可通过调参缓解。
+- **`ModelInfo.DisableThinking`**：布尔合并是 OR 语义，稀疏的手动条目此前无法撤销远端目录错误的 `SupportsThinking=true`；新字段是显式撤销开关，强制合并结果为不支持 thinking（models 文件同名 `disable_thinking`）。
+
+### 破坏性变更（同上批修复）
+
+- `Registry.SetManual` / `SetRemote` 签名由无返回值改为 `error`；直接调用这两个公开方法（或 `LoadFile`）的代码需要接住错误。
+- endpoint（含 embedding endpoint）不允许携带 query 串；v0.3.1 的 `joinEndpoint` query 兼容随构建期拒绝一并失效。
+- Anthropic 请求默认不再发送 `Authorization: Bearer`；受影响的兼容网关请设置 `WithAnthropicBearerAuth(true)`。
+- 流式响应在 EOF 缺终止事件时 `Err()` 返回匹配 `ErrStreamTruncated` 的错误（此前返回 nil）。
+- Embedding / Rerank 对空结果、数量不匹配、非法 index/score 的响应改为报错（此前按原样返回）。
+
+### 修复（2026-09-13 第二轮审计，报告：docs/audit-2026-09-13.md）
+
+针对审计报告的 13 项主要发现与边界项的逐条修复，新增 `audit_report_fixes_test.go` 回归测试（16 例）。
+
+**流式与并发**
+
+- **`Stream.Partial()` 数据竞争（P1）**：快照的内容克隆移入锁内——此前克隆发生在解锁后，与 `Next()` 对既有块的就地修改构成 Go 数据竞争。`Err` / `Usage` / `Partial` / `Close` 与 `Next` 并发现在是真实承诺（race 检测通过）。
+- **用量回调死锁**：流结束回调（含用户 `UsageTracker.Record`）改在释放流互斥锁之后执行——tracker 同步读取 `Partial()` / `Err()` / `Usage()` 或调用 `Close()` 不再死锁；回调仍恰好触发一次。
+- **真实 HTTP 断流识别**：三协议流结束判断除 `io.EOF` 外纳入 `io.ErrUnexpectedEOF`——chunked 响应在终止零块前被掐断（网关超时、连接中断）现在同样先交付带已知 usage 的结束事件、再以 `ErrStreamTruncated` 失败，此前直接返回裸 `unexpected EOF` 且丢失已收到的 usage。
+
+**多模态协议正确性**
+
+- **Responses 拒绝音频输入**：官方 Responses 输入类型联合只有 text/image/file，`input_audio` 是 Chat Completions 的形状；此前错误编码并发送。音频请改用 Chat Completions 客户端。
+- **Responses 支持 `file_url`**：http(s) 文件 URL 现在映射为官方 `input_file.file_url`（此前误报为协议限制）。Chat Completions 仍拒绝 URL 文件（其官方形态确实只有内联数据/file_id）。
+- **Anthropic 文本文件 source**：`text/plain` 内联文档按官方契约转成 `text` source（base64 解码后原文直传）；base64 source 保留给 PDF；其他 MIME 显式报错而非伪装成 PDF。
+- **角色×块矩阵**：system/assistant 等角色不允许的块类型（如 system 里的文件/音频、assistant 里的图片）在请求校验期报 `ErrInvalidRequest`，不再被编码器静默丢弃——此前一条 system 消息携带的附件会无声消失。
+- **文件来源唯一**：`FileData` 与 `FileID` 同时设置报错（此前静默取旧 `FileID`，更新内容不生效）。
+- **媒体载荷本地校验**：音频/文件 base64 语法、`data:` URL 结构与空载荷在构建期报错。
+- **空文本占位恢复**：媒体块旁的空文本块视为占位符跳过，修复"空文本+有效图片"请求被新校验误拒的回归。
+
+**嵌入与重排校验**
+
+- **缺失/`null` 字段拒绝**：embedding 的 index、向量元素与 rerank 的 index/score 用指针/原始 JSON 解码，字段缺失或为 `null` 报协议错误，不再静默变零值。
+- **维度校验**：embedding 批内向量维度必须一致；显式传 `Dimensions` 时必须精确匹配（含 `WithExtraOverrides` 覆盖后的有效值）。返回数据按 Index 恢复输入顺序；rerank 结果按分数降序重排。
+- **负数用量拒绝**：embedding/rerank 响应的负 token 计数报协议错误，不再污染用量统计。
+- **rerank 兼容声明收敛**：文档明确 Voyage（`top_k`/`data[]`）与 DashScope（独立路径与嵌套结构）与 Cohere 线格式不兼容、当前未适配（官方文档核对结论）。
+- **`WithExtraOverrides(true)` 下的响应校验**改按覆盖后的有效 `input` / `documents` 数量执行。
+
+**其他**
+
+- **`Extra` 保留键按 API 族划分**：chat 不再全局保留 `user` —— `ChatRequest.Extra["user"]`（终端用户标识）恢复可用；embeddings/rerank 各自保留自己的负载字段。
+- **大错误体脱敏**：`APIError.Raw` 先脱敏后截断——超过 4KiB 的 JSON 错误体此前被先截断成字符串、结构化脱敏失效，敏感键值可能泄露进日志。
+- **reasoning 值拒绝不再降级**：上游 400 拒绝的是 `reasoning` 字段的**取值**（如某模型不支持 `low`）时原样报错；只有字段级拒绝才触发降级，且 Responses 的降级记忆按模型隔离（不同模型互不污染）。
+- **`ModelInfo.DisableThinking` 单条目生效**：仅手动层一条记录同时声明二者时也强制 `SupportsThinking=false`，不再依赖跨层合并才生效。
+- **端点错误不回显 query**：携带 query 的非法端点在构建错误中剥离 query 后输出，误贴进 URL 的凭据不再回显到日志。
+
 ## v0.3.1 (2026-09-08)
 
 2026-09-08 审计报告的逐条修复。

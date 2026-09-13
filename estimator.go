@@ -1,5 +1,33 @@
 package rosetta
 
+// MultimediaTokenEstimates overrides the flat per-block token estimates
+// used by the context-window check. The built-in defaults are deliberately
+// coarse (multimedia tokenization is provider- and resolution-specific);
+// tune them when the default warnings are too noisy or too lax for your
+// provider's actual billing. Zero fields keep the defaults.
+type MultimediaTokenEstimates struct {
+	// Image is the flat estimate per image block. Default 1500.
+	Image int
+	// Audio is the flat estimate per audio block. Default 500.
+	Audio int
+	// File is the flat estimate per document block. Default 3000.
+	File int
+}
+
+// resolve fills zero fields with the built-in defaults.
+func (e MultimediaTokenEstimates) resolve() MultimediaTokenEstimates {
+	if e.Image <= 0 {
+		e.Image = 1500
+	}
+	if e.Audio <= 0 {
+		e.Audio = 500
+	}
+	if e.File <= 0 {
+		e.File = 3000
+	}
+	return e
+}
+
 // EstimateTokens gives a rough token count for a piece of text. CJK
 // characters are ≈1 token each; ASCII text ≈4 characters per token. The
 // estimate rounds up so it errs on the high side (a context-window
@@ -18,9 +46,10 @@ func EstimateTokens(text string) int {
 }
 
 // estimateInputTokens approximates the prompt size of a request, including
-// per-message overhead, a flat estimate per image, and the tool
+// per-message overhead, flat per-block multimedia estimates and the tool
 // definitions offered to the model.
-func (r *ChatRequest) estimateInputTokens() int {
+func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
+	est = est.resolve()
 	total := 0
 	if r.System != "" {
 		total += EstimateTokens(r.System) + 4
@@ -34,7 +63,15 @@ func (r *ChatRequest) estimateInputTokens() int {
 			case BlockThinking:
 				total += EstimateTokens(b.Thinking)
 			case BlockImage:
-				total += 1500
+				total += est.Image
+			case BlockAudio:
+				// Flat per-clip estimate; audio tokenization is
+				// provider-specific and duration is not carried on the block.
+				total += est.Audio
+			case BlockFile:
+				// Conservative flat estimate for a typical small document;
+				// real PDF cost varies by page count and content.
+				total += est.File
 			case BlockToolCall:
 				total += EstimateTokens(b.Arguments) + 16
 			case BlockToolResult:

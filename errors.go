@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -25,8 +26,17 @@ var (
 	// ErrThinkingUnsupported is returned when thinking was requested but
 	// the model cannot think and no fallback is configured.
 	ErrThinkingUnsupported = errors.New("rosetta: model does not support thinking")
-	// ErrInvalidRequest is returned for structurally invalid ChatRequests.
+	// ErrInvalidRequest is returned for structurally invalid requests.
 	ErrInvalidRequest = errors.New("rosetta: invalid request")
+	// ErrNotSupported is returned when an operation cannot be served by the
+	// configured protocol/endpoint combination — e.g. Embed on an
+	// Anthropic-protocol client without WithEmbeddingEndpoint.
+	ErrNotSupported = errors.New("rosetta: operation not supported with this configuration")
+	// ErrStreamTruncated is returned when a stream ends (EOF) without the
+	// provider's terminal event — a cut connection or gateway timeout, not
+	// a clean finish. The partial response stays available via
+	// Stream.Partial; match with errors.Is.
+	ErrStreamTruncated = errors.New("stream truncated")
 )
 
 // TransportError wraps a lower-level network failure (DNS, connect, TLS,
@@ -53,8 +63,12 @@ type APIError struct {
 	RequestID  string // from X-Request-Id / request-id headers
 	Method     string
 	URL        string
-	Retryable  bool
-	Raw        json.RawMessage // original response body (may be truncated)
+	// Retryable marks statuses worth retrying (408/429/5xx/529). It is a
+	// hint for callers: the SDK auto-retries only when the request's retry
+	// policy allows it (GET-like methods by default; non-idempotent POSTs
+	// like chat require an explicit policy).
+	Retryable bool
+	Raw       json.RawMessage // original response body (may be truncated)
 }
 
 func (e *APIError) Error() string {
@@ -106,13 +120,73 @@ func truncateBody(body []byte) json.RawMessage {
 }
 
 // safeTruncateBody wraps response bodies of unknown provenance (error
-// pages, gateway HTML) for storage in Raw: anything that is not valid
-// JSON is degraded to a JSON string.
+// pages, gateway HTML) for storage in Raw: structured bodies get sensitive
+// values redacted before storage — error bodies sometimes echo the
+// caller's API key, auth header or prompt, and Raw travels into logs and
+// telemetry — and anything that is not valid JSON is degraded to a JSON
+// string. Redaction runs BEFORE truncation: once an oversized body is
+// degraded to a JSON string by truncateBody, structured redaction can no
+// longer reach the sensitive keys inside it.
 func safeTruncateBody(body []byte) json.RawMessage {
-	raw := truncateBody(body)
-	if json.Valid(raw) {
+	if json.Valid(body) {
+		return truncateBody(redactJSON(body))
+	}
+	// Mask key material on the full body, then truncate and degrade to a
+	// JSON string.
+	raw := truncateBody(apiKeyRe.ReplaceAll(body, []byte("sk-***")))
+	if !json.Valid(raw) { // short non-JSON body: degrade to a JSON string
+		s, _ := json.Marshal(string(raw))
+		return json.RawMessage(s)
+	}
+	return raw // truncateBody already degraded an oversized body to a string
+}
+
+// apiKeyRe matches OpenAI-style key material echoed inside error messages.
+var apiKeyRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}`)
+
+// redactJSON masks sensitive values in a valid-JSON body while keeping it
+// valid JSON: sensitive-keyed string values become "[redacted]" and
+// key-material patterns are masked everywhere. Best effort — on any
+// structural surprise the original (truncated) body is returned.
+func redactJSON(raw json.RawMessage) json.RawMessage {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
 		return raw
 	}
-	s, _ := json.Marshal(string(raw))
-	return json.RawMessage(s)
+	redactValue(v)
+	out, err := json.Marshal(v)
+	if err != nil {
+		return raw
+	}
+	return apiKeyRe.ReplaceAll(out, []byte("sk-***"))
+}
+
+func redactValue(v any) {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if _, ok := val.(string); ok && isSensitiveKey(k) {
+				t[k] = "[redacted]"
+				continue
+			}
+			redactValue(val)
+		}
+	case []any:
+		for _, item := range t {
+			redactValue(item)
+		}
+	}
+}
+
+func isSensitiveKey(k string) bool {
+	low := strings.ToLower(k)
+	low = strings.ReplaceAll(low, "-", "")
+	low = strings.ReplaceAll(low, "_", "")
+	switch {
+	case strings.Contains(low, "apikey"), strings.Contains(low, "secret"),
+		strings.Contains(low, "token"), strings.Contains(low, "password"),
+		strings.Contains(low, "authorization"), strings.Contains(low, "credential"):
+		return true
+	}
+	return false
 }

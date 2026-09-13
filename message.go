@@ -1,6 +1,11 @@
 package rosetta
 
-import "strings"
+import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"strings"
+)
 
 // Role is a conversation speaker, unified across protocols.
 type Role string
@@ -21,6 +26,8 @@ type BlockType string
 const (
 	BlockText       BlockType = "text"
 	BlockImage      BlockType = "image"
+	BlockAudio      BlockType = "audio"       // inline audio input (OpenAI protocols only)
+	BlockFile       BlockType = "file"        // document/file input (PDF etc.)
 	BlockToolCall   BlockType = "tool_call"   // model requesting a tool
 	BlockToolResult BlockType = "tool_result" // result fed back to the model
 	BlockThinking   BlockType = "thinking"    // chain-of-thought content
@@ -31,20 +38,30 @@ const (
 //
 //   - BlockText: Text
 //   - BlockImage: ImageURL (http(s) or data: URL)
+//   - BlockAudio: AudioData (raw base64), AudioFormat ("wav"|"mp3");
+//     supported by the OpenAI protocols, rejected by Anthropic
+//   - BlockFile: FileData (raw base64, data: URL or http(s) URL) or
+//     FileID (uploaded reference), plus FileName and MimeType
 //   - BlockToolCall: ToolCallID, ToolName, Arguments (raw JSON string)
 //   - BlockToolResult: ToolCallID, ToolName, Content (text payload), IsError
 //   - BlockThinking: Thinking, Signature (Anthropic passthrough)
 type Block struct {
-	Type       BlockType
-	Text       string
-	ImageURL   string
-	ToolCallID string
-	ToolName   string
-	Arguments  string
-	Content    string
-	IsError    bool
-	Thinking   string
-	Signature  string
+	Type        BlockType
+	Text        string
+	ImageURL    string
+	AudioData   string // base64 payload without the data: prefix
+	AudioFormat string // "wav" or "mp3"
+	FileName    string
+	MimeType    string // e.g. "application/pdf"; derived when empty
+	FileData    string // raw base64, data: URL or http(s) URL
+	FileID      string // provider file id (uploaded reference)
+	ToolCallID  string
+	ToolName    string
+	Arguments   string
+	Content     string
+	IsError     bool
+	Thinking    string
+	Signature   string
 }
 
 // Message is one conversation turn composed of content blocks.
@@ -72,6 +89,48 @@ func UserImage(text, imageURL string) Message {
 	}
 	blocks = append(blocks, Block{Type: BlockImage, ImageURL: imageURL})
 	return Message{Role: RoleUser, Blocks: blocks}
+}
+
+// UserFile builds a user message combining optional text with a document.
+// data is raw base64 (no data: prefix), a data: URL or — on Anthropic — an
+// http(s) URL; mediaType is e.g. "application/pdf".
+func UserFile(text, name, mediaType, data string) Message {
+	var blocks []Block
+	if text != "" {
+		blocks = append(blocks, Block{Type: BlockText, Text: text})
+	}
+	blocks = append(blocks, FileContent(name, mediaType, data))
+	return Message{Role: RoleUser, Blocks: blocks}
+}
+
+// UserAudio builds a user message combining optional text with inline
+// audio. data is raw base64; format must be "wav" or "mp3". Supported by
+// the OpenAI protocols; Anthropic rejects audio input.
+func UserAudio(text, base64Data, format string) Message {
+	var blocks []Block
+	if text != "" {
+		blocks = append(blocks, Block{Type: BlockText, Text: text})
+	}
+	blocks = append(blocks, AudioContent(base64Data, format))
+	return Message{Role: RoleUser, Blocks: blocks}
+}
+
+// AudioContent builds an inline audio block from raw base64 data.
+func AudioContent(data, format string) Block {
+	return Block{Type: BlockAudio, AudioData: data, AudioFormat: format}
+}
+
+// FileContent builds an inline document block. data is raw base64 (no
+// data: prefix), a data: URL or an http(s) URL (the last is accepted by
+// Anthropic only).
+func FileContent(name, mediaType, data string) Block {
+	return Block{Type: BlockFile, FileName: name, MimeType: mediaType, FileData: data}
+}
+
+// FileRef references a file previously uploaded through the provider's
+// files API, instead of carrying inline content.
+func FileRef(name, fileID string) Block {
+	return Block{Type: BlockFile, FileName: name, FileID: fileID}
 }
 
 // Assistant builds an assistant message. Use AssistantBlocks to include
@@ -117,4 +176,146 @@ func (m Message) text() string {
 		}
 	}
 	return b.String()
+}
+
+// roleAllowedBlocks defines which block types each role may carry.
+// Combinations outside the matrix are rejected at validation time instead
+// of being silently dropped by a protocol encoder — a file or audio block
+// that never reaches the model must not look like a successful request.
+var roleAllowedBlocks = map[Role]map[BlockType]bool{
+	RoleSystem:    {BlockText: true},
+	RoleUser:      {BlockText: true, BlockImage: true, BlockAudio: true, BlockFile: true},
+	RoleAssistant: {BlockText: true, BlockToolCall: true, BlockThinking: true},
+	RoleTool:      {BlockToolResult: true},
+}
+
+// validate checks protocol-independent structural rules for one message:
+// a known role, at least one effective content block, block types allowed
+// for the role, and the required fields per block type. Empty text blocks
+// are treated as placeholders and skipped — an image-only message with an
+// empty text prefix is valid — but a message left with no effective
+// content is an error.
+func (m Message) validate() error {
+	switch m.Role {
+	case RoleSystem, RoleUser, RoleAssistant, RoleTool:
+	default:
+		return fmt.Errorf("unsupported role %q", m.Role)
+	}
+	allowed := roleAllowedBlocks[m.Role]
+	n := 0
+	for _, b := range m.Blocks {
+		if b.Type == BlockText && b.Text == "" {
+			continue // placeholder alongside media blocks
+		}
+		if !allowed[b.Type] {
+			return fmt.Errorf("%s role does not support %s blocks", m.Role, b.Type)
+		}
+		n++
+	}
+	if n == 0 {
+		return fmt.Errorf("message has no content blocks")
+	}
+	for i, b := range m.Blocks {
+		if b.Type == BlockText && b.Text == "" {
+			continue
+		}
+		if err := b.validate(); err != nil {
+			return fmt.Errorf("Blocks[%d] (%s): %w", i, b.Type, err)
+		}
+	}
+	return nil
+}
+
+// validate checks the required fields of one content block.
+func (b Block) validate() error {
+	switch b.Type {
+	case BlockText:
+		if b.Text == "" {
+			return fmt.Errorf("text block is empty")
+		}
+	case BlockImage:
+		if b.ImageURL == "" {
+			return fmt.Errorf("image block needs ImageURL")
+		}
+	case BlockAudio:
+		if b.AudioData == "" {
+			return fmt.Errorf("audio block has no AudioData")
+		}
+		if b.AudioFormat != "wav" && b.AudioFormat != "mp3" {
+			return fmt.Errorf("audio format %q unsupported (wav or mp3)", b.AudioFormat)
+		}
+		if !isBase64(b.AudioData) {
+			return fmt.Errorf("audio block AudioData is not valid base64")
+		}
+	case BlockFile:
+		if b.FileData == "" && b.FileID == "" {
+			return fmt.Errorf("file block needs FileData or FileID")
+		}
+		if b.FileData != "" && b.FileID != "" {
+			return fmt.Errorf("file block has both FileData and FileID; set exactly one source")
+		}
+		if b.FileData != "" {
+			if err := validateFileData(b.FileData); err != nil {
+				return err
+			}
+		}
+	case BlockToolCall:
+		if b.ToolCallID == "" || b.ToolName == "" {
+			return fmt.Errorf("tool_call block needs ToolCallID and ToolName")
+		}
+		if b.Arguments != "" && !json.Valid([]byte(b.Arguments)) {
+			return fmt.Errorf("tool_call arguments are not valid JSON")
+		}
+	case BlockToolResult:
+		if b.ToolCallID == "" {
+			return fmt.Errorf("tool_result block needs ToolCallID")
+		}
+	case BlockThinking:
+		if b.Thinking == "" && b.Signature == "" {
+			return fmt.Errorf("thinking block is empty")
+		}
+	default:
+		return fmt.Errorf("unknown block type %q", b.Type)
+	}
+	return nil
+}
+
+// validateFileData checks inline file content: a data: URL must be
+// well-formed with a non-empty payload (base64 payloads must decode);
+// anything else must be valid base64. http(s) URLs pass through — only
+// Anthropic accepts them, which the protocol encoders enforce.
+func validateFileData(data string) error {
+	if strings.HasPrefix(data, "data:") {
+		rest := strings.TrimPrefix(data, "data:")
+		head, payload, ok := strings.Cut(rest, ",")
+		if !ok {
+			return fmt.Errorf("file data is a malformed data: URL (missing comma)")
+		}
+		if payload == "" {
+			return fmt.Errorf("file data URL has an empty payload")
+		}
+		if strings.Contains(head, ";base64") && !isBase64(payload) {
+			return fmt.Errorf("file data URL payload is not valid base64")
+		}
+		return nil
+	}
+	if strings.HasPrefix(data, "http://") || strings.HasPrefix(data, "https://") {
+		return nil
+	}
+	if !isBase64(data) {
+		return fmt.Errorf("file block FileData is not valid base64, a data: URL or an http(s) URL")
+	}
+	return nil
+}
+
+// isBase64 reports whether s is valid standard (padded or raw) base64.
+func isBase64(s string) bool {
+	if s == "" {
+		return false
+	}
+	if _, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return true
+	}
+	_, err := base64.RawStdEncoding.DecodeString(s)
+	return err == nil
 }

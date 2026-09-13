@@ -3,11 +3,11 @@ package rosetta
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,10 +31,13 @@ func (p *anthropicProvider) headers(stream bool) http.Header {
 		h.Set("Accept", "application/json")
 	}
 	if key := p.c.settings.apiKey; key != "" {
-		// x-api-key is the Anthropic-native auth header; Authorization
-		// helps Anthropic-compatible gateways that expect Bearer.
+		// x-api-key is the Anthropic-native auth header and the default.
+		// WithAnthropicBearerAuth additionally sends Bearer for
+		// gateways that authenticate exclusively that way.
 		h.Set("x-api-key", key)
-		h.Set("Authorization", "Bearer "+key)
+		if p.c.settings.anthropicBearer {
+			h.Set("Authorization", "Bearer "+key)
+		}
 	}
 	h.Set("anthropic-version", anthropicVersion)
 	return h
@@ -147,7 +150,9 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 	if stream {
 		payload["stream"] = true
 	}
-	maps.Copy(payload, req.Extra)
+	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
+		return nil, err
+	}
 	return payload, nil
 }
 
@@ -206,6 +211,14 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 					return "", nil, err
 				}
 				blocks = append(blocks, map[string]any{"type": "image", "source": src})
+			case BlockAudio:
+				return "", nil, fmt.Errorf("%w: anthropic does not support audio input", ErrInvalidRequest)
+			case BlockFile:
+				doc, err := encodeAnthropicDocument(b)
+				if err != nil {
+					return "", nil, err
+				}
+				blocks = append(blocks, doc)
 			case BlockToolResult:
 				tr := map[string]any{
 					"type":        "tool_result",
@@ -269,6 +282,50 @@ func encodeAnthropicImage(imageURL string) (map[string]any, error) {
 	return nil, fmt.Errorf("%w: unsupported image reference %q", ErrInvalidRequest, imageURL)
 }
 
+// encodeAnthropicDocument converts a file reference into Anthropic's
+// document block: uploaded ids become file sources, http(s) URLs url
+// sources, inline base64/data-URL content base64 sources. FileName rides
+// along as the optional title. Plain-text files use Anthropic's text
+// source (with the decoded text); the official base64 source is defined
+// for PDFs only, so other media types are rejected locally instead of
+// being mis-encoded and failing upstream.
+func encodeAnthropicDocument(b Block) (map[string]any, error) {
+	var src map[string]any
+	switch {
+	case b.FileID != "":
+		src = map[string]any{"type": "file", "file_id": b.FileID}
+	case strings.HasPrefix(b.FileData, "http://") || strings.HasPrefix(b.FileData, "https://"):
+		src = map[string]any{"type": "url", "url": b.FileData}
+	case b.FileData != "":
+		media, data := b.MimeType, b.FileData
+		if m, d, ok := splitDataURL(b.FileData); ok {
+			media, data = m, d
+		}
+		if media == "" {
+			media = "application/pdf"
+		}
+		switch media {
+		case "application/pdf":
+			src = map[string]any{"type": "base64", "media_type": media, "data": data}
+		case "text/plain":
+			decoded, err := base64.StdEncoding.DecodeString(data)
+			if err != nil {
+				return nil, fmt.Errorf("%w: text/plain file data must be valid base64: %v", ErrInvalidRequest, err)
+			}
+			src = map[string]any{"type": "text", "media_type": media, "data": string(decoded)}
+		default:
+			return nil, fmt.Errorf("%w: anthropic document sources support application/pdf (base64), text/plain (text source) and http(s) PDF URLs, not %q", ErrInvalidRequest, media)
+		}
+	default:
+		return nil, fmt.Errorf("%w: file block needs FileData or FileID", ErrInvalidRequest)
+	}
+	doc := map[string]any{"type": "document", "source": src}
+	if b.FileName != "" {
+		doc["title"] = b.FileName
+	}
+	return doc, nil
+}
+
 func splitDataURL(u string) (media, data string, ok bool) {
 	const prefix = "data:"
 	if !strings.HasPrefix(u, prefix) {
@@ -316,7 +373,7 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
-		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		body, rerr := httpx.ReadBody(resp.Body, 1<<20)
 		resp.Body.Close()
 		if rerr != nil {
 			return nil, transport(rerr, method, url)
@@ -359,15 +416,18 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 			resp = r
 			break
 		}
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		body, rerr := httpx.ReadBody(r.Body, 1<<20)
 		r.Body.Close()
+		if rerr != nil {
+			return nil, transport(rerr, method, url)
+		}
 		apiErr := parseAnthropicError(r.StatusCode, body, method, url, requestID(r.Header))
 		if r.StatusCode == http.StatusBadRequest && p.c.settings.thinkingRectify && pl.rectify(apiErr.Message) {
 			continue
 		}
 		return nil, apiErr
 	}
-	s := newStream(p.streamEvents(resp.Body), nil)
+	s := newStream(p.streamEvents(resp.Body, method, url, requestID(resp.Header)), nil)
 	s.attachCloser(resp.Body)
 	return s, nil
 }
@@ -375,14 +435,17 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 // streamEvents maps Anthropic's typed SSE stream onto unified events.
 // Input tokens arrive with message_start, output tokens with
 // message_delta; both are folded into a single EventMessageEnd emitted at
-// message_stop (or EOF, for truncated streams).
-func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) {
+// message_stop. An EOF before message_stop still yields the end event
+// (with StopOther) but the stream then fails with ErrStreamTruncated, so
+// callers never mistake a cut-off response for a clean finish.
+func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
-		stop     StopReason
-		usage    anthroUsage
-		hasUsage bool
-		ended    bool
+		stop      StopReason
+		usage     anthroUsage
+		hasUsage  bool
+		ended     bool
+		truncated bool
 	)
 	endEvent := func() *Event {
 		// No stop reason seen: the stream ended without the provider's
@@ -398,17 +461,28 @@ func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) 
 		}
 		return ev
 	}
+	malformed := func(err error) error {
+		return fmt.Errorf("rosetta: anthropic stream (%s %s): malformed event: %w", method, url, err)
+	}
 	return func() (*Event, error) {
 		for {
-			// Once message_stop (or EOF) was seen, never emit further
-			// events even if the server keeps sending.
+			// Once message_stop (or a truncated EOF) was seen, never emit
+			// further events even if the server keeps sending.
 			if ended {
+				if truncated {
+					return nil, fmt.Errorf("rosetta: %w: anthropic stream ended without message_stop (partial response kept in Stream.Partial)", ErrStreamTruncated)
+				}
 				return nil, io.EOF
 			}
 			ssev, err := sc.Next()
 			if err != nil {
-				if errors.Is(err, io.EOF) && !ended {
+				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
+				// covers a real HTTP truncation (chunked stream cut before the
+				// final zero chunk, gateway timeout). Both mean message_stop
+				// never arrived.
+				if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && !ended {
 					ended = true
+					truncated = true
 					return endEvent(), nil
 				}
 				return nil, err
@@ -419,8 +493,10 @@ func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) 
 			}
 			var ch anthroChunk
 			if err := json.Unmarshal(data, &ch); err != nil {
-				p.c.settings.logger.Debug("anthropic: skipping malformed stream chunk", "err", err.Error())
-				continue
+				// A malformed chunk may carry content the caller will
+				// otherwise never see; dropping it silently would corrupt
+				// text or tool-call arguments, so fail the stream instead.
+				return nil, malformed(err)
 			}
 			switch ch.Type {
 			case "ping":
@@ -429,10 +505,14 @@ func (p *anthropicProvider) streamEvents(body io.Reader) func() (*Event, error) 
 				// Tolerate a malformed error event with no error body
 				// (seen on third-party Anthropic-compatible gateways):
 				// surface a generic APIError instead of a nil event.
+				var apiErr *APIError
 				if ch.Error != nil {
-					return nil, ch.Error.apiError(200)
+					apiErr = ch.Error.apiError(200)
+				} else {
+					apiErr = &APIError{StatusCode: 200, Type: "api_error", Message: "stream error event without details"}
 				}
-				return nil, &APIError{StatusCode: 200, Type: "api_error", Message: "stream error event without details"}
+				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
+				return nil, apiErr
 			case "message_start":
 				if ch.Message != nil {
 					if ch.Message.Usage != nil {
@@ -514,8 +594,11 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		if err != nil {
 			return nil, transport(err, method, pageURL)
 		}
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		body, rerr := httpx.ReadBody(resp.Body, 8<<20)
 		resp.Body.Close()
+		if rerr != nil {
+			return nil, transport(rerr, method, pageURL)
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header))
 		}

@@ -7,9 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
 	"github.com/cn-maul/rosetta/internal/sse"
@@ -20,63 +20,176 @@ import (
 // with the Chat Completions adapter but uses its own wire shapes:
 // items instead of messages, max_output_tokens, reasoning.effort and
 // typed stream events.
-type openaiResponsesProvider struct{ c *Client }
+//
+// Compatibility with third-party gateways follows the same escalation as
+// Chat: a sticky probe — send the modern optional fields, drop one once
+// on a matching 400 — remembering downgrades per model for the client
+// lifetime. A rejection of a *value* inside a field (e.g. an unsupported
+// reasoning.effort) is surfaced as-is: it is a request configuration
+// error, not evidence that the field is unsupported.
+type openaiResponsesProvider struct {
+	c *Client
+
+	mu sync.Mutex
+	// Sticky downgrades are remembered per model: one model rejecting a
+	// field says nothing about another model's capabilities.
+	stickyNoReasoning map[string]bool // upstream rejected the reasoning object
+	stickyNoMaxOutput map[string]bool // upstream rejected max_output_tokens
+}
+
+// respSendState is the per-request mutable send strategy.
+type respSendState struct {
+	reasoning bool
+	maxOutput bool
+}
+
+func (p *openaiResponsesProvider) initialState(model string) *respSendState {
+	st := &respSendState{reasoning: true, maxOutput: true}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stickyNoReasoning[model] {
+		st.reasoning = false
+	}
+	if p.stickyNoMaxOutput[model] {
+		st.maxOutput = false
+	}
+	return st
+}
+
+// isValueRejection reports whether a 400 rejects a *value* inside an
+// optional field (e.g. reasoning.effort "low" unsupported by the model)
+// rather than the field itself. Dropping the whole field would silently
+// mask a configuration error and pollute later requests, so such errors
+// are surfaced as-is.
+func isValueRejection(apiErr *APIError) bool {
+	if apiErr == nil {
+		return false
+	}
+	if apiErr.Code == "unsupported_value" {
+		return true
+	}
+	return containsAny(strings.ToLower(apiErr.Message), "unsupported value")
+}
+
+// sanitize inspects a 400 error and drops one optional field. It returns
+// true when the payload changed and the request should be retried. The
+// same hint-word guarding as Chat's sanitizer keeps unrelated 400s from
+// triggering downgrades.
+func (p *openaiResponsesProvider) sanitize(st *respSendState, apiErr *APIError, model string) bool {
+	if isValueRejection(apiErr) {
+		return false
+	}
+	low := strings.ToLower(apiErr.Message)
+	if apiErr.Type != "" && !strings.Contains(strings.ToLower(apiErr.Type), "invalid_request") {
+		return false
+	}
+	remember := func(field string, v bool) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		switch field {
+		case "reasoning":
+			if p.stickyNoReasoning == nil {
+				p.stickyNoReasoning = map[string]bool{}
+			}
+			p.stickyNoReasoning[model] = v
+		case "max_output":
+			if p.stickyNoMaxOutput == nil {
+				p.stickyNoMaxOutput = map[string]bool{}
+			}
+			p.stickyNoMaxOutput[model] = v
+		}
+	}
+	switch {
+	case st.reasoning && containsAny(low, "reasoning") && containsAny(low, hintWords...):
+		st.reasoning = false
+		remember("reasoning", true)
+		p.c.settings.logger.Debug("responses: upstream rejected the reasoning field; dropping it", "model", model)
+		return true
+	case st.maxOutput && containsAny(low, "max_output_tokens") && containsAny(low, hintWords...):
+		st.maxOutput = false
+		remember("max_output", true)
+		p.c.settings.logger.Debug("responses: upstream rejected max_output_tokens; letting the provider decide the cap", "model", model)
+		return true
+	}
+	return false
+}
 
 // Chat performs a non-streaming completion.
 func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/responses")
-	payload, err := p.buildPayload(req, false)
-	if err != nil {
-		return nil, err
+	st := p.initialState(req.Model)
+	sanitizes := 0
+	for {
+		payload, err := p.buildPayload(req, false, st)
+		if err != nil {
+			return nil, err
+		}
+		call := &httpx.Call{
+			Method: method,
+			URL:    url,
+			Header: openAIHeaders(p.c, "application/json"),
+			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+		}
+		resp, err := p.c.http.Do(ctx, call)
+		if err != nil {
+			return nil, transport(err, method, url)
+		}
+		body, rerr := httpx.ReadBody(resp.Body, 1<<20)
+		resp.Body.Close()
+		if rerr != nil {
+			return nil, transport(rerr, method, url)
+		}
+		if resp.StatusCode != http.StatusOK {
+			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model) {
+				sanitizes++
+				continue
+			}
+			return nil, apiErr
+		}
+		return decodeResponsesResponse(body)
 	}
-	call := &httpx.Call{
-		Method: method,
-		URL:    url,
-		Header: openAIHeaders(p.c, "application/json"),
-		Body:   func() ([]byte, error) { return json.Marshal(payload) },
-	}
-	resp, err := p.c.http.Do(ctx, call)
-	if err != nil {
-		return nil, transport(err, method, url)
-	}
-	body, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
-	if rerr != nil {
-		return nil, transport(rerr, method, url)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
-	}
-	return decodeResponsesResponse(body)
 }
 
 // StreamChat starts a streaming completion.
 func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stream, error) {
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/responses")
-	payload, err := p.buildPayload(req, true)
-	if err != nil {
-		return nil, err
+	st := p.initialState(req.Model)
+	sanitizes := 0
+	for {
+		payload, err := p.buildPayload(req, true, st)
+		if err != nil {
+			return nil, err
+		}
+		call := &httpx.Call{
+			Method: method,
+			URL:    url,
+			Header: openAIHeaders(p.c, "text/event-stream"),
+			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+		}
+		resp, err := p.c.http.Do(ctx, call)
+		if err != nil {
+			return nil, transport(err, method, url)
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, rerr := httpx.ReadBody(resp.Body, 1<<20)
+			resp.Body.Close()
+			if rerr != nil {
+				return nil, transport(rerr, method, url)
+			}
+			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model) {
+				sanitizes++
+				continue
+			}
+			return nil, apiErr
+		}
+		s := newStream(p.streamEvents(resp.Body, method, url, resp.Header.Get("X-Request-Id")), nil)
+		s.attachCloser(resp.Body)
+		return s, nil
 	}
-	call := &httpx.Call{
-		Method: method,
-		URL:    url,
-		Header: openAIHeaders(p.c, "text/event-stream"),
-		Body:   func() ([]byte, error) { return json.Marshal(payload) },
-	}
-	resp, err := p.c.http.Do(ctx, call)
-	if err != nil {
-		return nil, transport(err, method, url)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		resp.Body.Close()
-		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
-	}
-	s := newStream(p.streamEvents(resp.Body), nil)
-	s.attachCloser(resp.Body)
-	return s, nil
 }
 
 // ListModels queries GET /models via the shared OpenAI-family helper.
@@ -89,7 +202,7 @@ func (p *openaiResponsesProvider) ListModels(ctx context.Context) ([]ModelInfo, 
 // max_output_tokens, tools are flat objects, stop sequences are not
 // supported (dropped with a debug log), and sampling params are dropped
 // alongside reasoning (reasoning-capable models reject them).
-func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool) (map[string]any, error) {
+func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st *respSendState) (map[string]any, error) {
 	input, err := p.encodeInput(req)
 	if err != nil {
 		return nil, err
@@ -98,12 +211,16 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool) (m
 		"model": req.Model,
 		"input": input,
 	}
-	if max := p.c.effectiveMaxOutput(req); max > 0 {
-		payload["max_output_tokens"] = max
+	if st.maxOutput {
+		if max := p.c.effectiveMaxOutput(req); max > 0 {
+			payload["max_output_tokens"] = max
+		}
 	}
 	if req.Thinking != nil {
-		if eff := req.effort(); eff != EffortUnset {
-			payload["reasoning"] = map[string]any{"effort": string(eff)}
+		if st.reasoning {
+			if eff := req.effort(); eff != EffortUnset {
+				payload["reasoning"] = map[string]any{"effort": string(eff)}
+			}
 		}
 		if req.Temperature != nil {
 			p.c.settings.logger.Debug("responses: dropping temperature for a reasoning request")
@@ -141,7 +258,9 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool) (m
 	if stream {
 		payload["stream"] = true
 	}
-	maps.Copy(payload, req.Extra)
+	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
+		return nil, err
+	}
 	return payload, nil
 }
 
@@ -161,7 +280,11 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 				addSystem(t)
 			}
 		case RoleUser:
-			items = append(items, encodeResponsesUser(m))
+			item, err := encodeResponsesUser(m)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, item)
 		case RoleAssistant:
 			if t := m.text(); t != "" {
 				items = append(items, map[string]any{
@@ -199,18 +322,21 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 	return items, nil
 }
 
-func encodeResponsesUser(m Message) map[string]any {
+func encodeResponsesUser(m Message) (map[string]any, error) {
 	item := map[string]any{"type": "message", "role": "user"}
-	var hasImage bool
+	var multimodal bool
 	for _, b := range m.Blocks {
-		if b.Type == BlockImage {
-			hasImage = true
+		switch b.Type {
+		case BlockImage, BlockAudio, BlockFile:
+			multimodal = true
+		}
+		if multimodal {
 			break
 		}
 	}
-	if !hasImage {
+	if !multimodal {
 		item["content"] = m.text()
-		return item
+		return item, nil
 	}
 	parts := make([]map[string]any, 0, len(m.Blocks))
 	for _, b := range m.Blocks {
@@ -221,22 +347,53 @@ func encodeResponsesUser(m Message) map[string]any {
 			}
 		case BlockImage:
 			parts = append(parts, map[string]any{"type": "input_image", "image_url": b.ImageURL})
+		case BlockAudio:
+			// The official Responses input content union carries text,
+			// image and file parts only; input_audio is a Chat
+			// Completions shape. Encoding it anyway would produce requests
+			// the official API does not define.
+			return nil, fmt.Errorf("%w: responses protocol does not support audio input; use Chat Completions (ProtoOpenAIChat) for audio", ErrInvalidRequest)
+		case BlockFile:
+			if b.FileID != "" {
+				parts = append(parts, map[string]any{"type": "input_file", "file_id": b.FileID})
+				continue
+			}
+			// The official Responses file input carries inline data via
+			// file_data and remote files via file_url; only Chat
+			// Completions lacks the URL form.
+			if strings.HasPrefix(b.FileData, "http://") || strings.HasPrefix(b.FileData, "https://") {
+				parts = append(parts, map[string]any{"type": "input_file", "file_url": b.FileData})
+				continue
+			}
+			du, err := fileDataURL(b)
+			if err != nil {
+				return nil, err
+			}
+			part := map[string]any{"type": "input_file", "file_data": du}
+			if b.FileName != "" {
+				part["filename"] = b.FileName
+			}
+			parts = append(parts, part)
 		}
 	}
 	item["content"] = parts
-	return item
+	return item, nil
 }
 
 // streamEvents maps Responses' typed SSE stream onto unified events.
 // Usage and stop status arrive with response.completed / response.incomplete
 // and are folded into a single EventMessageEnd; the stream ends there
-// (the Responses API does not send a [DONE] sentinel).
-func (p *openaiResponsesProvider) streamEvents(body io.Reader) func() (*Event, error) {
+// (the Responses API does not send a [DONE] sentinel). An EOF before
+// either event still yields the end event (with StopOther) but the stream
+// then fails with ErrStreamTruncated, so callers never mistake a cut-off
+// response for a clean finish.
+func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
-		stop  StopReason
-		usage *Usage
-		ended bool
+		stop      StopReason
+		usage     *Usage
+		ended     bool
+		truncated bool
 	)
 	endEvent := func() *Event {
 		if stop == "" {
@@ -250,15 +407,24 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader) func() (*Event, e
 	}
 	return func() (*Event, error) {
 		for {
-			// Once response.completed/incomplete (or EOF) was seen, never
-			// emit further events even if the server keeps sending.
+			// Once response.completed/incomplete (or a truncated EOF) was
+			// seen, never emit further events even if the server keeps
+			// sending.
 			if ended {
+				if truncated {
+					return nil, fmt.Errorf("rosetta: %w: responses stream ended without response.completed (partial response kept in Stream.Partial)", ErrStreamTruncated)
+				}
 				return nil, io.EOF
 			}
 			ssev, err := sc.Next()
 			if err != nil {
-				if errors.Is(err, io.EOF) && !ended {
+				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
+				// covers a real HTTP truncation (chunked stream cut before the
+				// final zero chunk, gateway timeout). Both mean the terminal
+				// event never arrived.
+				if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && !ended {
 					ended = true
+					truncated = true
 					return endEvent(), nil
 				}
 				return nil, err
@@ -269,8 +435,10 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader) func() (*Event, e
 			}
 			var ev oaRespEvent
 			if err := json.Unmarshal(data, &ev); err != nil {
-				p.c.settings.logger.Debug("responses: skipping malformed stream event", "err", err.Error())
-				continue
+				// A malformed event may carry content the caller will
+				// otherwise never see; dropping it silently would corrupt
+				// text or tool-call arguments, so fail the stream instead.
+				return nil, fmt.Errorf("rosetta: responses stream (%s %s): malformed event: %w", method, url, err)
 			}
 			switch ev.Type {
 			case "response.created":
@@ -328,11 +496,15 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader) func() (*Event, e
 				}
 			case "response.failed":
 				if ev.Response != nil && ev.Response.Error != nil {
-					return nil, ev.Response.Error.apiError(200)
+					apiErr := ev.Response.Error.apiError(200)
+					apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
+					return nil, apiErr
 				}
-				return nil, &APIError{StatusCode: 200, Message: "response.failed", Type: "api_error"}
+				return nil, &APIError{StatusCode: 200, Message: "response.failed", Type: "api_error", Method: method, URL: url, RequestID: requestID}
 			case "error":
-				return nil, (&oaErrorBody{Message: ev.Message, Type: "api_error", Code: json.RawMessage(maybeQuote(ev.Code))}).apiError(200)
+				apiErr := (&oaErrorBody{Message: ev.Message, Type: "api_error", Code: json.RawMessage(maybeQuote(ev.Code))}).apiError(200)
+				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
+				return nil, apiErr
 			default:
 				// in_progress, content_part.*, *_done, output_item.done, ... are ignored
 			}

@@ -5,6 +5,8 @@ package httpx
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -179,6 +181,26 @@ func retryAfter(v string) time.Duration {
 // maxRetryAfter bounds a server-provided Retry-After so a hostile or
 // misconfigured gateway cannot stall callers for arbitrarily long.
 const maxRetryAfter = 60 * time.Second
+
+// ErrBodyTooLarge is returned by ReadBody when the response exceeds the
+// caller-provided cap. Distinguishing it from a JSON decode error makes
+// oversized (or truncated) responses diagnosable instead of misleading.
+var ErrBodyTooLarge = errors.New("rosetta: response body exceeds limit")
+
+// ReadBody reads r fully but fails with ErrBodyTooLarge once more than
+// limit bytes arrive. It is the bounded counterpart of io.ReadAll:
+// LimitReader alone would silently truncate and push a confusing parse
+// error (or worse, a mis-parse) onto the caller.
+func ReadBody(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w: more than %d bytes", ErrBodyTooLarge, limit)
+	}
+	return b, nil
+}
 
 func drain(resp *http.Response) {
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))

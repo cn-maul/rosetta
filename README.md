@@ -1,6 +1,6 @@
 # Rosetta
 
-统一接入 LLM API 的 Go SDK：同一套 API 说三种协议——**OpenAI Chat Completions**、**OpenAI Responses**、**Anthropic Messages**，以及兼容这些协议的第三方服务（DeepSeek、Moonshot、Qwen、GLM、OpenRouter、vLLM、Ollama 等）。协议差异（认证方式、system 位置、thinking 参数、流式事件、usage 字段）全部由 SDK 吸收。零第三方依赖。
+统一接入 LLM API 的 Go SDK：同一套 API 说三种协议——**OpenAI Chat Completions**、**OpenAI Responses**、**Anthropic Messages**，以及兼容这些协议的第三方服务（DeepSeek、Moonshot、Qwen、GLM、OpenRouter、vLLM、Ollama 等）。协议差异（认证方式、system 位置、thinking 参数、流式事件、usage 字段）全部由 SDK 吸收。对话之外还覆盖同一套客户端下的 **Embeddings**（OpenAI 格式）与 **Rerank**（Cohere 格式），支持图文/音频/文档多模态输入。零第三方依赖。
 
 ## 安装
 
@@ -59,7 +59,7 @@ func main() {
 | [用量统计](docs/usage-stats.md) | Usage 字段、Tracker 接口、Snapshot 查询 |
 | [设计文档](PLAN.md) | 架构决策、里程碑、参考研究 |
 
-可运行示例见 [examples/](examples/)：chat / stream / responses / anthropic / usage / models。
+可运行示例见 [examples/](examples/)：chat / stream / responses / anthropic / embedding / rerank / usage / models。
 
 ## 许可证
 

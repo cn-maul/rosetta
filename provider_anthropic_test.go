@@ -7,6 +7,12 @@ import (
 	"testing"
 )
 
+// tBody adapts a raw SSE payload to the streamEvents signature (shared by
+// all three protocol stream tests).
+func tBody(s string) (io.Reader, string, string, string) {
+	return strings.NewReader(s), "POST", "http://api.test/v1/test", ""
+}
+
 func TestAnthropicPlan(t *testing.T) {
 	c := newTestClient(t, WithProtocol(ProtoAnthropic))
 	p := c.provider.(*anthropicProvider)
@@ -279,7 +285,7 @@ func TestAnthropicStreamEvents(t *testing.T) {
 		"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"[1,2\"}}\n\n" +
 		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":7}}\n\n" +
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-	next := p.streamEvents(strings.NewReader(body))
+	next := p.streamEvents(tBody(body))
 
 	want := []EventType{EventMessageStart, EventTextDelta, EventThinkingDelta, EventThinkingDelta, EventToolCall, EventToolCall, EventMessageEnd}
 	var got []EventType
@@ -308,7 +314,7 @@ func TestAnthropicStreamEvents(t *testing.T) {
 	}
 
 	// Signature rides the thinking event.
-	next = p.streamEvents(strings.NewReader("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"S\"}}\n\n"))
+	next = p.streamEvents(tBody("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"S\"}}\n\n"))
 	if ev, err := next(); err != nil || ev.Signature != "S" {
 		t.Fatalf("signature event = %+v err=%v", ev, err)
 	}
@@ -319,7 +325,7 @@ func TestAnthropicStreamEvents(t *testing.T) {
 func TestAnthropicStreamErrorWithoutBody(t *testing.T) {
 	c := newTestClient(t, WithProtocol(ProtoAnthropic))
 	p := c.provider.(*anthropicProvider)
-	next := p.streamEvents(strings.NewReader("data: {\"type\":\"error\"}\n\n"))
+	next := p.streamEvents(tBody("data: {\"type\":\"error\"}\n\n"))
 	ev, err := next()
 	if err == nil {
 		t.Fatalf("expected an error, got event %+v", ev)
@@ -342,7 +348,7 @@ func TestAnthropicStreamEventsEndDiscipline(t *testing.T) {
 		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
 		"data: {\"type\":\"message_stop\"}\n\n" +
 		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"late\"}}\n\n"
-	next := p.streamEvents(strings.NewReader(body))
+	next := p.streamEvents(tBody(body))
 	for {
 		ev, err := next()
 		if errors.Is(err, io.EOF) {

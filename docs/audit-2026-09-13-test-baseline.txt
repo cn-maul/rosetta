@@ -1,0 +1,24 @@
+ok  	github.com/cn-maul/rosetta	0.277s	coverage: 86.6% of statements
+	github.com/cn-maul/rosetta/examples/anthropic		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/chat		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/embedding		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/models		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/rerank		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/responses		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/stream		coverage: 0.0% of statements
+	github.com/cn-maul/rosetta/examples/usage		coverage: 0.0% of statements
+ok  	github.com/cn-maul/rosetta/internal/httpx	0.072s	coverage: 78.9% of statements
+ok  	github.com/cn-maul/rosetta/internal/jsonx	0.048s	coverage: 86.6% of statements
+ok  	github.com/cn-maul/rosetta/internal/sse	0.061s	coverage: 93.8% of statements
+ok  	github.com/cn-maul/rosetta	1.267s
+?   	github.com/cn-maul/rosetta/examples/anthropic	[no test files]
+?   	github.com/cn-maul/rosetta/examples/chat	[no test files]
+?   	github.com/cn-maul/rosetta/examples/embedding	[no test files]
+?   	github.com/cn-maul/rosetta/examples/models	[no test files]
+?   	github.com/cn-maul/rosetta/examples/rerank	[no test files]
+?   	github.com/cn-maul/rosetta/examples/responses	[no test files]
+?   	github.com/cn-maul/rosetta/examples/stream	[no test files]
+?   	github.com/cn-maul/rosetta/examples/usage	[no test files]
+ok  	github.com/cn-maul/rosetta/internal/httpx	1.153s
+ok  	github.com/cn-maul/rosetta/internal/jsonx	1.103s
+ok  	github.com/cn-maul/rosetta/internal/sse	1.090s

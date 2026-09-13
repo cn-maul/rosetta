@@ -3,6 +3,7 @@ package rosetta
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 )
 
 // Effort is a protocol-independent thinking dial.
@@ -90,9 +91,60 @@ type ChatRequest struct {
 
 	// Extra is merged into the protocol payload last, letting callers
 	// reach provider-specific fields the SDK does not model. Values must
-	// be JSON-marshalable. Keys collide with SDK-managed fields only at
-	// the caller's own risk.
+	// be JSON-marshalable. Keys that collide with SDK-managed payload
+	// fields are rejected with ErrInvalidRequest unless
+	// WithExtraOverrides(true) is set.
 	Extra map[string]any
+}
+
+// Reserved-key sets are per API family, not a global union: blocking the
+// union would reject legitimate keys on requests that have no SDK-managed
+// counterpart (e.g. ChatRequest.Extra["user"] — chat payloads have no user
+// field, but embeddings do). Each caller passes the set for its own API.
+// WithExtraOverrides(true) lifts the check for callers who really mean it.
+var (
+	// chatReservedPayloadKeys covers the three chat protocols' spellings
+	// (OpenAI Chat, Responses, Anthropic).
+	chatReservedPayloadKeys = map[string]bool{
+		// request identity and transport
+		"model": true, "stream": true,
+		// conversation content
+		"messages": true, "input": true, "system": true,
+		// output caps (all three protocols' spellings)
+		"max_tokens": true, "max_completion_tokens": true, "max_output_tokens": true,
+		// sampling
+		"temperature": true, "top_p": true, "stop": true, "stop_sequences": true,
+		// tools and thinking
+		"tools": true, "tool_choice": true, "stream_options": true,
+		"thinking": true, "reasoning": true, "reasoning_effort": true,
+	}
+	// embeddingsReservedPayloadKeys covers POST /embeddings payloads.
+	embeddingsReservedPayloadKeys = map[string]bool{
+		"model": true, "input": true, "dimensions": true, "user": true,
+		"encoding_format": true,
+	}
+	// rerankReservedPayloadKeys covers POST /rerank (Cohere format).
+	rerankReservedPayloadKeys = map[string]bool{
+		"model": true, "query": true, "documents": true, "top_n": true,
+		"return_documents": true,
+	}
+)
+
+// mergeExtra copies Extra into the payload, enforcing the reserved-key
+// rule for the given API family unless overrides are explicitly enabled.
+func mergeExtra(dst map[string]any, extra map[string]any, allowOverride bool, reserved map[string]bool) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	if !allowOverride {
+		for k := range extra {
+			if reserved[k] {
+				return fmt.Errorf("%w: Extra key %q collides with an SDK-managed field (pass WithExtraOverrides(true) to override anyway)", ErrInvalidRequest, k)
+			}
+		}
+	}
+	maps.Copy(dst, extra)
+	return nil
 }
 
 // Float returns a pointer to v (for Temperature/TopP fields).
@@ -105,7 +157,10 @@ func Float(v float64) *float64 { return new(v) }
 //go:fix inline
 func Bool(v bool) *bool { return new(v) }
 
-// validate checks structural requirements shared by all protocols.
+// validate checks structural requirements shared by all protocols, so
+// obviously broken requests fail locally with ErrInvalidRequest instead of
+// surfacing as provider-specific 400s (or worse, silently degraded
+// payloads) that differ across protocols.
 func (r *ChatRequest) validate() error {
 	if r == nil {
 		return fmt.Errorf("%w: nil request", ErrInvalidRequest)
@@ -115,6 +170,30 @@ func (r *ChatRequest) validate() error {
 	}
 	if len(r.Messages) == 0 && r.System == "" {
 		return fmt.Errorf("%w: Messages must not be empty", ErrInvalidRequest)
+	}
+	if r.MaxOutputTokens < 0 {
+		return fmt.Errorf("%w: MaxOutputTokens must not be negative", ErrInvalidRequest)
+	}
+	if r.Temperature != nil && (*r.Temperature < 0 || *r.Temperature > 2) {
+		return fmt.Errorf("%w: Temperature %v outside [0, 2]", ErrInvalidRequest, *r.Temperature)
+	}
+	if r.TopP != nil && (*r.TopP < 0 || *r.TopP > 1) {
+		return fmt.Errorf("%w: TopP %v outside [0, 1]", ErrInvalidRequest, *r.TopP)
+	}
+	if r.Thinking != nil {
+		switch r.Thinking.Effort {
+		case EffortUnset, EffortLow, EffortMedium, EffortHigh:
+		default:
+			return fmt.Errorf("%w: unknown Thinking.Effort %q", ErrInvalidRequest, r.Thinking.Effort)
+		}
+		if r.Thinking.BudgetTokens < 0 {
+			return fmt.Errorf("%w: Thinking.BudgetTokens must not be negative", ErrInvalidRequest)
+		}
+	}
+	for i, m := range r.Messages {
+		if err := m.validate(); err != nil {
+			return fmt.Errorf("%w: Messages[%d]: %w", ErrInvalidRequest, i, err)
+		}
 	}
 	return nil
 }

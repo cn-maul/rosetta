@@ -24,7 +24,7 @@ func TestResponsesBuildPayload(t *testing.T) {
 		Tools:           []ToolDefinition{{Name: "fn", Description: "d"}},
 		Extra:           map[string]any{"previous_response_id": "resp_0"},
 	}
-	pl, err := p.buildPayload(req, false)
+	pl, err := p.buildPayload(req, false, p.initialState("gpt-5"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,7 +47,7 @@ func TestResponsesBuildPayload(t *testing.T) {
 
 	// Thinking: reasoning.effort, sampling dropped.
 	req.Thinking = &ThinkingConfig{Effort: EffortLow}
-	pl, err = p.buildPayload(req, true)
+	pl, err = p.buildPayload(req, true, p.initialState("gpt-5"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestResponsesStreamEvents(t *testing.T) {
 		"data: {\"type\":\"response.output_item.added\",\"output_index\":2,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"fn\"}}\n\n" +
 		"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":2,\"delta\":\"[1,2\"}\n\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
-	next := p.streamEvents(strings.NewReader(body))
+	next := p.streamEvents(tBody(body))
 
 	want := []EventType{EventMessageStart, EventTextDelta, EventThinkingDelta, EventToolCall, EventToolCall, EventMessageEnd}
 	var got []EventType
@@ -224,7 +224,7 @@ func TestResponsesStreamEvents(t *testing.T) {
 	}
 
 	// response.incomplete ends the stream with StopLength.
-	next = p.streamEvents(strings.NewReader(
+	next = p.streamEvents(tBody(
 		"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
 	if ev, err := next(); err != nil || ev.Type != EventMessageEnd || ev.StopReason != StopLength {
 		t.Fatalf("incomplete end = %+v err=%v", ev, err)
@@ -235,27 +235,29 @@ func TestResponsesStreamEventsErrors(t *testing.T) {
 	c := newTestClient(t, WithProtocol(ProtoOpenAIResponses))
 	p := c.provider.(*openaiResponsesProvider)
 
-	// response.failed surfaces the embedded error.
-	next := p.streamEvents(strings.NewReader(
+	// response.failed surfaces the embedded error, with request context.
+	next := p.streamEvents(tBody(
 		"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"bad\",\"type\":\"api_error\"}}}\n\n"))
-	if _, err := next(); err == nil {
-		t.Fatal("response.failed must fail the stream")
+	_, err := next()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Message != "bad" || apiErr.Method != "POST" || apiErr.URL == "" {
+		t.Fatalf("response.failed err = %v, want APIError with request context", err)
 	}
 
 	// Bare error event.
-	next = p.streamEvents(strings.NewReader(
+	next = p.streamEvents(tBody(
 		"data: {\"type\":\"error\",\"code\":\"srv_err\",\"message\":\"oops\"}\n\n"))
-	_, err := next()
-	var apiErr *APIError
+	_, err = next()
 	if !errors.As(err, &apiErr) || apiErr.Message != "oops" || apiErr.Code != "srv_err" {
 		t.Fatalf("err = %v", err)
 	}
 
-	// Malformed events are skipped.
-	next = p.streamEvents(strings.NewReader(
+	// Malformed events fail the stream: silently dropping one could lose
+	// text or tool-call fragments.
+	next = p.streamEvents(tBody(
 		"data: not-json\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
-	if ev, err := next(); err != nil || ev.Type != EventTextDelta || ev.Text != "ok" {
-		t.Fatalf("ev=%v err=%v", ev, err)
+	if _, err := next(); err == nil {
+		t.Fatal("malformed event must fail the stream")
 	}
 }
 
@@ -269,7 +271,7 @@ func TestResponsesStreamEventsEndDiscipline(t *testing.T) {
 		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n" +
 		"data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
-	next := p.streamEvents(strings.NewReader(body))
+	next := p.streamEvents(tBody(body))
 
 	if ev, err := next(); err != nil || ev.Type != EventMessageStart {
 		t.Fatalf("first = %v %v", ev, err)

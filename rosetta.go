@@ -1,7 +1,8 @@
-// Package rosetta provides a unified Go client for large-model chat APIs.
+// Package rosetta provides a unified Go client for large-model APIs.
 // It speaks three wire protocols — OpenAI Chat Completions, OpenAI
 // Responses and Anthropic Messages — plus the many third-party services
-// compatible with them, behind one small surface.
+// compatible with them, behind one small surface. Embeddings (OpenAI
+// format) and reranking (Cohere format) ride on the same client.
 //
 // A client is created with just an endpoint and an API key; protocol
 // differences (auth headers, system prompt placement, thinking budgets,
@@ -26,7 +27,7 @@
 package rosetta
 
 // Version is the semantic version of this SDK release.
-const Version = "0.3.1"
+const Version = "0.4.0"
 
 // Protocol identifies one of the supported wire protocols.
 type Protocol string

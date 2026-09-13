@@ -19,7 +19,25 @@ func validateEndpoint(raw string) error {
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Fragment != "" {
 		return errInvalidEndpoint
 	}
+	// Query strings are rejected: endpoints carry their version path only,
+	// and a query can hide credentials that would leak into error strings
+	// and retry logs verbatim.
+	if u.RawQuery != "" {
+		return errInvalidEndpoint
+	}
 	return nil
+}
+
+// displayEndpoint renders a raw endpoint for error messages with the query
+// string stripped: callers sometimes paste a key into the URL, and even a
+// rejected endpoint should not echo that credential back into logs.
+func displayEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.RawQuery == "" {
+		return raw
+	}
+	u.RawQuery = ""
+	return u.String()
 }
 
 func trimTrailingSlash(s string) string {

@@ -1,0 +1,47 @@
+package rosetta
+
+import (
+ "io"
+ "strings"
+ "sync"
+ "testing"
+ "time"
+)
+
+func TestAudit20260913LongErrorRedaction(t *testing.T) {
+ body := []byte(`{"api_key":"provider-secret-123456","padding":"` + strings.Repeat("x", 5000) + `"}`)
+ raw := safeTruncateBody(body)
+ if !strings.Contains(string(raw), "provider-secret-123456") { t.Fatal("expected reproduction of long-body redaction bypass") }
+ t.Log("CONFIRMED: >4KiB error body retains api_key value in Raw")
+}
+
+func TestAudit20260913StreamCallbackLock(t *testing.T) {
+ var s *streamCore
+ var blocked bool
+ done := make(chan struct{})
+ s = newStream(func() (*Event, error) { return nil, io.EOF }, func(Usage, error) {
+  go func() { s.Partial(); close(done) }()
+  select { case <-done: case <-time.After(100*time.Millisecond): blocked = true }
+ })
+ s.Next()
+ <-done
+ if !blocked { t.Fatal("expected callback's Partial accessor to block on the held stream lock") }
+ t.Log("CONFIRMED: onEnd runs under stream mutex; synchronous Partial/Err/Usage/Close callback reentry deadlocks")
+}
+
+func TestAudit20260913PartialConcurrent(t *testing.T) {
+ s := newStream(func() (*Event, error) { return &Event{Type: EventTextDelta, Text: "x"}, nil }, nil)
+ s.Next()
+ var wg sync.WaitGroup
+ wg.Go(func() { for range 20000 { s.Next() } })
+ wg.Go(func() { for range 20000 { _ = s.Partial() } })
+ wg.Wait()
+}
+
+func TestAudit20260913DisableThinkingStandalone(t *testing.T) {
+ r := newRegistry()
+ if err := r.SetManual([]ModelInfo{{ID:"model", SupportsThinking:true, DisableThinking:true}}); err != nil { t.Fatal(err) }
+ m,_ := r.Lookup("model")
+ if !m.SupportsThinking { t.Fatal("expected reproduction before merge") }
+ t.Log("CONFIRMED: standalone manual entry with DisableThinking=true keeps SupportsThinking=true")
+}

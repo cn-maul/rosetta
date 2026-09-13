@@ -527,7 +527,7 @@ func TestOpenAIChatStreamEventsEndDiscipline(t *testing.T) {
 		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
 		"data: [DONE]\n\n" +
 		"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n"
-	next := p.streamEvents(strings.NewReader(body))
+	next := p.streamEvents(tBody(body))
 
 	if ev, err := next(); err != nil || ev.Type != EventMessageStart {
 		t.Fatalf("first = %v %v", ev, err)
@@ -548,23 +548,25 @@ func TestOpenAIChatStreamEventsErrors(t *testing.T) {
 	c := newTestClient(t)
 	p := c.provider.(*openaiChatProvider)
 
-	// Mid-stream error object.
-	next := p.streamEvents(strings.NewReader("data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n"))
+	// Mid-stream error object, with request context attached.
+	next := p.streamEvents(tBody("data: {\"error\":{\"message\":\"boom\",\"type\":\"server_error\"}}\n\n"))
+	_, err := next()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Message != "boom" || apiErr.Method != "POST" || apiErr.URL == "" {
+		t.Fatalf("error chunk err = %v, want APIError with request context", err)
+	}
+
+	// Malformed chunks fail the stream: silently dropping one could lose
+	// text or tool-call fragments.
+	next = p.streamEvents(tBody("data: not-json\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
 	if _, err := next(); err == nil {
-		t.Fatal("error chunk must fail the stream")
+		t.Fatal("malformed chunk must fail the stream")
 	}
 
-	// Malformed chunks are skipped, not fatal.
-	next = p.streamEvents(strings.NewReader("data: not-json\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n"))
-	if ev, err := next(); err != nil || ev.Type != EventMessageStart {
-		t.Fatalf("start ev=%v err=%v", ev, err)
-	}
-	if ev, err := next(); err != nil || ev.Type != EventTextDelta || ev.Text != "ok" {
-		t.Fatalf("ev=%v err=%v", ev, err)
-	}
-
-	// Truncated stream without [DONE] → StopOther, no phantom StopEnd.
-	next = p.streamEvents(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+	// Truncated stream without [DONE]: the end event still arrives (with
+	// StopOther, no phantom StopEnd) but the stream reports
+	// ErrStreamTruncated afterwards.
+	next = p.streamEvents(tBody("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
 	var last *Event
 	for {
 		ev, err := next()
@@ -578,5 +580,8 @@ func TestOpenAIChatStreamEventsErrors(t *testing.T) {
 	}
 	if last.StopReason != StopOther {
 		t.Fatalf("truncated stream end = %+v, want StopOther", last)
+	}
+	if _, err := next(); !errors.Is(err, ErrStreamTruncated) {
+		t.Fatalf("err after truncated end = %v, want ErrStreamTruncated", err)
 	}
 }

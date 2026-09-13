@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"slices"
+	"sync"
 )
 
 // EventType enumerates unified stream event kinds.
@@ -39,8 +40,10 @@ type Event struct {
 	StopReason     StopReason
 }
 
-// Stream is a pull-based iterator over unified stream events. It is not
-// safe for concurrent use; drive it from one goroutine. A typical loop:
+// Stream is a pull-based iterator over unified stream events. Next must
+// be driven from a single goroutine, but Err / Usage / Partial / Close are
+// safe to call concurrently (e.g. a watchdog closing the stream while the
+// consumer loop runs). A typical loop:
 //
 //	stream, err := client.ChatStream(ctx, req)
 //	if err != nil { return err }
@@ -78,12 +81,17 @@ type Stream interface {
 // streamCore is the shared Stream implementation. Protocol adapters supply
 // a next func producing unified events; this type accumulates the partial
 // response, tracks usage and finalizes exactly once.
+//
+// State transitions are mutex-guarded so Close can race a blocked Next:
+// the event produced after a concurrent Close is discarded and the
+// resources were already released by Close.
 type streamCore struct {
 	next   func() (*Event, error)
 	onEnd  func(Usage, error)
 	cancel context.CancelFunc
 	closer io.Closer
 
+	mu       sync.Mutex
 	done     bool
 	released bool
 	closeErr error
@@ -113,16 +121,33 @@ func (s *streamCore) attachCloser(c io.Closer) {
 }
 
 func (s *streamCore) Next() bool {
+	s.mu.Lock()
 	if s.done {
+		s.mu.Unlock()
 		return false
 	}
+	s.mu.Unlock()
+
+	// The producer runs outside the lock: it blocks on network reads.
 	ev, err := s.next()
+
+	s.mu.Lock()
+	if s.done {
+		// Close() won the race while we were blocked in next(); it already
+		// released the resources and will fire onEnd after unlocking.
+		s.mu.Unlock()
+		return false
+	}
 	if err != nil {
 		s.done = true
 		if !errors.Is(err, io.EOF) {
 			s.err = err
 		}
-		s.release()
+		s.releaseLocked()
+		s.mu.Unlock()
+		if call, usage, terr := s.takeOnEnd(); call != nil {
+			call(usage, terr)
+		}
 		return false
 	}
 	if ev == nil {
@@ -130,43 +155,73 @@ func (s *streamCore) Next() bool {
 		// the stream, never panic the consumer.
 		s.done = true
 		s.err = errors.New("rosetta: internal error: stream produced a nil event")
-		s.release()
+		s.releaseLocked()
+		s.mu.Unlock()
+		if call, usage, terr := s.takeOnEnd(); call != nil {
+			call(usage, terr)
+		}
 		return false
 	}
 	s.apply(ev)
 	s.cur = ev
+	s.mu.Unlock()
 	return true
 }
 
-func (s *streamCore) Event() *Event { return s.cur }
+func (s *streamCore) Event() *Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur
+}
 
-func (s *streamCore) Err() error { return s.err }
+func (s *streamCore) Err() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
 
-func (s *streamCore) Usage() Usage { return s.usage }
+func (s *streamCore) Usage() Usage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usage
+}
 
 func (s *streamCore) Partial() *ChatResponse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cp := s.partial
-	cp.Content = slices.Clone(cp.Content) // snapshots must not mutate with the live stream
+	// Clone inside the lock: Next() mutates existing blocks in place, so a
+	// post-unlock clone of Content would race the live stream.
+	cp.Content = slices.Clone(cp.Content)
 	return &cp
 }
 
 func (s *streamCore) Collect() (*ChatResponse, error) {
 	for s.Next() {
 	}
-	resp := s.partial
-	resp.Content = slices.Clone(resp.Content)
-	return &resp, s.err
+	return s.Partial(), s.Err()
 }
 
 func (s *streamCore) Close() error {
+	s.mu.Lock()
 	s.done = true
-	s.release()
-	return s.closeErr
+	s.releaseLocked()
+	closeErr := s.closeErr
+	s.mu.Unlock()
+	// Fire onEnd outside the lock: user-supplied usage trackers may read
+	// stream accessors (Partial/Err/Usage) or close the stream, which must
+	// not deadlock against the mutex held here.
+	if call, usage, err := s.takeOnEnd(); call != nil {
+		call(usage, err)
+	}
+	return closeErr
 }
 
-// release finalizes the stream exactly once: cancels the request context,
-// closes the response body and notifies the owner.
-func (s *streamCore) release() {
+// releaseLocked finalizes the stream exactly once: cancels the request
+// context and closes the response body. The owner callback (onEnd) is NOT
+// invoked here — callers fire it via takeOnEnd after unlocking, so user
+// code can never run while mu is held. Callers hold mu.
+func (s *streamCore) releaseLocked() {
 	if s.released {
 		return
 	}
@@ -180,9 +235,18 @@ func (s *streamCore) release() {
 			s.err = s.closeErr
 		}
 	}
-	if s.onEnd != nil {
-		s.onEnd(s.usage, s.err)
-	}
+}
+
+// takeOnEnd pops the owner callback so it fires exactly once, outside mu.
+// usage/err are the terminal values captured at the time of the pop. The
+// returned call is nil when the callback was already consumed.
+func (s *streamCore) takeOnEnd() (call func(Usage, error), usage Usage, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	call = s.onEnd
+	s.onEnd = nil
+	usage, err = s.usage, s.err
+	return
 }
 
 // apply folds an event into the accumulated partial response.

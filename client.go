@@ -27,6 +27,7 @@ type Client struct {
 	modelsMu         sync.Mutex
 	modelsRefreshing bool
 	modelsDone       chan struct{}
+	modelsErr        error
 }
 
 // buildSettings applies options and resolves protocol/endpoint defaults.
@@ -49,7 +50,12 @@ func buildSettings(opts []Option) (*settings, error) {
 		st.endpoint = defaultEndpoint(st.protocol)
 	}
 	if err := validateEndpoint(st.endpoint); err != nil {
-		return nil, fmt.Errorf("rosetta: invalid endpoint %q: %w", st.endpoint, err)
+		return nil, fmt.Errorf("rosetta: invalid endpoint %q: %w", displayEndpoint(st.endpoint), err)
+	}
+	if st.embedEndpoint != "" {
+		if err := validateEndpoint(st.embedEndpoint); err != nil {
+			return nil, fmt.Errorf("rosetta: invalid embedding endpoint %q: %w", displayEndpoint(st.embedEndpoint), err)
+		}
 	}
 	return st, nil
 }
@@ -89,8 +95,7 @@ func NewClient(opts ...Option) (*Client, error) {
 		st.manualModels = append(infos, st.manualModels...)
 	}
 	if len(st.manualModels) > 0 {
-		c.registry.SetManual(st.manualModels)
-		if err := c.registry.Validate(); err != nil {
+		if err := c.registry.SetManual(st.manualModels); err != nil {
 			return nil, err
 		}
 	}
@@ -180,7 +185,9 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.registry.SetRemote(infos)
+	if err := c.registry.SetRemote(infos); err != nil {
+		return nil, err
+	}
 	return c.registry.List(), nil
 }
 
@@ -197,7 +204,12 @@ func (c *Client) refreshModels(ctx context.Context) error {
 		c.modelsMu.Unlock()
 		select {
 		case <-done:
-			return nil
+			// Waiters share the refresh outcome: a failed refresh must
+			// not read as success to whoever waited on it.
+			c.modelsMu.Lock()
+			err := c.modelsErr
+			c.modelsMu.Unlock()
+			return err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -209,10 +221,11 @@ func (c *Client) refreshModels(ctx context.Context) error {
 
 	infos, err := c.provider.ListModels(ctx)
 	if err == nil {
-		c.registry.SetRemote(infos)
+		err = c.registry.SetRemote(infos)
 	}
 	c.modelsMu.Lock()
 	c.modelsRefreshing = false
+	c.modelsErr = err
 	close(done)
 	c.modelsMu.Unlock()
 	return err
@@ -228,8 +241,11 @@ func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
 			ctx, cancel = context.WithTimeout(ctx, c.settings.timeout)
 			defer cancel()
 		}
-		if infos, err := c.provider.ListModels(ctx); err == nil {
-			c.registry.SetRemote(infos)
+		// Route through refreshModels so concurrent unknown-model lookups
+		// share one /models request instead of stampeding the endpoint.
+		if err := c.refreshModels(ctx); err != nil {
+			c.settings.logger.Debug("rosetta: remote model discovery failed",
+				"model", id, "err", err.Error())
 		}
 	}
 	mi, ok := c.registry.Lookup(id)
@@ -281,7 +297,7 @@ func (c *Client) checkContext(req *ChatRequest) error {
 	if !ok || mi.ContextWindow <= 0 {
 		return nil
 	}
-	in := req.estimateInputTokens()
+	in := req.estimateInputTokens(c.settings.estimates)
 	out := c.effectiveMaxOutput(req)
 	if in <= mi.ContextWindow && (out <= 0 || in+out <= mi.ContextWindow) {
 		return nil

@@ -556,7 +556,7 @@ Rosetta/
 | **M5 用量统计** | 统计器、Snapshot、Tracker 接口、流式 usage 兜底 | 并发统计无竞态（-race）；各协议流式均能取到 usage | 0.5 周 |
 | **M6 打磨发布** | quirks、examples、README、godoc、语义化版本 v0.1.0 | 5 个示例可运行；文档完整；覆盖率达标 | 0.5 周 |
 
-后续路线图（v0.2+）：Bedrock/Vertex 适配、count_tokens 对接、结构化输出（JSON Schema）统一、prompt caching 统一配置、Embeddings。
+后续路线图（v0.2+）：Bedrock/Vertex 适配、count_tokens 对接、结构化输出（JSON Schema）统一、prompt caching 统一配置。Embeddings 与 Rerank 已于 v0.4.0 落地（`Client.Embed`/`Client.Rerank`，OpenAI 与 Cohere 事实标准）。
 
 ---
 
@@ -577,7 +577,7 @@ Rosetta/
 
 1. ~~**module path**~~：已定 `github.com/cn-maul/rosetta`（2026-09-05）。
 2. **工具调用**：是否按本计划纳入 v1（仅透传，不含执行循环）？若不需要可砍掉约 3 天工作量。
-3. **Go 最低版本**：建议 Go 1.22+，是否可接受？
+3. ~~**Go 最低版本**~~：已定 Go 1.27+（go.mod `go 1.27`，2026-09-13）。
 4. **用量持久化**：v1 仅内存 + 接口扩展点，是否符合预期？是否需要内置 SQLite/文件持久化？
 5. **多模态范围**：图片输入（URL/base64）v1 纳入，音频/视频是否需要？
 6. ~~**SDK 命名**~~：已定名 **Rosetta**（2026-09-05，原暂定名 PolyAI 弃用）。

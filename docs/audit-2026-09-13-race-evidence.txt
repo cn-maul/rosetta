@@ -1,0 +1,44 @@
+=== RUN   TestAudit20260913PartialConcurrent
+==================
+WARNING: DATA RACE
+Write at 0x00c000000110 by goroutine 10:
+  github.com/cn-maul/rosetta.appendBlockText()
+      C:/Users/louis/Desktop/project/rosetta/stream.go:260 +0xaa6
+  github.com/cn-maul/rosetta.(*streamCore).apply()
+      C:/Users/louis/Desktop/project/rosetta/stream.go:236 +0x6b5
+  github.com/cn-maul/rosetta.(*streamCore).Next()
+      C:/Users/louis/Desktop/project/rosetta/stream.go:157 +0x157
+  github.com/cn-maul/rosetta.TestAudit20260913PartialConcurrent.func2()
+      C:/Users/louis/Desktop/project/rosetta/zz_audit_20260913_core_temp_test.go:36 +0x37
+
+Previous read at 0x00c000000110 by goroutine 11:
+  runtime.slicecopy()
+      C:/Program Files/Go/src/runtime/slice.go:392 +0x0
+  slices.Clone[go.shape.[]github.com/cn-maul/rosetta.Block,go.shape.struct { Type github.com/cn-maul/rosetta.BlockType; Text string; ImageURL string; AudioData string; AudioFormat string; FileName string; MimeType string; FileData string; FileID string; ToolCallID string; ToolName string; Arguments string; Content string; IsError bool; Thinking string; Signature string }]()
+      C:/Program Files/Go/src/slices/slices.go:362 +0x1a4
+  github.com/cn-maul/rosetta.(*streamCore).Partial()
+      C:/Users/louis/Desktop/project/rosetta/stream.go:184 +0x105
+  github.com/cn-maul/rosetta.TestAudit20260913PartialConcurrent.func3()
+      C:/Users/louis/Desktop/project/rosetta/zz_audit_20260913_core_temp_test.go:37 +0x37
+
+Goroutine 10 (running) created at:
+  sync.(*WaitGroup).Go()
+      C:/Program Files/Go/src/sync/waitgroup.go:238 +0x72
+  testing.tRunner()
+      C:/Program Files/Go/src/testing/testing.go:2193 +0x1ca
+  testing.(*T).Run.gowrap1()
+      C:/Program Files/Go/src/testing/testing.go:2258 +0x38
+
+Goroutine 11 (running) created at:
+  sync.(*WaitGroup).Go()
+      C:/Program Files/Go/src/sync/waitgroup.go:238 +0x72
+  testing.tRunner()
+      C:/Program Files/Go/src/testing/testing.go:2193 +0x1ca
+  testing.(*T).Run.gowrap1()
+      C:/Program Files/Go/src/testing/testing.go:2258 +0x38
+==================
+    testing.go:1865: race detected during execution of test
+--- FAIL: TestAudit20260913PartialConcurrent (0.21s)
+FAIL
+FAIL	github.com/cn-maul/rosetta	0.278s
+FAIL

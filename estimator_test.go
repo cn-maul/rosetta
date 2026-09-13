@@ -35,7 +35,7 @@ func TestEstimateInputTokens(t *testing.T) {
 		Messages: []Message{User("abcd")},
 	}
 	// system: 1 + 4 overhead; message: 1 + 4 overhead = 10
-	if got := req.estimateInputTokens(); got != 10 {
+	if got := req.estimateInputTokens(MultimediaTokenEstimates{}); got != 10 {
 		t.Fatalf("estimateInputTokens() = %d, want 10", got)
 	}
 
@@ -51,7 +51,7 @@ func TestEstimateInputTokens(t *testing.T) {
 	}
 	// system 1+4; user 2+4; assistant tool call (7 ascii→2)+16+4; tool
 	// result (6 ascii→2)+4 = 39
-	if got := req.estimateInputTokens(); got != 39 {
+	if got := req.estimateInputTokens(MultimediaTokenEstimates{}); got != 39 {
 		t.Fatalf("estimateInputTokens() = %d, want 39", got)
 	}
 
@@ -65,7 +65,7 @@ func TestEstimateInputTokens(t *testing.T) {
 	}
 	// user 2+4; tool: 24 + name (11 ascii→3) + desc (15 ascii→4) + schema
 	// (33 ascii→9) = 40; total 45
-	if got := req.estimateInputTokens(); got != 45 {
+	if got := req.estimateInputTokens(MultimediaTokenEstimates{}); got != 45 {
 		t.Fatalf("estimateInputTokens() with tools = %d, want 45", got)
 	}
 }

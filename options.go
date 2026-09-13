@@ -27,6 +27,8 @@ type Quirks struct {
 type settings struct {
 	endpoint         string
 	apiKey           string
+	embedEndpoint    string
+	embedAPIKey      string
 	protocol         Protocol
 	httpClient       *http.Client
 	timeout          time.Duration
@@ -38,7 +40,10 @@ type settings struct {
 	thinkingFallback bool
 	thinkingRectify  bool
 	maxTokensField   string
+	anthropicBearer  bool
 	strictContext    bool
+	extraOverrides   bool
+	estimates        MultimediaTokenEstimates
 	quirks           Quirks
 	modelsFile       string
 	manualModels     []ModelInfo
@@ -66,6 +71,22 @@ func WithEndpoint(v string) Option {
 // on OpenAI protocols and "x-api-key" on Anthropic.
 func WithAPIKey(v string) Option {
 	return func(s *settings) { s.apiKey = strings.TrimSpace(v) }
+}
+
+// WithEmbeddingEndpoint overrides the base URL used for Embed and Rerank
+// calls, for setups where the chat provider does not serve embeddings —
+// e.g. chat on DeepSeek with embeddings on a local Ollama or SiliconFlow.
+// When unset, both ride on the main endpoint. Note that Anthropic-protocol
+// clients cannot serve embeddings at all; this option is what unlocks
+// Embed/Rerank there.
+func WithEmbeddingEndpoint(v string) Option {
+	return func(s *settings) { s.embedEndpoint = strings.TrimSpace(v) }
+}
+
+// WithEmbeddingAPIKey sets the credential used against the embedding
+// endpoint when it differs from the chat key.
+func WithEmbeddingAPIKey(v string) Option {
+	return func(s *settings) { s.embedAPIKey = strings.TrimSpace(v) }
 }
 
 // WithProtocol forces a wire protocol. When omitted, it resolves from
@@ -175,4 +196,32 @@ func WithMaxTokensField(v string) Option {
 // WithQuirks applies explicit compatibility adjustments for the endpoint.
 func WithQuirks(q Quirks) Option {
 	return func(s *settings) { s.quirks = q }
+}
+
+// WithAnthropicBearerAuth additionally sends "Authorization: Bearer <key>"
+// on Anthropic requests. By default only the Anthropic-native "x-api-key"
+// header is sent, so the credential is not copied onto a second auth
+// channel that proxies and gateways may log differently. Enable this for
+// Anthropic-compatible gateways that authenticate exclusively via Bearer.
+func WithAnthropicBearerAuth(v bool) Option {
+	return func(s *settings) { s.anthropicBearer = v }
+}
+
+// WithExtraOverrides lets ChatRequest/EmbeddingRequest/RerankRequest.Extra
+// keys override SDK-managed payload fields ("model", "messages", "stream",
+// output caps, ...). By default such collisions are rejected with
+// ErrInvalidRequest, because an accidental override silently bypasses
+// validation. Enable only when you really mean to rewrite SDK-computed
+// fields for a provider quirk.
+func WithExtraOverrides(v bool) Option {
+	return func(s *settings) { s.extraOverrides = v }
+}
+
+// WithMultimediaTokenEstimates overrides the flat per-block token
+// estimates (image/audio/file) used by the context-window check. The
+// defaults are coarse approximations — tune them to your provider when
+// strict context checking rejects valid requests or lets oversized ones
+// through. Zero fields keep the defaults (1500 / 500 / 3000).
+func WithMultimediaTokenEstimates(e MultimediaTokenEstimates) Option {
+	return func(s *settings) { s.estimates = e }
 }

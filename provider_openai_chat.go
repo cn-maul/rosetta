@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -126,7 +125,9 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 			pl["stream_options"] = map[string]any{"include_usage": true}
 		}
 	}
-	maps.Copy(pl, req.Extra)
+	if err := mergeExtra(pl, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
+		return nil, err
+	}
 	return pl, nil
 }
 
@@ -142,7 +143,11 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 				out = append(out, map[string]any{"role": "system", "content": t})
 			}
 		case RoleUser:
-			out = append(out, encodeOpenAIUser(m))
+			mm, err := encodeOpenAIUser(m)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, mm)
 		case RoleAssistant:
 			mm := map[string]any{"role": "assistant"}
 			if t := m.text(); t != "" {
@@ -190,18 +195,21 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 	return out, nil
 }
 
-func encodeOpenAIUser(m Message) map[string]any {
+func encodeOpenAIUser(m Message) (map[string]any, error) {
 	mm := map[string]any{"role": "user"}
-	var hasImage bool
+	var multimodal bool
 	for _, b := range m.Blocks {
-		if b.Type == BlockImage {
-			hasImage = true
+		switch b.Type {
+		case BlockImage, BlockAudio, BlockFile:
+			multimodal = true
+		}
+		if multimodal {
 			break
 		}
 	}
-	if !hasImage {
+	if !multimodal {
 		mm["content"] = m.text()
-		return mm
+		return mm, nil
 	}
 	parts := make([]map[string]any, 0, len(m.Blocks))
 	for _, b := range m.Blocks {
@@ -215,10 +223,36 @@ func encodeOpenAIUser(m Message) map[string]any {
 				"type":      "image_url",
 				"image_url": map[string]any{"url": b.ImageURL},
 			})
+		case BlockAudio:
+			if b.AudioData == "" {
+				return nil, fmt.Errorf("%w: audio block has no AudioData", ErrInvalidRequest)
+			}
+			if b.AudioFormat != "wav" && b.AudioFormat != "mp3" {
+				return nil, fmt.Errorf("%w: audio format %q unsupported (wav or mp3)", ErrInvalidRequest, b.AudioFormat)
+			}
+			parts = append(parts, map[string]any{
+				"type":        "input_audio",
+				"input_audio": map[string]any{"data": b.AudioData, "format": b.AudioFormat},
+			})
+		case BlockFile:
+			f := map[string]any{}
+			if b.FileID != "" {
+				f["file_id"] = b.FileID
+			} else {
+				du, err := fileDataURL(b)
+				if err != nil {
+					return nil, err
+				}
+				f["file_data"] = du
+			}
+			if b.FileName != "" {
+				f["filename"] = b.FileName
+			}
+			parts = append(parts, map[string]any{"type": "file", "file": f})
 		}
 	}
 	mm["content"] = parts
-	return mm
+	return mm, nil
 }
 
 // hintWords match 400-error phrasing that identifies an optional-field
@@ -241,11 +275,17 @@ func containsAny(low string, words ...string) bool {
 // It returns true when the payload changed and the request should be
 // retried. Downgrades are remembered for the client lifetime. To keep the
 // keyword matching from misfiring on unrelated 400s, a non-empty error
-// type must look like an invalid-request error; and a field pinned via
-// WithMaxTokensField is never flipped.
+// type must look like an invalid-request error; a rejection of a *value*
+// inside a field (e.g. an unsupported reasoning_effort level) is a request
+// configuration error, not evidence the field is unsupported, so it is
+// surfaced as-is; and a field pinned via WithMaxTokensField is never
+// flipped.
 func (p *openaiChatProvider) sanitize(st *oaSendState, msg, errType string, stream bool) bool {
 	low := strings.ToLower(msg)
 	if errType != "" && !strings.Contains(strings.ToLower(errType), "invalid_request") {
+		return false
+	}
+	if containsAny(low, "unsupported value") {
 		return false
 	}
 	note := func(slot **bool, v bool) {
@@ -305,7 +345,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
-		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		body, rerr := httpx.ReadBody(resp.Body, 1<<20)
 		resp.Body.Close()
 		if rerr != nil {
 			return nil, transport(rerr, method, url)
@@ -348,8 +388,11 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 			resp = r
 			break
 		}
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		body, rerr := httpx.ReadBody(r.Body, 1<<20)
 		r.Body.Close()
+		if rerr != nil {
+			return nil, transport(rerr, method, url)
+		}
 		apiErr := parseOpenAIError(r.StatusCode, body, method, url, r.Header.Get("X-Request-Id"))
 		if r.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, apiErr.Type, true) {
 			sanitizes++
@@ -357,16 +400,18 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		}
 		return nil, apiErr
 	}
-	s := newStream(p.streamEvents(resp.Body), nil)
+	s := newStream(p.streamEvents(resp.Body, method, url, resp.Header.Get("X-Request-Id")), nil)
 	s.attachCloser(resp.Body)
 	return s, nil
 }
 
 // streamEvents maps the OpenAI chunk SSE stream onto unified events.
 // Usage and stop reason are captured from their chunks and delivered in a
-// single synthesized EventMessageEnd, emitted at [DONE] or EOF whichever
-// comes first (usage sometimes trails the finish_reason chunk).
-func (p *openaiChatProvider) streamEvents(body io.Reader) func() (*Event, error) {
+// single synthesized EventMessageEnd, emitted at [DONE]. An EOF before
+// [DONE] still yields the end event (with StopOther) but the stream then
+// fails with ErrStreamTruncated, so callers never mistake a cut-off
+// response for a clean finish.
+func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
 		pending   []*Event
@@ -374,6 +419,7 @@ func (p *openaiChatProvider) streamEvents(body io.Reader) func() (*Event, error)
 		stop      StopReason
 		usage     *Usage
 		ended     bool
+		truncated bool
 	)
 	endEvent := func() *Event {
 		// No finish_reason seen: stream ended without the provider's
@@ -394,15 +440,24 @@ func (p *openaiChatProvider) streamEvents(body io.Reader) func() (*Event, error)
 			return ev, nil
 		}
 		for {
-			// Once the terminal signal ([DONE] or EOF) was seen, never
-			// emit further events even if the server keeps sending.
+			// Once the terminal signal ([DONE] or a truncated EOF) was
+			// seen, never emit further events even if the server keeps
+			// sending.
 			if ended {
+				if truncated {
+					return nil, fmt.Errorf("rosetta: %w: openai-chat stream ended without [DONE] (partial response kept in Stream.Partial)", ErrStreamTruncated)
+				}
 				return nil, io.EOF
 			}
 			ssev, err := sc.Next()
 			if err != nil {
-				if errors.Is(err, io.EOF) && !ended {
+				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
+				// covers a real HTTP truncation (chunked stream cut before the
+				// final zero chunk, gateway timeout). Both mean [DONE] never
+				// arrived.
+				if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && !ended {
 					ended = true
+					truncated = true
 					return endEvent(), nil
 				}
 				return nil, err
@@ -420,12 +475,15 @@ func (p *openaiChatProvider) streamEvents(body io.Reader) func() (*Event, error)
 			}
 			var ch oaChunk
 			if err := json.Unmarshal(data, &ch); err != nil {
-				p.c.settings.logger.Debug("openai-chat: skipping malformed stream chunk",
-					"err", err.Error())
-				continue
+				// A malformed chunk may carry content the caller will
+				// otherwise never see; dropping it silently would corrupt
+				// text or tool-call arguments, so fail the stream instead.
+				return nil, fmt.Errorf("rosetta: openai-chat stream (%s %s): malformed event: %w", method, url, err)
 			}
 			if ch.Error != nil {
-				return nil, ch.Error.apiError(200)
+				apiErr := ch.Error.apiError(200)
+				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
+				return nil, apiErr
 			}
 			var events []*Event
 			if !startSent {
