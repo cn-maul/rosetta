@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -81,7 +82,8 @@ func (f *FlexInt64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		}
 		// Tolerate floats like 1.2e3 or 120.0 from sloppy serializers.
 		if fv, ferr := tok.Float(); ferr == nil {
-			f.Value = int64(fv)
+			v, ok := clampFloatToInt64(fv)
+			f.Value, f.Set = v, ok
 			return nil
 		}
 		f.Set = false
@@ -102,7 +104,8 @@ func (f *FlexInt64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 			return nil
 		}
 		if fv, ferr := strconv.ParseFloat(s, 64); ferr == nil {
-			f.Value = int64(fv)
+			v, ok := clampFloatToInt64(fv)
+			f.Value, f.Set = v, ok
 			return nil
 		}
 		f.Set = false
@@ -120,6 +123,22 @@ func (f *FlexInt64) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 }
 
 func (f FlexInt64) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }
+
+// clampFloatToInt64 converts a float to int64 without the silent wraparound
+// that a raw int64(f) cast performs on out-of-range or non-finite values:
+// ±Inf and overflow pin to the int64 extremes, NaN reports "unset".
+func clampFloatToInt64(fv float64) (int64, bool) {
+	switch {
+	case math.IsNaN(fv):
+		return 0, false
+	case fv >= math.MaxInt64:
+		return math.MaxInt64, true
+	case fv <= math.MinInt64:
+		return math.MinInt64, true
+	default:
+		return int64(fv), true
+	}
+}
 
 // ContentString decodes an OpenAI-style "content" field: usually a plain
 // string, but occasionally an array of typed parts on third-party

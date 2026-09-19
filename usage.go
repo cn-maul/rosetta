@@ -15,6 +15,11 @@ type Usage struct {
 	// CachedInputTokens counts input tokens served from cache (OpenAI
 	// prompt_tokens_details.cached_tokens; Anthropic cache_read_input_tokens).
 	CachedInputTokens int64 `json:"cached_input_tokens"`
+	// CachedCreationTokens counts input tokens written into the cache by
+	// this request (Anthropic cache_creation_input_tokens). The OpenAI
+	// protocols cache prefixes automatically and report no separate write
+	// figure, so it stays zero there.
+	CachedCreationTokens int64 `json:"cached_creation_tokens"`
 	// ReasoningTokens counts tokens spent on thinking (where reported).
 	ReasoningTokens int64 `json:"reasoning_tokens"`
 }
@@ -37,26 +42,28 @@ type UsageRecord struct {
 
 // ModelUsage aggregates usage for one key (model or protocol).
 type ModelUsage struct {
-	Requests          int64 `json:"requests"`
-	InputTokens       int64 `json:"input_tokens"`
-	OutputTokens      int64 `json:"output_tokens"`
-	TotalTokens       int64 `json:"total_tokens"`
-	CachedInputTokens int64 `json:"cached_input_tokens"`
-	ReasoningTokens   int64 `json:"reasoning_tokens"`
-	UsageMissing      int64 `json:"usage_missing"`
+	Requests             int64 `json:"requests"`
+	InputTokens          int64 `json:"input_tokens"`
+	OutputTokens         int64 `json:"output_tokens"`
+	TotalTokens          int64 `json:"total_tokens"`
+	CachedInputTokens    int64 `json:"cached_input_tokens"`
+	CachedCreationTokens int64 `json:"cached_creation_tokens"`
+	ReasoningTokens      int64 `json:"reasoning_tokens"`
+	UsageMissing         int64 `json:"usage_missing"`
 }
 
 // UsageSnapshot is a point-in-time view of accumulated usage.
 type UsageSnapshot struct {
-	TotalRequests     int64                   `json:"total_requests"`
-	InputTokens       int64                   `json:"input_tokens"`
-	OutputTokens      int64                   `json:"output_tokens"`
-	TotalTokens       int64                   `json:"total_tokens"`
-	CachedInputTokens int64                   `json:"cached_input_tokens"`
-	ReasoningTokens   int64                   `json:"reasoning_tokens"`
-	UsageMissing      int64                   `json:"usage_missing"`
-	ByModel           map[string]ModelUsage   `json:"by_model"`
-	ByProtocol        map[Protocol]ModelUsage `json:"by_protocol"`
+	TotalRequests        int64                   `json:"total_requests"`
+	InputTokens          int64                   `json:"input_tokens"`
+	OutputTokens         int64                   `json:"output_tokens"`
+	TotalTokens          int64                   `json:"total_tokens"`
+	CachedInputTokens    int64                   `json:"cached_input_tokens"`
+	CachedCreationTokens int64                   `json:"cached_creation_tokens"`
+	ReasoningTokens      int64                   `json:"reasoning_tokens"`
+	UsageMissing         int64                   `json:"usage_missing"`
+	ByModel              map[string]ModelUsage   `json:"by_model"`
+	ByProtocol           map[Protocol]ModelUsage `json:"by_protocol"`
 }
 
 // UsageTracker receives usage observations. Implementations must be safe
@@ -94,6 +101,7 @@ func (t *MemoryUsageTracker) Record(_ context.Context, r UsageRecord) {
 		m.OutputTokens += r.Usage.OutputTokens
 		m.TotalTokens += r.Usage.TotalTokens
 		m.CachedInputTokens += r.Usage.CachedInputTokens
+		m.CachedCreationTokens += r.Usage.CachedCreationTokens
 		m.ReasoningTokens += r.Usage.ReasoningTokens
 		if r.UsageMissing {
 			m.UsageMissing++
@@ -113,15 +121,16 @@ func (t *MemoryUsageTracker) Snapshot() UsageSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	snap := UsageSnapshot{
-		TotalRequests:     t.total.Requests,
-		InputTokens:       t.total.InputTokens,
-		OutputTokens:      t.total.OutputTokens,
-		TotalTokens:       t.total.TotalTokens,
-		CachedInputTokens: t.total.CachedInputTokens,
-		ReasoningTokens:   t.total.ReasoningTokens,
-		UsageMissing:      t.total.UsageMissing,
-		ByModel:           make(map[string]ModelUsage, len(t.byModel)),
-		ByProtocol:        make(map[Protocol]ModelUsage, len(t.byProto)),
+		TotalRequests:        t.total.Requests,
+		InputTokens:          t.total.InputTokens,
+		OutputTokens:         t.total.OutputTokens,
+		TotalTokens:          t.total.TotalTokens,
+		CachedInputTokens:    t.total.CachedInputTokens,
+		CachedCreationTokens: t.total.CachedCreationTokens,
+		ReasoningTokens:      t.total.ReasoningTokens,
+		UsageMissing:         t.total.UsageMissing,
+		ByModel:              make(map[string]ModelUsage, len(t.byModel)),
+		ByProtocol:           make(map[Protocol]ModelUsage, len(t.byProto)),
 	}
 	maps.Copy(snap.ByModel, t.byModel)
 	maps.Copy(snap.ByProtocol, t.byProto)

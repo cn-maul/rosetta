@@ -146,7 +146,7 @@ func TestAuditFixEmptyTextPlaceholderWithImage(t *testing.T) {
 	if err := req.validate(); err != nil {
 		t.Fatalf("empty text placeholder must pass: %v", err)
 	}
-	if _, err := p.buildPayload(req, false, p.initialState()); err != nil {
+	if _, err := p.buildPayload(req, false, p.initialState("m")); err != nil {
 		t.Fatalf("payload build must pass: %v", err)
 	}
 }

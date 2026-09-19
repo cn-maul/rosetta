@@ -10,7 +10,7 @@ import (
 func TestOpenAIChatMultimodalBlocks(t *testing.T) {
 	c := newTestClient(t)
 	p := c.provider.(*openaiChatProvider)
-	st := p.initialState()
+	st := p.initialState("gpt-4o-audio-preview")
 
 	req := &ChatRequest{
 		Model: "gpt-4o-audio-preview",
@@ -61,7 +61,7 @@ func TestOpenAIChatMultimodalBlocks(t *testing.T) {
 func TestOpenAIChatMultimodalBlockErrors(t *testing.T) {
 	c := newTestClient(t)
 	p := c.provider.(*openaiChatProvider)
-	st := p.initialState()
+	st := p.initialState("m")
 	base := func(b Block) *ChatRequest {
 		return &ChatRequest{Model: "m", Messages: []Message{{Role: RoleUser, Blocks: []Block{b}}}}
 	}

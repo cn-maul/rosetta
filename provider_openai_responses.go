@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
+	"github.com/cn-maul/rosetta/internal/jsonx"
 	"github.com/cn-maul/rosetta/internal/sse"
 )
 
@@ -135,10 +136,9 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
-		body, rerr := httpx.ReadBody(resp.Body, 1<<20)
-		resp.Body.Close()
+		body, rerr := readBody(resp, method, url, bodyLimit)
 		if rerr != nil {
-			return nil, transport(rerr, method, url)
+			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
 			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
@@ -174,10 +174,9 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 			return nil, transport(err, method, url)
 		}
 		if resp.StatusCode != http.StatusOK {
-			body, rerr := httpx.ReadBody(resp.Body, 1<<20)
-			resp.Body.Close()
+			body, rerr := readBody(resp, method, url, bodyLimit)
 			if rerr != nil {
-				return nil, transport(rerr, method, url)
+				return nil, rerr
 			}
 			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
 			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model) {
@@ -390,14 +389,29 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
-		stop      StopReason
-		usage     *Usage
-		ended     bool
-		truncated bool
+		stop        StopReason
+		usage       *Usage
+		ended       bool
+		truncated   bool
+		sawToolCall bool
+		// announced guards output_item.added vs output_item.done so a
+		// minimal emitter that skips the incremental events still has its
+		// finalized function_call delivered once.
+		announced map[int]bool
 	)
 	endEvent := func() *Event {
+		// A completed turn that requested a tool call ends as tool_use, not
+		// end_turn: the Responses API reports status "completed" even when
+		// the model emitted a function_call, so the presence of a tool call
+		// is the authoritative signal.
 		if stop == "" {
-			stop = StopOther
+			if sawToolCall {
+				stop = StopToolUse
+			} else {
+				stop = StopOther
+			}
+		} else if stop == StopEnd && sawToolCall {
+			stop = StopToolUse
 		}
 		ev := &Event{Type: EventMessageEnd, StopReason: stop}
 		if usage != nil {
@@ -440,19 +454,52 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				// text or tool-call arguments, so fail the stream instead.
 				return nil, fmt.Errorf("rosetta: responses stream (%s %s): malformed event: %w", method, url, err)
 			}
-			switch ev.Type {
+			// Dispatch on the JSON type field, but fall back to the SSE
+			// `event:` name: a proxy that forwards the envelope unchanged may
+			// drop or fail to populate the inner type.
+			dtype := ev.Type
+			if dtype == "" {
+				dtype = ssev.Name
+			}
+			switch dtype {
 			case "response.created":
 				if ev.Response != nil {
 					return &Event{Type: EventMessageStart, ID: ev.Response.ID, Model: ev.Response.Model}, nil
 				}
 			case "response.output_item.added":
 				if ev.Item != nil && ev.Item.Type == "function_call" {
+					sawToolCall = true
+					if announced == nil {
+						announced = map[int]bool{}
+					}
+					announced[ev.OutputIndex] = true
 					return &Event{
 						Type:      EventToolCall,
 						ToolIndex: ev.OutputIndex,
 						ToolID:    ev.Item.CallID,
 						ToolName:  ev.Item.Name,
 					}, nil
+				}
+			case "response.output_item.done":
+				// The finalized item is normally assembled from the earlier
+				// added + argument-delta events. Only when a minimal emitter
+				// skipped those do we surface the complete function_call here
+				// so its id/name/arguments are never lost.
+				if ev.Item != nil && ev.Item.Type == "function_call" {
+					sawToolCall = true
+					if !announced[ev.OutputIndex] {
+						if announced == nil {
+							announced = map[int]bool{}
+						}
+						announced[ev.OutputIndex] = true
+						return &Event{
+							Type:           EventToolCall,
+							ToolIndex:      ev.OutputIndex,
+							ToolID:         ev.Item.CallID,
+							ToolName:       ev.Item.Name,
+							ArgumentsDelta: ev.Item.Arguments,
+						}, nil
+					}
 				}
 			case "response.output_text.delta":
 				if ev.Delta != "" {
@@ -464,6 +511,7 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				}
 			case "response.function_call_arguments.delta":
 				if ev.Delta != "" {
+					sawToolCall = true
 					return &Event{
 						Type:           EventToolCall,
 						ToolIndex:      ev.OutputIndex,
@@ -543,32 +591,32 @@ func maybeQuote(s string) string {
 // ---- wire types ----
 
 type oaRespUsage struct {
-	InputTokens        int64 `json:"input_tokens"`
-	OutputTokens       int64 `json:"output_tokens"`
-	TotalTokens        int64 `json:"total_tokens"`
+	InputTokens        jsonx.FlexInt64 `json:"input_tokens"`
+	OutputTokens       jsonx.FlexInt64 `json:"output_tokens"`
+	TotalTokens        jsonx.FlexInt64 `json:"total_tokens"`
 	InputTokensDetails *struct {
-		CachedTokens int64 `json:"cached_tokens"`
+		CachedTokens jsonx.FlexInt64 `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
 	OutputTokensDetails *struct {
-		ReasoningTokens int64 `json:"reasoning_tokens"`
+		ReasoningTokens jsonx.FlexInt64 `json:"reasoning_tokens"`
 	} `json:"output_tokens_details"`
 }
 
 func (u *oaRespUsage) toUsage() Usage {
-	total := u.TotalTokens
+	total := u.TotalTokens.Value
 	if total == 0 {
-		total = u.InputTokens + u.OutputTokens
+		total = u.InputTokens.Value + u.OutputTokens.Value
 	}
 	out := Usage{
-		InputTokens:  u.InputTokens,
-		OutputTokens: u.OutputTokens,
+		InputTokens:  u.InputTokens.Value,
+		OutputTokens: u.OutputTokens.Value,
 		TotalTokens:  total,
 	}
 	if u.InputTokensDetails != nil {
-		out.CachedInputTokens = u.InputTokensDetails.CachedTokens
+		out.CachedInputTokens = u.InputTokensDetails.CachedTokens.Value
 	}
 	if u.OutputTokensDetails != nil {
-		out.ReasoningTokens = u.OutputTokensDetails.ReasoningTokens
+		out.ReasoningTokens = u.OutputTokensDetails.ReasoningTokens.Value
 	}
 	return out
 }
@@ -615,9 +663,10 @@ type oaRespEvent struct {
 	Code        string `json:"code"`
 	Message     string `json:"message"`
 	Item        *struct {
-		Type   string `json:"type"`
-		CallID string `json:"call_id"`
-		Name   string `json:"name"`
+		Type      string `json:"type"`
+		CallID    string `json:"call_id"`
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
 	} `json:"item"`
 	Response *oaRespResponse `json:"response"`
 }
@@ -631,6 +680,7 @@ func decodeResponsesResponse(body []byte) (*ChatResponse, error) {
 		return nil, r.Error.apiError(200)
 	}
 	out := &ChatResponse{ID: r.ID, Model: r.Model, Raw: truncateBody(body)}
+	var sawToolCall bool
 	for _, item := range r.Output {
 		switch item.Type {
 		case "message":
@@ -661,6 +711,7 @@ func decodeResponsesResponse(body []byte) (*ChatResponse, error) {
 				out.Content = append(out.Content, Block{Type: BlockThinking, Thinking: th.String()})
 			}
 		case "function_call":
+			sawToolCall = true
 			out.Content = append(out.Content, Block{
 				Type:       BlockToolCall,
 				ToolCallID: item.CallID,
@@ -670,6 +721,11 @@ func decodeResponsesResponse(body []byte) (*ChatResponse, error) {
 		}
 	}
 	out.StopReason = mapResponsesStop(r.Status, r.IncompleteReason())
+	// A completed response that requested a tool call is tool_use, not a
+	// plain end_turn: status alone does not distinguish them.
+	if out.StopReason == StopEnd && sawToolCall {
+		out.StopReason = StopToolUse
+	}
 	if out.StopReason == StopOther && r.Status == "" {
 		out.StopReason = StopEnd // unary 200 is complete by definition
 	}

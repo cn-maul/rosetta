@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -36,7 +37,7 @@ var (
 	// provider's terminal event — a cut connection or gateway timeout, not
 	// a clean finish. The partial response stays available via
 	// Stream.Partial; match with errors.Is.
-	ErrStreamTruncated = errors.New("stream truncated")
+	ErrStreamTruncated = errors.New("rosetta: stream truncated")
 )
 
 // TransportError wraps a lower-level network failure (DNS, connect, TLS,
@@ -59,6 +60,7 @@ type APIError struct {
 	StatusCode int
 	Code       string // provider-specific error code, when present
 	Type       string // provider-specific error type, when present
+	Param      string // offending request parameter, when the provider names it
 	Message    string
 	RequestID  string // from X-Request-Id / request-id headers
 	Method     string
@@ -74,15 +76,18 @@ type APIError struct {
 func (e *APIError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "rosetta: %s %s -> %d", e.Method, e.URL, e.StatusCode)
-	if e.Type != "" {
-		b.WriteString(" (" + e.Type)
-		if e.Code != "" {
-			b.WriteString("/" + e.Code)
+	// Type/Code/Message are taken verbatim from the provider body, which can
+	// echo the caller's key or prompt; mask credential patterns before the
+	// string reaches any log.
+	if t := maskSecrets(e.Type); t != "" {
+		b.WriteString(" (" + t)
+		if c := maskSecrets(e.Code); c != "" {
+			b.WriteString("/" + c)
 		}
 		b.WriteString(")")
 	}
-	if e.Message != "" {
-		b.WriteString(": " + e.Message)
+	if m := maskSecrets(e.Message); m != "" {
+		b.WriteString(": " + m)
 	}
 	return b.String()
 }
@@ -90,6 +95,35 @@ func (e *APIError) Error() string {
 // transport wraps a network error with request context.
 func transport(err error, method, url string) error {
 	return &TransportError{Method: method, URL: url, Err: err}
+}
+
+// Response body caps, unified across adapters. A single tight cap rejects
+// legitimate large payloads; these bound a runaway gateway per category.
+const (
+	// bodyLimit bounds a unary completion, error, or /models catalog body.
+	// 8MiB accommodates long completions and large tool-call arguments that
+	// a 1MiB cap wrongly rejected while still capping a misbehaving server.
+	bodyLimit = 8 << 20
+	// auxBodyLimit bounds embedding/rerank result bodies, which are large by
+	// design (one vector per input).
+	auxBodyLimit = 64 << 20
+)
+
+// readBody reads a response body up to limit and closes it. An over-limit
+// body becomes a distinct size error rather than a transport failure, so a
+// caller can tell "the gateway streamed an oversized response" apart from a
+// network break; errors.Is against httpx.ErrBodyTooLarge still matches.
+func readBody(resp *http.Response, method, url string, limit int64) ([]byte, error) {
+	body, err := httpx.ReadBody(resp.Body, limit)
+	resp.Body.Close()
+	if err != nil {
+		if errors.Is(err, httpx.ErrBodyTooLarge) {
+			return nil, fmt.Errorf("rosetta: %s %s response body exceeds %d bytes: %w",
+				method, displayEndpoint(url), limit, err)
+		}
+		return nil, transport(err, method, url)
+	}
+	return body, nil
 }
 
 // retryableStatus reports whether an HTTP status is worth retrying. The
@@ -133,7 +167,7 @@ func safeTruncateBody(body []byte) json.RawMessage {
 	}
 	// Mask key material on the full body, then truncate and degrade to a
 	// JSON string.
-	raw := truncateBody(apiKeyRe.ReplaceAll(body, []byte("sk-***")))
+	raw := truncateBody(secretRe.ReplaceAll(body, []byte("***")))
 	if !json.Valid(raw) { // short non-JSON body: degrade to a JSON string
 		s, _ := json.Marshal(string(raw))
 		return json.RawMessage(s)
@@ -141,8 +175,14 @@ func safeTruncateBody(body []byte) json.RawMessage {
 	return raw // truncateBody already degraded an oversized body to a string
 }
 
-// apiKeyRe matches OpenAI-style key material echoed inside error messages.
-var apiKeyRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}`)
+// secretRe matches common credential shapes a provider might echo back into
+// an error body or message: OpenAI/Anthropic "sk-...", Google "AIza...",
+// and JWT "eyJ<header>.<payload>.<sig>" tokens. Matches are masked before
+// anything reaches logs or error strings.
+var secretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}`)
+
+// maskSecrets replaces credential patterns in s with a fixed marker.
+func maskSecrets(s string) string { return secretRe.ReplaceAllString(s, "***") }
 
 // redactJSON masks sensitive values in a valid-JSON body while keeping it
 // valid JSON: sensitive-keyed string values become "[redacted]" and
@@ -158,7 +198,7 @@ func redactJSON(raw json.RawMessage) json.RawMessage {
 	if err != nil {
 		return raw
 	}
-	return apiKeyRe.ReplaceAll(out, []byte("sk-***"))
+	return secretRe.ReplaceAll(out, []byte("***"))
 }
 
 func redactValue(v any) {

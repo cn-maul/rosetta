@@ -18,9 +18,18 @@ import (
 type RetryPolicy int
 
 const (
+	// RetryDefault retries only intrinsically safe methods (GET/HEAD/
+	// OPTIONS/PUT/DELETE) and leaves non-idempotent POSTs alone.
 	RetryDefault RetryPolicy = iota
+	// RetryNever disables retry regardless of method.
 	RetryNever
+	// RetryIdempotent is a caller assertion: "this request is safe to
+	// repeat" (e.g. embeddings/rerank, which have no server-side side
+	// effects). It behaves like RetryAlways but documents intent — the
+	// transport cannot itself verify idempotency, so the caller owns that
+	// guarantee.
 	RetryIdempotent
+	// RetryAlways forces retries for any method.
 	RetryAlways
 )
 
@@ -58,12 +67,16 @@ func New() *Client {
 // response that is not retryable, or the last response/error once retries
 // are exhausted. The caller owns the returned response body.
 func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
+	var slept time.Duration
 	for attempt := 0; ; attempt++ {
 		resp, err := c.attempt(ctx, call)
 		if err == nil && !RetryableStatus(resp.StatusCode) {
 			return resp, nil
 		}
-		if !c.canRetry(call) || attempt >= c.MaxRetries || ctx.Err() != nil {
+		// A permanent (non-network) failure — bad method/URL or a Body()
+		// that cannot serialize — will fail identically every time; never
+		// spend a retry on it.
+		if errors.Is(err, ErrPermanent) || !c.canRetry(call) || attempt >= c.MaxRetries || ctx.Err() != nil {
 			return resp, err
 		}
 		var wait time.Duration
@@ -79,6 +92,10 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 		} else {
 			wait = c.backoff(attempt)
 		}
+		if slept+wait > maxTotalWait {
+			return resp, err // retry budget exhausted; surface the last outcome
+		}
+		slept += wait
 		c.log("retrying request", "url", call.URL, "attempt", attempt+1, "wait", wait.String())
 		timer := time.NewTimer(wait)
 		select {
@@ -113,7 +130,7 @@ func (c *Client) attempt(ctx context.Context, call *Call) (*http.Response, error
 	if call.Body != nil {
 		var err error
 		if body, err = call.Body(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", ErrPermanent, err)
 		}
 	}
 	var rd io.Reader
@@ -122,7 +139,7 @@ func (c *Client) attempt(ctx context.Context, call *Call) (*http.Response, error
 	}
 	req, err := http.NewRequestWithContext(ctx, call.Method, call.URL, rd)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrPermanent, err)
 	}
 	if call.Header != nil {
 		req.Header = call.Header.Clone()
@@ -131,14 +148,25 @@ func (c *Client) attempt(ctx context.Context, call *Call) (*http.Response, error
 }
 
 func (c *Client) backoff(attempt int) time.Duration {
-	d := c.Base << attempt
-	if d <= 0 || d > c.Cap {
-		d = c.Cap
+	base := c.Base
+	if base <= 0 {
+		base = 400 * time.Millisecond
+	}
+	lim := c.Cap
+	if lim <= 0 {
+		lim = 8 * time.Second
+	}
+	d := base << attempt
+	if d <= 0 || d > lim {
+		d = lim
 	}
 	j := 0.8 + 0.4*rand.Float64() // ±20% jitter
 	d = time.Duration(float64(d) * j)
-	if d > c.Cap { // Cap is a hard ceiling, even under jitter
-		d = c.Cap
+	if d > lim { // Cap is a hard ceiling, even under jitter
+		d = lim
+	}
+	if d <= 0 {
+		d = time.Millisecond // never a zero-delay retry loop
 	}
 	return d
 }
@@ -181,6 +209,16 @@ func retryAfter(v string) time.Duration {
 // maxRetryAfter bounds a server-provided Retry-After so a hostile or
 // misconfigured gateway cannot stall callers for arbitrarily long.
 const maxRetryAfter = 60 * time.Second
+
+// maxTotalWait caps the cumulative time Do may spend sleeping between
+// retries, so a large MaxRetries combined with long Retry-After values
+// cannot stall a caller for many minutes.
+const maxTotalWait = 3 * time.Minute
+
+// ErrPermanent marks a failure that will recur identically on every attempt
+// (a Body() that cannot serialize, or an invalid method/URL). Do returns it
+// immediately instead of burning the retry budget.
+var ErrPermanent = errors.New("httpx: permanent request error")
 
 // ErrBodyTooLarge is returned by ReadBody when the response exceeds the
 // caller-provided cap. Distinguishing it from a JSON decode error makes

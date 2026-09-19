@@ -148,7 +148,8 @@ func TestResponsesDecode(t *testing.T) {
 	if resp.Content[2].ToolCallID != "c1" {
 		t.Fatalf("tool block = %+v", resp.Content[2])
 	}
-	if resp.StopReason != StopEnd {
+	// A completed response carrying a function_call reports tool_use.
+	if resp.StopReason != StopToolUse {
 		t.Fatalf("stop = %s", resp.StopReason)
 	}
 	if resp.Usage.InputTokens != 4 || resp.Usage.CachedInputTokens != 2 || resp.Usage.ReasoningTokens != 1 {
@@ -219,7 +220,9 @@ func TestResponsesStreamEvents(t *testing.T) {
 			t.Fatalf("events = %v, want %v", got, want)
 		}
 	}
-	if endEv.StopReason != StopEnd || endEv.Usage == nil || endEv.Usage.TotalTokens != 3 {
+	// A completed response that carried a function_call reports tool_use,
+	// not a plain end_turn: status alone cannot distinguish them.
+	if endEv.StopReason != StopToolUse || endEv.Usage == nil || endEv.Usage.TotalTokens != 3 {
 		t.Fatalf("end event = %+v", endEv)
 	}
 

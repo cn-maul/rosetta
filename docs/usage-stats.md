@@ -10,6 +10,7 @@
 | `OutputTokens` | `completion_tokens` | `output_tokens` | `output_tokens` |
 | `TotalTokens` | `total_tokens`（缺省时求和） | `total_tokens`（缺省时求和） | input+output 求和 |
 | `CachedInputTokens` | `prompt_tokens_details.cached_tokens` | `input_tokens_details.cached_tokens` | `cache_read_input_tokens` |
+| `CachedCreationTokens` | —（自动缓存，不单独回报写入量） | — | `cache_creation_input_tokens` |
 | `ReasoningTokens` | `completion_tokens_details.reasoning_tokens` | `output_tokens_details.reasoning_tokens` | — |
 
 `Usage.IsZero()` 判断上游是否完全没有回报用量。
@@ -44,7 +45,8 @@ stats.TotalRequests        // 总请求数
 stats.InputTokens          // 输入合计
 stats.OutputTokens         // 输出合计
 stats.TotalTokens          // 总 token
-stats.CachedInputTokens    // 缓存命中
+stats.CachedInputTokens    // 缓存命中（读）
+stats.CachedCreationTokens // 缓存写入（Anthropic 专有；OpenAI 系自动缓存恒为 0）
 stats.ReasoningTokens      // 思考消耗
 stats.UsageMissing         // 无用量响应次数
 stats.ByModel["deepseek-chat"]     // ModelUsage：按模型
@@ -52,6 +54,8 @@ stats.ByProtocol[rosetta.ProtoOpenAIChat] // ModelUsage：按协议
 ```
 
 `ModelUsage` 与总量同构（Requests / 各 token 维度 / UsageMissing）。`Stats()` 返回深拷贝，可安全持有。
+
+注意各协议对 `InputTokens` 的口径不同：OpenAI 系的 `prompt_tokens`/`input_tokens` **已包含**命中缓存的部分，而 Anthropic 的 `input_tokens` 只计未缓存部分，缓存读/写分别落在 `CachedInputTokens`/`CachedCreationTokens`。跨协议对比真实输入量时，Anthropic 侧需用 `InputTokens + CachedInputTokens + CachedCreationTokens`。
 
 ## 自定义持久化
 

@@ -22,6 +22,15 @@ type anthropicProvider struct{ c *Client }
 
 const anthropicVersion = "2023-06-01"
 
+// extendedCacheTTLBeta gates Anthropic's 1-hour prompt-cache TTL: a request
+// carrying cache_control with ttl "1h" is rejected unless this beta header is
+// present.
+const extendedCacheTTLBeta = "extended-cache-ttl-2025-04-11"
+
+// maxCacheBreakpoints is Anthropic's hard limit on cache_control blocks per
+// request; exceeding it is a 400 upstream, so it is caught locally first.
+const maxCacheBreakpoints = 4
+
 func (p *anthropicProvider) headers(stream bool) http.Header {
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
@@ -41,6 +50,52 @@ func (p *anthropicProvider) headers(stream bool) http.Header {
 	}
 	h.Set("anthropic-version", anthropicVersion)
 	return h
+}
+
+// needsExtendedCacheTTL reports whether any cache breakpoint in the request
+// asks for the 1-hour TTL, which Anthropic gates behind a beta header.
+func needsExtendedCacheTTL(req *ChatRequest) bool {
+	hourly := func(c *CacheControl) bool { return c != nil && c.TTL == "1h" }
+	for _, m := range req.Messages {
+		for _, b := range m.Blocks {
+			if hourly(b.CacheControl) {
+				return true
+			}
+		}
+	}
+	for _, t := range req.Tools {
+		if hourly(t.CacheControl) {
+			return true
+		}
+	}
+	return false
+}
+
+// countCacheControl walks a built payload counting cache_control breakpoints
+// so the wire request can be checked against Anthropic's four-breakpoint
+// ceiling — which is enforced on what actually reaches the API, so an
+// empty-text block whose breakpoint was dropped is not counted.
+func countCacheControl(v any) int {
+	switch t := v.(type) {
+	case map[string]any:
+		n := 0
+		for k, val := range t {
+			if k == "cache_control" {
+				n++
+				continue
+			}
+			n += countCacheControl(val)
+		}
+		return n
+	case []any:
+		n := 0
+		for _, item := range t {
+			n += countCacheControl(item)
+		}
+		return n
+	default:
+		return 0
+	}
 }
 
 // anthroPlan is the per-request resolution of max_tokens and thinking
@@ -105,7 +160,7 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 		"messages":   msgs,
 		"max_tokens": pl.maxTokens,
 	}
-	if system != "" {
+	if system != nil {
 		payload["system"] = system
 	}
 	if req.Thinking != nil {
@@ -144,6 +199,9 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 				"description":  t.Description,
 				"input_schema": schema,
 			})
+			if cc := t.CacheControl.toWire(); cc != nil {
+				tools[len(tools)-1]["cache_control"] = cc
+			}
 		}
 		payload["tools"] = tools
 	}
@@ -153,6 +211,9 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
 		return nil, err
 	}
+	if n := countCacheControl(payload); n > maxCacheBreakpoints {
+		return nil, fmt.Errorf("%w: anthropic allows at most %d cache breakpoints, request has %d", ErrInvalidRequest, maxCacheBreakpoints, n)
+	}
 	return payload, nil
 }
 
@@ -160,10 +221,15 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 // content is lifted to the top-level system field, tool results ride
 // inside user turns, and consecutive same-role messages are merged
 // (Anthropic enforces strict role alternation).
-func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[string]any, error) {
-	var sysParts []string
+//
+// The system value is returned as a plain string unless a caller marked a
+// cache breakpoint on a system segment, in which case it becomes Anthropic's
+// array-of-text-blocks form so the cache_control can ride along. It is nil
+// when there is no system content.
+func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]any, error) {
+	var sysParts []anthroSysPart
 	if req.System != "" {
-		sysParts = append(sysParts, req.System)
+		sysParts = append(sysParts, anthroSysPart{text: req.System})
 	}
 	type mapped struct {
 		role   string
@@ -181,7 +247,7 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 		switch m.Role {
 		case RoleSystem:
 			if t := m.text(); t != "" {
-				sysParts = append(sysParts, t)
+				sysParts = append(sysParts, anthroSysPart{text: t, cc: firstCacheControl(m.Blocks)})
 			}
 		case RoleUser:
 			add("user", m.Blocks)
@@ -190,11 +256,16 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 		case RoleAssistant:
 			add("assistant", m.Blocks)
 		default:
-			return "", nil, fmt.Errorf("%w: unsupported role %q", ErrInvalidRequest, m.Role)
+			return nil, nil, fmt.Errorf("%w: unsupported role %q", ErrInvalidRequest, m.Role)
 		}
 	}
 	if len(msgs) == 0 {
-		return "", nil, fmt.Errorf("%w: anthropic requires at least one non-system message", ErrInvalidRequest)
+		return nil, nil, fmt.Errorf("%w: anthropic requires at least one non-system message", ErrInvalidRequest)
+	}
+	putCC := func(m map[string]any, b Block) {
+		if cc := b.CacheControl.toWire(); cc != nil {
+			m["cache_control"] = cc
+		}
 	}
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
@@ -203,21 +274,26 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 			switch b.Type {
 			case BlockText:
 				if b.Text != "" {
-					blocks = append(blocks, map[string]any{"type": "text", "text": b.Text})
+					blk := map[string]any{"type": "text", "text": b.Text}
+					putCC(blk, b)
+					blocks = append(blocks, blk)
 				}
 			case BlockImage:
 				src, err := encodeAnthropicImage(b.ImageURL)
 				if err != nil {
-					return "", nil, err
+					return nil, nil, err
 				}
-				blocks = append(blocks, map[string]any{"type": "image", "source": src})
+				blk := map[string]any{"type": "image", "source": src}
+				putCC(blk, b)
+				blocks = append(blocks, blk)
 			case BlockAudio:
-				return "", nil, fmt.Errorf("%w: anthropic does not support audio input", ErrInvalidRequest)
+				return nil, nil, fmt.Errorf("%w: anthropic does not support audio input", ErrInvalidRequest)
 			case BlockFile:
 				doc, err := encodeAnthropicDocument(b)
 				if err != nil {
-					return "", nil, err
+					return nil, nil, err
 				}
+				putCC(doc, b)
 				blocks = append(blocks, doc)
 			case BlockToolResult:
 				tr := map[string]any{
@@ -228,23 +304,43 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 				if b.IsError {
 					tr["is_error"] = true
 				}
+				putCC(tr, b)
 				blocks = append(blocks, tr)
 			case BlockThinking:
-				if m.role == "assistant" {
+				if m.role != "assistant" {
+					continue
+				}
+				// Anthropic rejects replayed thinking blocks that lack a
+				// valid signature, so an unsigned block (e.g. one the caller
+				// hand-authored) is dropped rather than poisoning the turn.
+				if b.Signature == "" {
+					p.c.settings.logger.Debug("anthropic: dropping unsigned thinking block on replay")
+					continue
+				}
+				blocks = append(blocks, map[string]any{
+					"type":      "thinking",
+					"thinking":  b.Thinking,
+					"signature": b.Signature,
+				})
+			case BlockRedactedThinking:
+				// Opaque redacted reasoning must be replayed verbatim to keep
+				// the assistant turn's block sequence valid.
+				if m.role == "assistant" && b.Thinking != "" {
 					blocks = append(blocks, map[string]any{
-						"type":      "thinking",
-						"thinking":  b.Thinking,
-						"signature": b.Signature,
+						"type": "redacted_thinking",
+						"data": b.Thinking,
 					})
 				}
 			case BlockToolCall:
 				if m.role == "assistant" {
-					blocks = append(blocks, map[string]any{
+					tu := map[string]any{
 						"type":  "tool_use",
 						"id":    b.ToolCallID,
 						"name":  b.ToolName,
 						"input": parseToolInput(b.Arguments),
-					})
+					}
+					putCC(tu, b)
+					blocks = append(blocks, tu)
 				}
 			}
 		}
@@ -257,12 +353,63 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (string, []map[stri
 	// renderable blocks must not leave an assistant turn first (Anthropic
 	// requires the conversation to open with a user turn).
 	if len(out) == 0 {
-		return "", nil, fmt.Errorf("%w: anthropic requires at least one non-system message", ErrInvalidRequest)
+		return nil, nil, fmt.Errorf("%w: anthropic requires at least one non-system message", ErrInvalidRequest)
 	}
 	if out[0]["role"] != "user" {
-		return "", nil, fmt.Errorf("%w: anthropic requires the first message to be user role", ErrInvalidRequest)
+		return nil, nil, fmt.Errorf("%w: anthropic requires the first message to be user role", ErrInvalidRequest)
 	}
-	return strings.Join(sysParts, "\n\n"), out, nil
+	return renderAnthropicSystem(sysParts), out, nil
+}
+
+// firstCacheControl returns the first non-nil breakpoint among the blocks,
+// so a caller can mark a whole system segment by tagging any of its blocks.
+func firstCacheControl(blocks []Block) *CacheControl {
+	for _, b := range blocks {
+		if b.CacheControl != nil {
+			return b.CacheControl
+		}
+	}
+	return nil
+}
+
+// anthroSysPart is one system segment (from req.System or a RoleSystem
+// message) with an optional cache breakpoint lifted from its blocks.
+type anthroSysPart struct {
+	text string
+	cc   *CacheControl
+}
+
+// renderAnthropicSystem collapses system segments into Anthropic's system
+// field: a joined string when no segment carries a cache breakpoint (the
+// wire-identical default), otherwise an array of text blocks so the
+// breakpoints survive. Returns nil when there is no system content.
+func renderAnthropicSystem(parts []anthroSysPart) any {
+	if len(parts) == 0 {
+		return nil
+	}
+	hasCC := false
+	for _, s := range parts {
+		if s.cc != nil {
+			hasCC = true
+			break
+		}
+	}
+	if !hasCC {
+		texts := make([]string, len(parts))
+		for i, s := range parts {
+			texts[i] = s.text
+		}
+		return strings.Join(texts, "\n\n")
+	}
+	blocks := make([]map[string]any, 0, len(parts))
+	for _, s := range parts {
+		blk := map[string]any{"type": "text", "text": s.text}
+		if cc := s.cc.toWire(); cc != nil {
+			blk["cache_control"] = cc
+		}
+		blocks = append(blocks, blk)
+	}
+	return blocks
 }
 
 // encodeAnthropicImage converts an image reference into Anthropic's
@@ -358,6 +505,10 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/messages")
 	pl := p.plan(req)
+	hdr := p.headers(false)
+	if needsExtendedCacheTTL(req) {
+		hdr.Set("anthropic-beta", extendedCacheTTLBeta)
+	}
 	for {
 		payload, err := p.buildPayload(req, false, pl)
 		if err != nil {
@@ -366,17 +517,16 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 		call := &httpx.Call{
 			Method: method,
 			URL:    url,
-			Header: p.headers(false),
+			Header: hdr,
 			Body:   func() ([]byte, error) { return json.Marshal(payload) },
 		}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
-		body, rerr := httpx.ReadBody(resp.Body, 1<<20)
-		resp.Body.Close()
+		body, rerr := readBody(resp, method, url, bodyLimit)
 		if rerr != nil {
-			return nil, transport(rerr, method, url)
+			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
 			apiErr := parseAnthropicError(resp.StatusCode, body, method, url, requestID(resp.Header))
@@ -396,6 +546,10 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/messages")
 	pl := p.plan(req)
+	hdr := p.headers(true)
+	if needsExtendedCacheTTL(req) {
+		hdr.Set("anthropic-beta", extendedCacheTTLBeta)
+	}
 	var resp *http.Response
 	for {
 		payload, err := p.buildPayload(req, true, pl)
@@ -405,7 +559,7 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 		call := &httpx.Call{
 			Method: method,
 			URL:    url,
-			Header: p.headers(true),
+			Header: hdr,
 			Body:   func() ([]byte, error) { return json.Marshal(payload) },
 		}
 		r, err := p.c.http.Do(ctx, call)
@@ -416,10 +570,9 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 			resp = r
 			break
 		}
-		body, rerr := httpx.ReadBody(r.Body, 1<<20)
-		r.Body.Close()
+		body, rerr := readBody(r, method, url, bodyLimit)
 		if rerr != nil {
-			return nil, transport(rerr, method, url)
+			return nil, rerr
 		}
 		apiErr := parseAnthropicError(r.StatusCode, body, method, url, requestID(r.Header))
 		if r.StatusCode == http.StatusBadRequest && p.c.settings.thinkingRectify && pl.rectify(apiErr.Message) {
@@ -489,6 +642,16 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 			}
 			data := bytes.TrimSpace(ssev.Data)
 			if len(data) == 0 {
+				continue
+			}
+			// Anthropic never emits the OpenAI "[DONE]" sentinel, but a
+			// compatibility proxy fronting it may append one as a terminal
+			// marker; treat it as a clean end rather than a malformed event.
+			if bytes.Equal(data, []byte("[DONE]")) {
+				if !ended {
+					ended = true
+					return endEvent(), nil
+				}
 				continue
 			}
 			var ch anthroChunk
@@ -563,7 +726,21 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 					stop = mapAnthropicStop(*ch.Delta.StopReason)
 				}
 				if ch.Usage != nil {
+					// message_delta carries the authoritative final usage.
+					// Fold every field it reports (output_tokens always;
+					// input and cache counts when present) over the
+					// message_start baseline so cache accounting that only
+					// arrives at the end is not lost.
 					usage.OutputTokens = ch.Usage.OutputTokens
+					if ch.Usage.InputTokens != 0 {
+						usage.InputTokens = ch.Usage.InputTokens
+					}
+					if ch.Usage.CacheReadInputTokens != 0 {
+						usage.CacheReadInputTokens = ch.Usage.CacheReadInputTokens
+					}
+					if ch.Usage.CacheCreationInputTokens != 0 {
+						usage.CacheCreationInputTokens = ch.Usage.CacheCreationInputTokens
+					}
 					hasUsage = true
 				}
 			case "message_stop":
@@ -582,22 +759,30 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	const method = http.MethodGet
 	base := joinEndpoint(p.c.settings.endpoint, "/models")
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("rosetta: invalid endpoint %q: %w", displayEndpoint(base), err)
+	}
 	var models []ModelInfo
 	after := ""
 	for page := 0; ; page++ {
-		pageURL := base + "?limit=100"
+		q := parsed.Query()
+		q.Set("limit", "100")
 		if after != "" {
-			pageURL += "&after_id=" + url.QueryEscape(after)
+			q.Set("after_id", after)
+		} else {
+			q.Del("after_id")
 		}
+		parsed.RawQuery = q.Encode()
+		pageURL := parsed.String()
 		call := &httpx.Call{Method: method, URL: pageURL, Header: p.headers(false)}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, pageURL)
 		}
-		body, rerr := httpx.ReadBody(resp.Body, 8<<20)
-		resp.Body.Close()
+		body, rerr := readBody(resp, method, pageURL, bodyLimit)
 		if rerr != nil {
-			return nil, transport(rerr, method, pageURL)
+			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header))
@@ -657,10 +842,11 @@ type anthroUsage struct {
 
 func (u *anthroUsage) toUsage() Usage {
 	return Usage{
-		InputTokens:       u.InputTokens,
-		OutputTokens:      u.OutputTokens,
-		TotalTokens:       u.InputTokens + u.OutputTokens,
-		CachedInputTokens: u.CacheReadInputTokens,
+		InputTokens:          u.InputTokens,
+		OutputTokens:         u.OutputTokens,
+		TotalTokens:          u.InputTokens + u.OutputTokens,
+		CachedInputTokens:    u.CacheReadInputTokens,
+		CachedCreationTokens: u.CacheCreationInputTokens,
 	}
 }
 
@@ -709,6 +895,7 @@ type anthroResponse struct {
 		Text      string          `json:"text"`
 		Thinking  string          `json:"thinking"`
 		Signature string          `json:"signature"`
+		Data      string          `json:"data"`
 		ID        string          `json:"id"`
 		Name      string          `json:"name"`
 		Input     json.RawMessage `json:"input"`
@@ -735,6 +922,10 @@ func decodeAnthropicResponse(body []byte) (*ChatResponse, error) {
 			}
 		case "thinking":
 			out.Content = append(out.Content, Block{Type: BlockThinking, Thinking: blk.Thinking, Signature: blk.Signature})
+		case "redacted_thinking":
+			// Keep the opaque payload so a later turn can replay the block
+			// unchanged; the Thinking field carries the redacted data.
+			out.Content = append(out.Content, Block{Type: BlockRedactedThinking, Thinking: blk.Data})
 		case "tool_use":
 			out.Content = append(out.Content, Block{
 				Type:       BlockToolCall,
@@ -743,7 +934,7 @@ func decodeAnthropicResponse(body []byte) (*ChatResponse, error) {
 				Arguments:  string(blk.Input),
 			})
 		default:
-			// redacted_thinking and future types are skipped
+			// unknown content types are skipped
 		}
 	}
 	if r.StopReason != "" {
@@ -759,8 +950,18 @@ func decodeAnthropicResponse(body []byte) (*ChatResponse, error) {
 
 // parseAnthropicError converts a non-2xx body into an APIError. Anthropic's
 // shape is {"type":"error","error":{"type","message"}}; the generic
-// {"error":{...}} parser covers it, so it is reused.
+// {"error":{...}} parser covers it, so it is reused. When the request id is
+// absent from the headers (some gateways omit request-id), it is recovered
+// from the error body's top-level request_id field.
 func parseAnthropicError(status int, body []byte, method, url, requestID string) *APIError {
+	if requestID == "" {
+		var doc struct {
+			RequestID string `json:"request_id"`
+		}
+		if json.Unmarshal(body, &doc) == nil {
+			requestID = doc.RequestID
+		}
+	}
 	return parseOpenAIError(status, body, method, url, requestID)
 }
 

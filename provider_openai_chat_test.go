@@ -39,7 +39,7 @@ func TestJoinEndpoint(t *testing.T) {
 func TestOpenAIChatBuildPayload(t *testing.T) {
 	c := newTestClient(t)
 	p := c.provider.(*openaiChatProvider)
-	st := p.initialState()
+	st := p.initialState("gpt-4o")
 
 	req := &ChatRequest{
 		Model:           "gpt-4o",
@@ -125,7 +125,7 @@ func TestOpenAIChatBuildPayloadQuirksAndOptions(t *testing.T) {
 			c := newTestClient(t, tt.opts...)
 			p := c.provider.(*openaiChatProvider)
 			req := &ChatRequest{Model: "m", Messages: []Message{User("hi")}, MaxOutputTokens: 5}
-			pl, err := p.buildPayload(req, true, p.initialState())
+			pl, err := p.buildPayload(req, true, p.initialState("m"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -150,9 +150,9 @@ func TestOpenAIChatBuildPayloadQuirksAndOptions(t *testing.T) {
 func TestOpenAIChatPinBeatsSticky(t *testing.T) {
 	c := newTestClient(t, WithMaxTokensField("max_tokens"))
 	p := c.provider.(*openaiChatProvider)
-	yes := true
-	p.stickyLegacy = &yes // pretend a probe learned the opposite
-	st := p.initialState()
+	// Pretend a probe learned the opposite for this model; the pin must win.
+	p.stickyTokens = map[string]string{"m": "max_completion_tokens"}
+	st := p.initialState("m")
 	req := &ChatRequest{Model: "m", Messages: []Message{User("hi")}, MaxOutputTokens: 5}
 	pl, err := p.buildPayload(req, false, st)
 	if err != nil {
@@ -172,7 +172,7 @@ func TestOpenAIChatMaxOutputFallbackChain(t *testing.T) {
 	), WithDefaultMaxOutputTokens(32))
 	p := c.provider.(*openaiChatProvider)
 
-	pl, err := p.buildPayload(&ChatRequest{Model: "declared", Messages: []Message{User("hi")}}, false, p.initialState())
+	pl, err := p.buildPayload(&ChatRequest{Model: "declared", Messages: []Message{User("hi")}}, false, p.initialState("declared"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestOpenAIChatMaxOutputFallbackChain(t *testing.T) {
 		t.Fatalf("declared metadata cap = %v, want 64", pl["max_completion_tokens"])
 	}
 
-	pl, err = p.buildPayload(&ChatRequest{Model: "declared", Messages: []Message{User("hi")}, MaxOutputTokens: 100}, false, p.initialState())
+	pl, err = p.buildPayload(&ChatRequest{Model: "declared", Messages: []Message{User("hi")}, MaxOutputTokens: 100}, false, p.initialState("declared"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestOpenAIChatMaxOutputFallbackChain(t *testing.T) {
 		t.Fatalf("request cap = %v, want 100", pl["max_completion_tokens"])
 	}
 
-	pl, err = p.buildPayload(&ChatRequest{Model: "undeclared", Messages: []Message{User("hi")}}, false, p.initialState())
+	pl, err = p.buildPayload(&ChatRequest{Model: "undeclared", Messages: []Message{User("hi")}}, false, p.initialState("undeclared"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,10 +295,14 @@ func TestOpenAIChatEncodeMultipleToolResults(t *testing.T) {
 func TestOpenAIChatSanitize(t *testing.T) {
 	c := newTestClient(t)
 	p := c.provider.(*openaiChatProvider)
+	model := "m"
+	errWith := func(msg, errType string) *APIError {
+		return &APIError{Message: msg, Type: errType}
+	}
 
-	// reasoning_effort rejected → dropped and sticky.
-	st := p.initialState()
-	if !p.sanitize(st, "reasoning_effort is not supported", "invalid_request_error", false) {
+	// reasoning_effort rejected → dropped and sticky (per model).
+	st := p.initialState(model)
+	if !p.sanitize(st, errWith("reasoning_effort is not supported", "invalid_request_error"), model, false) {
 		t.Fatal("reasoning_effort rejection must trigger a retry")
 	}
 	if st.reasoning {
@@ -306,8 +310,8 @@ func TestOpenAIChatSanitize(t *testing.T) {
 	}
 
 	// stream_options rejected → dropped and sticky.
-	st = p.initialState()
-	if !p.sanitize(st, "unknown field stream_options", "invalid_request_error", true) {
+	st = p.initialState(model)
+	if !p.sanitize(st, errWith("unknown field stream_options", "invalid_request_error"), model, true) {
 		t.Fatal("stream_options rejection must trigger a retry")
 	}
 	if st.streamOptions {
@@ -315,37 +319,49 @@ func TestOpenAIChatSanitize(t *testing.T) {
 	}
 
 	// max_completion_tokens rejected → legacy fallback, sticky.
-	st = p.initialState()
-	if !p.sanitize(st, "max_completion_tokens unrecognized", "invalid_request_error", false) {
+	st = p.initialState(model)
+	if !p.sanitize(st, errWith("max_completion_tokens unrecognized", "invalid_request_error"), model, false) {
 		t.Fatal("max_completion_tokens rejection must trigger a retry")
 	}
 	if st.tokensField != "max_tokens" {
 		t.Fatalf("tokensField = %s", st.tokensField)
 	}
-	if p.stickyLegacy == nil || !*p.stickyLegacy {
-		t.Fatal("sticky legacy flag not set")
+	if p.stickyTokens[model] != "max_tokens" {
+		t.Fatalf("sticky legacy field not set: %+v", p.stickyTokens)
+	}
+
+	// A param-tagged rejection is honored without any message matching.
+	st = p.initialState("param-model")
+	if !p.sanitize(st, &APIError{Type: "invalid_request_error", Param: "reasoning_effort"}, "param-model", false) {
+		t.Fatal("param-named rejection must trigger a retry")
+	}
+
+	// Sticky state must not leak across models.
+	other := p.initialState("another-model")
+	if !other.reasoning || other.tokensField != "max_completion_tokens" {
+		t.Fatalf("sticky state leaked across models: %+v", other)
 	}
 
 	// The reverse flip: a service requiring the modern field.
 	c2 := newTestClient(t, WithQuirks(Quirks{LegacyMaxTokens: true}))
 	p2 := c2.provider.(*openaiChatProvider)
-	st = p2.initialState()
-	if !p2.sanitize(st, "max_tokens is not supported; use max_completion_tokens", "invalid_request_error", false) {
+	st = p2.initialState(model)
+	if !p2.sanitize(st, errWith("max_tokens is not supported; use max_completion_tokens", "invalid_request_error"), model, false) {
 		t.Fatal("max_tokens rejection must trigger a retry")
 	}
 	if st.tokensField != "max_completion_tokens" {
 		t.Fatalf("tokensField = %s", st.tokensField)
 	}
 
-	// Sticky state persists into the next request.
-	st = p.initialState()
+	// Sticky state persists into the next request for the same model.
+	st = p.initialState(model)
 	if st.tokensField != "max_tokens" {
 		t.Fatalf("sticky state lost: %s", st.tokensField)
 	}
 
 	// Unrelated errors must not downgrade anything.
-	st = p.initialState()
-	if p.sanitize(st, "the server had an unknown internal failure", "api_error", false) {
+	st = p.initialState(model)
+	if p.sanitize(st, errWith("the server had an unknown internal failure", "api_error"), model, false) {
 		t.Fatal("non-parameter errors must not trigger a downgrade")
 	}
 }

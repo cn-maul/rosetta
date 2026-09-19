@@ -54,6 +54,58 @@ func anthropicBudget(e Effort) int {
 	}
 }
 
+// CacheControl marks a prompt-cache breakpoint on a content block or tool.
+// Anthropic stores everything from the start of the prompt up to and
+// including the marked item, then reuses it on later requests that share
+// the same prefix; it is how you build a cache hit on that protocol. The
+// OpenAI protocols cache prefixes automatically and ignore this, so it has
+// no effect there. Anthropic accepts up to four breakpoints per request and
+// requires each cached region to be at least 1024 (Sonnet) / 2048 (Haiku
+// class) tokens — shorter prefixes are simply not cached upstream.
+type CacheControl struct {
+	// Type is the cache strategy; empty defaults to Anthropic's only
+	// supported value, "ephemeral".
+	Type string
+	// TTL is the cache lifetime: "5m" (default, refreshed on each hit) or
+	// "1h" (extended cache, billed at a higher write rate). Empty uses the
+	// provider default.
+	TTL string
+}
+
+// EphemeralCache returns a default (5-minute) Anthropic cache breakpoint.
+func EphemeralCache() *CacheControl { return &CacheControl{} }
+
+// ExtendedCache returns a 1-hour Anthropic cache breakpoint.
+func ExtendedCache() *CacheControl { return &CacheControl{TTL: "1h"} }
+
+// validate checks the breakpoint's TTL, which Anthropic constrains to
+// "5m" or "1h".
+func (c *CacheControl) validate() error {
+	switch c.TTL {
+	case "", "5m", "1h":
+		return nil
+	default:
+		return fmt.Errorf("cache TTL %q unsupported (use \"5m\" or \"1h\")", c.TTL)
+	}
+}
+
+// toWire renders Anthropic's cache_control object, or nil when the receiver
+// is nil (callers use the nil result to mean "no breakpoint").
+func (c *CacheControl) toWire() map[string]any {
+	if c == nil {
+		return nil
+	}
+	typ := c.Type
+	if typ == "" {
+		typ = "ephemeral"
+	}
+	out := map[string]any{"type": typ}
+	if c.TTL != "" {
+		out["ttl"] = c.TTL
+	}
+	return out
+}
+
 // ToolDefinition describes a callable tool (function) offered to the model.
 // The SDK passes tools through verbatim; executing them is the caller's job.
 type ToolDefinition struct {
@@ -61,6 +113,10 @@ type ToolDefinition struct {
 	Description string
 	// Parameters is a JSON Schema object describing arguments.
 	Parameters json.RawMessage
+	// CacheControl marks an Anthropic cache breakpoint after this tool,
+	// caching the whole tool set that precedes it (usually set on the last
+	// tool). Ignored by the OpenAI protocols.
+	CacheControl *CacheControl
 }
 
 // ChatRequest is a protocol-independent chat completion request.
@@ -193,6 +249,13 @@ func (r *ChatRequest) validate() error {
 	for i, m := range r.Messages {
 		if err := m.validate(); err != nil {
 			return fmt.Errorf("%w: Messages[%d]: %w", ErrInvalidRequest, i, err)
+		}
+	}
+	for i, t := range r.Tools {
+		if t.CacheControl != nil {
+			if err := t.CacheControl.validate(); err != nil {
+				return fmt.Errorf("%w: Tools[%d]: %w", ErrInvalidRequest, i, err)
+			}
 		}
 	}
 	return nil

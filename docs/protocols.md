@@ -52,6 +52,36 @@ usage 组装：Chat 在 usage chunk；Responses 在 completed 事件；Anthropic
 
 同机制覆盖另外两个字段：`stream_options.include_usage` 与 `reasoning_effort` 被拒时同样降级一次并记住。每次请求最多触发 4 次此类消毒重试。
 
+## Prompt 缓存（Anthropic）
+
+Anthropic 的上下文缓存要**显式打断点**才会写入，命中的 token 按约 1/10 计价。OpenAI 系（含 DeepSeek）是**自动前缀缓存**，无需也无法传 `cache_control`——那边命中与否取决于调用方能否保持 prompt 前缀稳定。
+
+rosetta 用统一字段 `CacheControl` 承载断点，仅 Anthropic 适配器会渲染它，OpenAI 系静默忽略：
+
+```go
+req := &rosetta.ChatRequest{
+	Model:  "claude-sonnet-4-5",
+	System: "一大段稳定的系统提示词……",
+	Tools: []rosetta.ToolDefinition{
+		{Name: "search", Description: "...", Parameters: schema},
+		// 断点打在最后一个工具上 → 缓存整个工具集及其之前的内容
+		{Name: "fetch", Description: "...", Parameters: schema2, CacheControl: rosetta.EphemeralCache()},
+	},
+	Messages: []rosetta.Message{
+		rosetta.User("……"),
+		{Role: rosetta.RoleSystem, Blocks: []rosetta.Block{
+			{Type: rosetta.BlockText, Text: "一大段稳定上下文……", CacheControl: rosetta.ExtendedCache()},
+		}},
+	},
+}
+```
+
+- `EphemeralCache()` = 默认 5 分钟（每次命中续期）；`ExtendedCache()` = 1 小时扩展缓存。非法 TTL 在本地 `ErrInvalidRequest` 拒绝。
+- 断点可打在 text / image / document / tool_result / tool_use 块与工具定义上；打在 Anthropic 不支持的位置（如 thinking 块）会本地报错，而非静默丢弃。
+- system 断点用一条带 `CacheControl` 的 `RoleSystem` 消息表达（`ChatRequest.System` 是纯字符串、无法携带断点）。有断点时适配器把 `system` 渲染成 Anthropic 的 text-block 数组；无断点时仍是原来的字符串，**wire 字节不变**，不影响既有调用的命中。
+- Anthropic 限制：每请求最多 4 个断点，被缓存前缀需 ≥1024 token（Haiku 类 2048），过短的前缀上游不会缓存。
+- 用量回报：命中量见 `Usage.CachedInputTokens`（`cache_read_input_tokens`），本次写入量见 `Usage.CachedCreationTokens`（`cache_creation_input_tokens`），两者都计入 `Stats()`。注意 Anthropic 的 `InputTokens` 只含未缓存部分，真实输入 = `InputTokens + CachedInputTokens + CachedCreationTokens`。
+
 ## Quirks
 
 已知偏差直接声明，跳过探测：

@@ -240,14 +240,17 @@ func TestAnthropicDecodeResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Content) != 3 {
-		t.Fatalf("blocks = %d (redacted_thinking must be skipped)", len(resp.Content))
+	if len(resp.Content) != 4 {
+		t.Fatalf("blocks = %d (redacted_thinking must be preserved)", len(resp.Content))
 	}
 	if resp.Content[0].Thinking != "hmm" || resp.Content[0].Signature != "sig" {
 		t.Fatalf("thinking block = %+v", resp.Content[0])
 	}
 	if resp.Content[2].ToolCallID != "t1" || resp.Content[2].Arguments != `{"x": 1}` {
 		t.Fatalf("tool block = %+v", resp.Content[2])
+	}
+	if resp.Content[3].Type != BlockRedactedThinking || resp.Content[3].Thinking != "xxx" {
+		t.Fatalf("redacted_thinking block = %+v", resp.Content[3])
 	}
 	if resp.StopReason != StopLength {
 		t.Fatalf("stop = %s", resp.StopReason)

@@ -58,10 +58,9 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, transport(err, method, url)
 	}
-	defer resp.Body.Close()
-	body, err := httpx.ReadBody(resp.Body, 8<<20)
+	body, err := readBody(resp, method, url, bodyLimit)
 	if err != nil {
-		return nil, transport(err, method, url)
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))

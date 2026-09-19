@@ -31,6 +31,10 @@ const (
 	BlockToolCall   BlockType = "tool_call"   // model requesting a tool
 	BlockToolResult BlockType = "tool_result" // result fed back to the model
 	BlockThinking   BlockType = "thinking"    // chain-of-thought content
+	// BlockRedactedThinking is Anthropic's server-redacted reasoning: an
+	// opaque payload that must be replayed unchanged to keep a thinking
+	// conversation intact. It rides in a block's Thinking field.
+	BlockRedactedThinking BlockType = "redacted_thinking"
 )
 
 // Block is one piece of message content. Which fields are meaningful
@@ -62,6 +66,10 @@ type Block struct {
 	IsError     bool
 	Thinking    string
 	Signature   string
+	// CacheControl marks an Anthropic prompt-cache breakpoint after this
+	// block (text, image, document, tool_result, tool_use). Ignored by the
+	// OpenAI protocols, which cache prefixes automatically.
+	CacheControl *CacheControl
 }
 
 // Message is one conversation turn composed of content blocks.
@@ -185,7 +193,7 @@ func (m Message) text() string {
 var roleAllowedBlocks = map[Role]map[BlockType]bool{
 	RoleSystem:    {BlockText: true},
 	RoleUser:      {BlockText: true, BlockImage: true, BlockAudio: true, BlockFile: true},
-	RoleAssistant: {BlockText: true, BlockToolCall: true, BlockThinking: true},
+	RoleAssistant: {BlockText: true, BlockToolCall: true, BlockThinking: true, BlockRedactedThinking: true},
 	RoleTool:      {BlockToolResult: true},
 }
 
@@ -274,8 +282,24 @@ func (b Block) validate() error {
 		if b.Thinking == "" && b.Signature == "" {
 			return fmt.Errorf("thinking block is empty")
 		}
+	case BlockRedactedThinking:
+		if b.Thinking == "" {
+			return fmt.Errorf("redacted_thinking block has no data")
+		}
 	default:
 		return fmt.Errorf("unknown block type %q", b.Type)
+	}
+	if b.CacheControl != nil {
+		if err := b.CacheControl.validate(); err != nil {
+			return err
+		}
+		// Anthropic only accepts cache breakpoints on text, image,
+		// document, tool_result and tool_use blocks; a thinking or
+		// redacted_thinking block carrying one would be silently dropped, so
+		// reject it locally.
+		if b.Type == BlockThinking || b.Type == BlockRedactedThinking {
+			return fmt.Errorf("thinking blocks cannot carry cache_control")
+		}
 	}
 	return nil
 }

@@ -1,7 +1,7 @@
 // Package sse implements a minimal Server-Sent Events parser over an
-// io.Reader. It follows the text/event-stream wire format: LF / CRLF line
-// endings, multi-line "data" fields joined with LF, comment lines starting
-// with ':', and optional whitespace after the field colon.
+// io.Reader. It follows the text/event-stream wire format: LF / CRLF / CR
+// line endings, multi-line "data" fields joined with LF, comment lines
+// starting with ':', and optional whitespace after the field colon.
 //
 // It is intentionally protocol agnostic: callers interpret event names and
 // data payloads (e.g. the "[DONE]" sentinel used by OpenAI-style streams).
@@ -104,30 +104,39 @@ func (s *Scanner) take() *Event {
 	return ev
 }
 
+// readLine returns the next line without its terminator. It accumulates
+// byte-by-byte so a server that never emits a line terminator cannot drive
+// unbounded allocation: the size guard fires before the buffer grows past
+// maxLineBytes. Terminators follow the SSE spec — LF, CRLF, or a lone CR.
 func (s *Scanner) readLine() ([]byte, error) {
-	line, err := s.r.ReadBytes('\n')
-	if len(line) > maxLineBytes+1 {
-		return nil, ErrTooLarge
+	var buf []byte
+	for {
+		b, err := s.r.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				if len(buf) > 0 {
+					return buf, nil // final line without a terminator
+				}
+				return nil, io.EOF
+			}
+			return nil, err
+		}
+		switch b {
+		case '\n':
+			return buf, nil
+		case '\r':
+			// CR ends the line; consume a following LF to complete CRLF.
+			if nb, perr := s.r.Peek(1); perr == nil && len(nb) > 0 && nb[0] == '\n' {
+				_, _ = s.r.ReadByte()
+			}
+			return buf, nil
+		default:
+			if len(buf) >= maxLineBytes+1 {
+				return nil, ErrTooLarge
+			}
+			buf = append(buf, b)
+		}
 	}
-	switch {
-	case err == nil:
-		return chomp(line), nil
-	case errors.Is(err, io.EOF) && len(line) > 0:
-		return chomp(line), nil // final line without terminator
-	default:
-		return nil, err
-	}
-}
-
-// chomp removes one trailing LF, or CRLF.
-func chomp(line []byte) []byte {
-	if n := len(line); n > 0 && line[n-1] == '\n' {
-		line = line[:n-1]
-	}
-	if n := len(line); n > 0 && line[n-1] == '\r' {
-		line = line[:n-1]
-	}
-	return line
 }
 
 // splitField splits "field: value" / "field:value" / "field".

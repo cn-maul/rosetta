@@ -65,10 +65,9 @@ func postAuxJSON(ctx context.Context, c *Client, path string, payload map[string
 	if err != nil {
 		return nil, transport(err, method, url)
 	}
-	body, rerr := httpx.ReadBody(resp.Body, 64<<20)
-	resp.Body.Close()
+	body, rerr := readBody(resp, method, url, auxBodyLimit)
 	if rerr != nil {
-		return nil, transport(rerr, method, url)
+		return nil, rerr
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))

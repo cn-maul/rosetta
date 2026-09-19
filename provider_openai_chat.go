@@ -22,14 +22,19 @@ import (
 // Third-party compatibility is handled in three layers, in escalation
 // order: explicit quirks (WithQuirks), a sticky probe — start with modern
 // fields and downgrade once on a matching 400 error — and per-request
-// sanitizing retries. Probed downgrades stick for the client lifetime.
+// sanitizing retries. Probed downgrades are remembered per model for the
+// client lifetime.
 type openaiChatProvider struct {
 	c *Client
 
-	mu                sync.Mutex
-	stickyLegacy      *bool // true: use max_tokens; false: use max_completion_tokens
-	stickyNoStreamOpt *bool // upstream rejected stream_options
-	stickyNoReasoning *bool // upstream rejected reasoning_effort
+	mu sync.Mutex
+	// Sticky downgrades are remembered per model: one model's field support
+	// says nothing about another's behind a multi-model gateway, so a
+	// legacy model rejecting max_completion_tokens must not downgrade the
+	// field for a modern model served at the same endpoint.
+	stickyTokens      map[string]string // model -> resolved max-tokens field name
+	stickyNoStreamOpt map[string]bool   // upstream rejected stream_options
+	stickyNoReasoning map[string]bool   // upstream rejected reasoning_effort
 }
 
 // oaSendState is the per-request mutable send strategy.
@@ -39,7 +44,7 @@ type oaSendState struct {
 	reasoning     bool
 }
 
-func (p *openaiChatProvider) initialState() *oaSendState {
+func (p *openaiChatProvider) initialState(model string) *oaSendState {
 	st := &oaSendState{
 		tokensField:   "max_completion_tokens",
 		streamOptions: !p.c.settings.quirks.NoStreamUsage,
@@ -52,26 +57,22 @@ func (p *openaiChatProvider) initialState() *oaSendState {
 	switch {
 	case p.c.settings.maxTokensField != "":
 		st.tokensField = p.c.settings.maxTokensField
-	case p.stickyLegacy != nil:
-		if *p.stickyLegacy {
-			st.tokensField = "max_tokens"
-		} else {
-			st.tokensField = "max_completion_tokens"
-		}
+	case p.stickyTokens[model] != "":
+		st.tokensField = p.stickyTokens[model]
 	case p.c.settings.quirks.LegacyMaxTokens:
 		st.tokensField = "max_tokens"
 	}
-	if p.stickyNoStreamOpt != nil && *p.stickyNoStreamOpt {
+	if p.stickyNoStreamOpt[model] {
 		st.streamOptions = false
 	}
-	if p.stickyNoReasoning != nil && *p.stickyNoReasoning {
+	if p.stickyNoReasoning[model] {
 		st.reasoning = false
 	}
 	return st
 }
 
-func (p *openaiChatProvider) headers() http.Header {
-	return openAIHeaders(p.c, "application/json")
+func (p *openaiChatProvider) headers(accept string) http.Header {
+	return openAIHeaders(p.c, accept)
 }
 
 // buildPayload renders the unified request into the wire payload.
@@ -271,54 +272,84 @@ func containsAny(low string, words ...string) bool {
 	return false
 }
 
-// sanitize inspects a 400 error message and downgrades one optional field.
-// It returns true when the payload changed and the request should be
-// retried. Downgrades are remembered for the client lifetime. To keep the
-// keyword matching from misfiring on unrelated 400s, a non-empty error
-// type must look like an invalid-request error; a rejection of a *value*
-// inside a field (e.g. an unsupported reasoning_effort level) is a request
-// configuration error, not evidence the field is unsupported, so it is
-// surfaced as-is; and a field pinned via WithMaxTokensField is never
+// sanitize inspects a 400 error and downgrades one optional field. It
+// returns true when the payload changed and the request should be retried.
+// Downgrades are remembered per model for the client lifetime. A
+// provider-supplied error.param is authoritative — it names the rejected
+// field directly — so it is matched first; only when it is absent does the
+// sanitizer fall back to scanning the message for the field name plus a
+// rejection hint, which keeps unrelated 400s from misfiring. A rejection of
+// a *value* inside a field (e.g. an unsupported reasoning_effort level) is
+// a request configuration error, not evidence the field is unsupported, so
+// it is surfaced as-is; and a field pinned via WithMaxTokensField is never
 // flipped.
-func (p *openaiChatProvider) sanitize(st *oaSendState, msg, errType string, stream bool) bool {
-	low := strings.ToLower(msg)
-	if errType != "" && !strings.Contains(strings.ToLower(errType), "invalid_request") {
+func (p *openaiChatProvider) sanitize(st *oaSendState, apiErr *APIError, model string, stream bool) bool {
+	if isValueRejection(apiErr) {
 		return false
 	}
-	if containsAny(low, "unsupported value") {
+	if apiErr.Type != "" && !strings.Contains(strings.ToLower(apiErr.Type), "invalid_request") {
 		return false
 	}
-	note := func(slot **bool, v bool) {
+	low := strings.ToLower(apiErr.Message)
+	param := strings.ToLower(apiErr.Param)
+	// hit reports whether apiErr rejects one of the named fields.
+	hit := func(names ...string) bool {
+		if param != "" {
+			for _, n := range names {
+				if strings.Contains(param, n) {
+					return true
+				}
+			}
+			return false
+		}
+		return containsAny(low, names...) && containsAny(low, hintWords...)
+	}
+	remember := func(fn func()) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
-		if *slot == nil {
-			b := v
-			*slot = &b
-		}
+		fn()
 	}
 	pinned := p.c.settings.maxTokensField != ""
 	switch {
-	case st.reasoning && containsAny(low, "reasoning_effort") && containsAny(low, hintWords...):
+	case st.reasoning && hit("reasoning_effort"):
 		st.reasoning = false
-		note(&p.stickyNoReasoning, true)
-		p.c.settings.logger.Debug("openai-chat: upstream rejected reasoning_effort; dropping it")
+		remember(func() {
+			if p.stickyNoReasoning == nil {
+				p.stickyNoReasoning = map[string]bool{}
+			}
+			p.stickyNoReasoning[model] = true
+		})
+		p.c.settings.logger.Debug("openai-chat: upstream rejected reasoning_effort; dropping it", "model", model)
 		return true
-	case stream && st.streamOptions && containsAny(low, "stream_options") && containsAny(low, hintWords...):
+	case stream && st.streamOptions && hit("stream_options"):
 		st.streamOptions = false
-		note(&p.stickyNoStreamOpt, true)
-		p.c.settings.logger.Debug("openai-chat: upstream rejected stream_options; dropping include_usage")
+		remember(func() {
+			if p.stickyNoStreamOpt == nil {
+				p.stickyNoStreamOpt = map[string]bool{}
+			}
+			p.stickyNoStreamOpt[model] = true
+		})
+		p.c.settings.logger.Debug("openai-chat: upstream rejected stream_options; dropping include_usage", "model", model)
 		return true
-	case !pinned && st.tokensField == "max_completion_tokens" &&
-		containsAny(low, "max_tokens", "max_completion_tokens") && containsAny(low, hintWords...):
+	case !pinned && st.tokensField == "max_completion_tokens" && hit("max_completion_tokens", "max_tokens"):
 		st.tokensField = "max_tokens"
-		note(&p.stickyLegacy, true)
-		p.c.settings.logger.Debug("openai-chat: falling back to legacy max_tokens field")
+		remember(func() {
+			if p.stickyTokens == nil {
+				p.stickyTokens = map[string]string{}
+			}
+			p.stickyTokens[model] = "max_tokens"
+		})
+		p.c.settings.logger.Debug("openai-chat: falling back to legacy max_tokens field", "model", model)
 		return true
-	case !pinned && st.tokensField == "max_tokens" &&
-		containsAny(low, "max_tokens", "max_completion_tokens") && containsAny(low, hintWords...):
+	case !pinned && st.tokensField == "max_tokens" && hit("max_completion_tokens", "max_tokens"):
 		st.tokensField = "max_completion_tokens"
-		note(&p.stickyLegacy, false)
-		p.c.settings.logger.Debug("openai-chat: upstream requires max_completion_tokens")
+		remember(func() {
+			if p.stickyTokens == nil {
+				p.stickyTokens = map[string]string{}
+			}
+			p.stickyTokens[model] = "max_completion_tokens"
+		})
+		p.c.settings.logger.Debug("openai-chat: upstream requires max_completion_tokens", "model", model)
 		return true
 	}
 	return false
@@ -328,7 +359,7 @@ func (p *openaiChatProvider) sanitize(st *oaSendState, msg, errType string, stre
 func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/chat/completions")
-	st := p.initialState()
+	st := p.initialState(req.Model)
 	sanitizes := 0
 	for {
 		payload, err := p.buildPayload(req, false, st)
@@ -338,21 +369,20 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 		call := &httpx.Call{
 			Method: method,
 			URL:    url,
-			Header: p.headers(),
+			Header: p.headers("application/json"),
 			Body:   func() ([]byte, error) { return json.Marshal(payload) },
 		}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
-		body, rerr := httpx.ReadBody(resp.Body, 1<<20)
-		resp.Body.Close()
+		body, rerr := readBody(resp, method, url, bodyLimit)
 		if rerr != nil {
-			return nil, transport(rerr, method, url)
+			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
 			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
-			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, apiErr.Type, false) {
+			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model, false) {
 				sanitizes++
 				continue
 			}
@@ -366,7 +396,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stream, error) {
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/chat/completions")
-	st := p.initialState()
+	st := p.initialState(req.Model)
 	sanitizes := 0
 	var resp *http.Response
 	for {
@@ -377,7 +407,7 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		call := &httpx.Call{
 			Method: method,
 			URL:    url,
-			Header: p.headers(),
+			Header: p.headers("text/event-stream"),
 			Body:   func() ([]byte, error) { return json.Marshal(payload) },
 		}
 		r, err := p.c.http.Do(ctx, call)
@@ -388,13 +418,12 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 			resp = r
 			break
 		}
-		body, rerr := httpx.ReadBody(r.Body, 1<<20)
-		r.Body.Close()
+		body, rerr := readBody(r, method, url, bodyLimit)
 		if rerr != nil {
-			return nil, transport(rerr, method, url)
+			return nil, rerr
 		}
 		apiErr := parseOpenAIError(r.StatusCode, body, method, url, r.Header.Get("X-Request-Id"))
-		if r.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr.Message, apiErr.Type, true) {
+		if r.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model, true) {
 			sanitizes++
 			continue
 		}
@@ -495,6 +524,12 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 				usage = &u
 			}
 			for _, choice := range ch.Choices {
+				if choice.Index != 0 {
+					// The unified event stream models a single assistant
+					// turn; extra choices (n>1) would interleave their text
+					// and clobber the stop reason, so only choice 0 maps.
+					continue
+				}
 				d := &choice.Delta
 				if d.Content.Set && d.Content.Value != "" {
 					events = append(events, &Event{Type: EventTextDelta, Text: d.Content.Value})
@@ -550,6 +585,7 @@ func mapOpenAIStop(s string) StopReason {
 type oaErrorBody struct {
 	Message string          `json:"message"`
 	Type    string          `json:"type"`
+	Param   string          `json:"param"`
 	Code    json.RawMessage `json:"code"`
 }
 
@@ -561,6 +597,7 @@ func (e *oaErrorBody) apiError(status int) *APIError {
 		StatusCode: status,
 		Code:       decodeJSONString(e.Code),
 		Type:       e.Type,
+		Param:      e.Param,
 		Message:    e.Message,
 	}
 }
@@ -719,6 +756,7 @@ func parseOpenAIError(status int, body []byte, method, url, requestID string) *A
 	if err := json.Unmarshal(top.Error, &obj); err == nil && (obj.Message != "" || obj.Type != "") {
 		apiErr.Message = obj.Message
 		apiErr.Type = obj.Type
+		apiErr.Param = obj.Param
 		apiErr.Code = decodeJSONString(obj.Code)
 		return apiErr
 	}
