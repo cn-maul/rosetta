@@ -230,10 +230,10 @@ func (s *streamCore) releaseLocked() {
 		s.cancel()
 	}
 	if s.closer != nil {
+		// Preserve the Close error for Close()'s return value, but do NOT
+		// surface it through s.err: a stream that ended cleanly must report
+		// Err()==nil even if freeing the connection failed.
 		s.closeErr = s.closer.Close()
-		if s.err == nil {
-			s.err = s.closeErr
-		}
 	}
 }
 

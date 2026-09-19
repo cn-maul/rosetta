@@ -246,3 +246,24 @@ func TestStreamCoreCloserCalledOnce(t *testing.T) {
 		t.Fatalf("closer called %d times after error end, want 1", cl.n)
 	}
 }
+
+// #11b: a response-body Close error must not masquerade as a stream failure.
+// After a clean end, Err() stays nil even when freeing the connection fails;
+// the close error is still surfaced through Close()'s return value.
+type errCloser struct{ err error }
+
+func (c *errCloser) Close() error { return c.err }
+
+func TestStreamCoreCloseErrorNotFailure(t *testing.T) {
+	closeErr := errors.New("connection close failed")
+	s := newStream(seqNext(&Event{Type: EventMessageEnd, StopReason: StopEnd}), nil)
+	s.attachCloser(&errCloser{err: closeErr})
+	for s.Next() {
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("Err after clean end = %v, want nil", err)
+	}
+	if err := s.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("Close = %v, want %v", err, closeErr)
+	}
+}
