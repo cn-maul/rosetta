@@ -2,3 +2,7 @@ coverage.out
 coverage.html
 *.exe
 *.test
+
+# Local assistant workspace state (memory, scratch). Never part of the
+# published module — keep it from being swept up by a blanket `git add -A`.
+.workbuddy/

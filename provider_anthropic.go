@@ -28,6 +28,15 @@ const anthropicVersion = "2023-06-01"
 // present.
 const extendedCacheTTLBeta = "extended-cache-ttl-2025-04-11"
 
+// interleavedThinkingBeta enables reasoning between tool calls inside a single
+// assistant turn. Per Anthropic's extended-thinking docs it is required on
+// Claude Opus 4.5 / Sonnet 4.5 and earlier Claude 4 models, is deprecated but
+// safely ignored on the adaptive-thinking models (Opus 4.6+ / Sonnet 5), and
+// is ignored on Haiku 4.5. The Claude API accepts it for any model without
+// erroring; Amazon Bedrock and Vertex AI reject it on models outside
+// Anthropic's whitelist, which is why WithInterleavedThinking(false) exists.
+const interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+
 // maxCacheBreakpoints is Anthropic's hard limit on cache_control blocks per
 // request; exceeding it is a 400 upstream, so it is caught locally first.
 const maxCacheBreakpoints = 4
@@ -95,6 +104,58 @@ func payloadNeedsExtendedCacheTTL(v any) bool {
 		}
 	}
 	return false
+}
+
+// payloadNeedsInterleavedThinking reports whether the built payload enables
+// extended thinking while also offering tools — the exact scope Anthropic
+// documents for the interleaved-thinking beta ("only supported for tools used
+// through the Messages API"). A request without tools gains nothing from the
+// header, and leaving it off keeps the request acceptable to gateways that
+// forward to platforms where the header is rejected.
+func payloadNeedsInterleavedThinking(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := m["thinking"]; !ok {
+		return false
+	}
+	switch tools := m["tools"].(type) {
+	case []map[string]any:
+		// How the builder types tool definitions.
+		return len(tools) > 0
+	case []any:
+		// How a tool list injected through Extra arrives after the JSON
+		// round-trip that normalizes Extra values.
+		return len(tools) > 0
+	}
+	return false
+}
+
+// wantsInterleavedThinking resolves the tri-state WithInterleavedThinking
+// setting against the payload: an explicit choice wins, otherwise the payload
+// decides.
+func (p *anthropicProvider) wantsInterleavedThinking(payload map[string]any) bool {
+	if v := p.c.settings.interleavedThinking; v != nil {
+		return *v
+	}
+	return payloadNeedsInterleavedThinking(payload)
+}
+
+// betaHeaders returns the value for the anthropic-beta header, or "" when the
+// payload needs none. The values are joined with a comma instead of Set
+// individually because a second Set would overwrite the first: a request that
+// uses both a 1-hour cache TTL and interleaved thinking has to advertise both
+// betas or Anthropic rejects it for the one that went missing.
+func (p *anthropicProvider) betaHeaders(payload map[string]any) string {
+	var betas []string
+	if payloadNeedsExtendedCacheTTL(payload) {
+		betas = append(betas, extendedCacheTTLBeta)
+	}
+	if p.wantsInterleavedThinking(payload) {
+		betas = append(betas, interleavedThinkingBeta)
+	}
+	return strings.Join(betas, ",")
 }
 
 // countCacheControl walks a built payload counting cache_control breakpoints
@@ -556,10 +617,11 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 			return nil, err
 		}
 		// Headers are derived from the payload that is about to be sent, so
-		// a breakpoint contributed by Extra is seen by the beta switch too.
+		// breakpoints and thinking configs contributed by Extra are seen by
+		// the beta switch too.
 		hdr := p.headers(false)
-		if payloadNeedsExtendedCacheTTL(payload) {
-			hdr.Set("anthropic-beta", extendedCacheTTLBeta)
+		if beta := p.betaHeaders(payload); beta != "" {
+			hdr.Set("anthropic-beta", beta)
 		}
 		call := &httpx.Call{
 			Method: method,
@@ -600,8 +662,8 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 			return nil, err
 		}
 		hdr := p.headers(true)
-		if payloadNeedsExtendedCacheTTL(payload) {
-			hdr.Set("anthropic-beta", extendedCacheTTLBeta)
+		if beta := p.betaHeaders(payload); beta != "" {
+			hdr.Set("anthropic-beta", beta)
 		}
 		call := &httpx.Call{
 			Method: method,

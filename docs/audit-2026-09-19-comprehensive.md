@@ -27,7 +27,7 @@
 - **A1–A3（P1）· 已修**：跨主机重定向在 `httpx.New()` 与 `WithHTTPClient` 拷贝路径统一装 `CrossHostSafeRedirect`；OpenAI Chat/Responses 解码接住 `refusal`→`BlockText`、`function_call`→`BlockToolCall`；Responses `error` 事件优先读嵌套 `error` 信封、回退扁平。
 - **B1–B16（P2）· 已修**：Anthropic 断点计数命中 `[]map[string]any`；纯 `io.EOF` 且已见语义终止不再误判截断；200-非-SSE 走 `bufferedJSONResponse`/`bufferedStream`；`anthroUsage`→`FlexInt64` + `FlexJSONString`；Responses 流式按 `item_id`/`output_index` 归并不丢项；httpx 预算耗尽分支的 `drain` 移到确要 sleep 之后（body 保持打开）；`redactJSON` 用 `UseNumber` 且回退路径必掩码；`streamCore.apply` 改 `strings.Builder` 摊还 + 字节/块数上限（`ErrStreamOverflow`）；**B9：Anthropic 缓存量并入 `InputTokens`/`TotalTokens`（`CachedInput` 为子集），跨协议 `Total` 语义对齐——此为有意的语义变更**；零值 `MemoryUsageTracker` 惰性建 map；`ListModels` 缺 `data` 报协议错误不再清空远端层；`DetectClient` 尊重显式 `WithProtocol`；`validate` 拒 NaN/Inf/工具/Extra；token 字段上限 + 不回绕的上下文门；估算器计 signature/redacted；手动层同 id 字段级合并。
 - **C1–C24（P3）**：C1/C8/B12 前序组已修，其余 C2–C7、C9、C10、C11、C12（`//go:build !nojsonv2` 守卫）、C13–C21、C23、C24 均已修。
-- **C22 · 暂缓（未改）**：交错思考重放是否需 `interleaved-thinking` beta 头，报告本身标注「未能从仓库核实、动作前请对 Anthropic 文档复核」；在无官方文档确认前不臆测改动。
+- **C22 · 已修（2026-09-20）**：已对 Anthropic 官方 extended-thinking 文档复核并实现。交错思考的 `interleaved-thinking-2025-05-14` beta 头现在按**已构建的 payload** 判定（payload 同时含 `thinking` 与 `tools` 时附带，正是官方限定的 Messages API 工具用法），且与扩展缓存 TTL 的 beta **合并为一个逗号分隔头**（此前逐个 `Set` 会互相覆盖）。新选项 `WithInterleavedThinking(v)` 可强制开关——经 Bedrock / Vertex 转发时必须设 `false`，因为这两家会拒绝白名单外模型的该头，而 Claude API 对任何模型都接受并忽略不支持者。复核结论见 `docs/protocols.md` 的「Anthropic beta 头」。
 
 ---
 
@@ -206,7 +206,7 @@
 - **C19 工具名/停止序列无本地校验**：`request.go:254-260`，空名/重名/越界字符/含 `""` 的 `StopSequences` 全部透传 → 上游隐晦 400。修复：`validate` 拒空名、重名、空停止串。
 - **C20 `ExtraOverrides` 覆盖后校验缺口**：`embedding.go:103-110/145/157`、`rerank.go:110-113/171`——(a) 仅对 `[]string`/`int` 生效，解析自 JSON 的 `[]any`/`float64` 使有效响应被误判协议错误；(b) `Extra{"documents":[]string{}}` 令 `expected==0`，跳过数量与 index 上界检查，越界 index 直达 `Results` 使调用方切片越界 panic。修复：覆盖再派生走 JSON 往返归一；wire 计数为 0 时硬报错。
 - **C21 provider token 数无量级上限**：`usage.go:100-105`，恶意/异常 `total_tokens:MaxInt64` 过"非负"检查并 `+=` 使聚合回绕为负。修复：per-record 超合理阈值（如 `1<<40`）拒绝或饱和。
-- **C22 低置信：Anthropic thinking 重放不发 `interleaved-thinking` beta 头**：`provider_anthropic.go:25-28/314-333`，扩展缓存 TTL 有 beta 门、交错思考没有对应项。**未能从本仓库核实各模型当前 beta 要求，动作前请对 Anthropic 文档复核**。
+- **C22 低置信：Anthropic thinking 重放不发 `interleaved-thinking` beta 头**（**已于 2026-09-20 修复**）：`provider_anthropic.go:25-28/314-333`，扩展缓存 TTL 有 beta 门、交错思考没有对应项。**未能从本仓库核实各模型当前 beta 要求，动作前请对 Anthropic 文档复核**。
 - **C23 `DisableThinking` 下层否决手层（潜在，文档反向）**：`registry.go:191-194` `low||high` OR 使远端 `DisableThinking` 能撤销手动 `SupportsThinking:true`，与 `docs/models.md`（手动声明不可被远端撤销）相反；当前无 provider 解码器置该位，属潜在。修复：manual-high 时 `out.DisableThinking=high.DisableThinking`。
 - **C24 `ThinkingConfig` 文档与 `effort()` 优先级矛盾**：`request.go:17-30` 称"两者都设时 BudgetTokens 在 Anthropic 胜出、他处映射为最近 effort"，但 `effort()`（`:265-277`）`Effort` 非空即返回，OpenAI 上 `BudgetTokens` 从不"胜出"。修复：按文档先判 `BudgetTokens`，或把文档改成"显式 Effort 在非 Anthropic 协议胜出"。
 

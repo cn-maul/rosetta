@@ -40,14 +40,17 @@ type settings struct {
 	logger           *slog.Logger
 	thinkingFallback bool
 	thinkingRectify  bool
-	maxTokensField   string
-	anthropicBearer  bool
-	strictContext    bool
-	extraOverrides   bool
-	estimates        MultimediaTokenEstimates
-	quirks           Quirks
-	modelsFile       string
-	manualModels     []ModelInfo
+	// interleavedThinking is tri-state: nil lets the provider decide from the
+	// payload (thinking + tools), non-nil pins the beta header on or off.
+	interleavedThinking *bool
+	maxTokensField      string
+	anthropicBearer     bool
+	strictContext       bool
+	extraOverrides      bool
+	estimates           MultimediaTokenEstimates
+	quirks              Quirks
+	modelsFile          string
+	manualModels        []ModelInfo
 }
 
 func defaultSettings() *settings {
@@ -186,6 +189,23 @@ func WithThinkingFallback(v bool) Option {
 // budget once and retries. Default true.
 func WithThinkingRectify(v bool) Option {
 	return func(s *settings) { s.thinkingRectify = v }
+}
+
+// WithInterleavedThinking pins the Anthropic "interleaved-thinking-2025-05-14"
+// beta header on or off. Interleaved thinking is what lets Claude reason
+// between tool calls inside one assistant turn; the beta header is how the
+// models that still need it are told to do so.
+//
+// Left unset (the default) the SDK decides per request: the header is sent
+// when the outgoing payload both enables extended thinking and declares
+// tools, which is exactly the scope Anthropic documents for the beta.
+//
+// Pin it to false when the endpoint forwards to Amazon Bedrock or Google
+// Cloud Vertex AI: those platforms reject the header on models outside
+// Anthropic's list, while the Claude API itself accepts it on any model and
+// ignores it where unsupported.
+func WithInterleavedThinking(v bool) Option {
+	return func(s *settings) { s.interleavedThinking = &v }
 }
 
 // WithMaxTokensField pins the output-cap field name for OpenAI Chat

@@ -18,6 +18,8 @@
 
 - **哨兵错误 `ErrStreamTruncated` 与 `ErrStreamOverflow`**：前者区分"provider 终止事件之前 EOF"与干净结束（部分结果仍保留在 `Stream.Partial()`），后者在单流累计内容超过 64 MiB 或 10000 个内容块时终止流。
 - **`Anthropic` 1 小时缓存的 beta 头判定改为基于已构建的 payload**，因此经 `Extra`（`WithExtraOverrides(true)`）注入的 `ttl:"1h"` 断点也能正确附带 `anthropic-beta: extended-cache-ttl-2025-04-11`（此前只扫类型化请求，这类断点上得了 wire 却拿不到 beta 头，被上游 400 拒绝）。
+- **Anthropic 交错思考的 beta 头自动附带**（第四轮 C22）。payload **同时**含 `thinking` 与 `tools` 时（即官方限定的 Messages API 工具用法），SDK 发送 `anthropic-beta: interleaved-thinking-2025-05-14`，让模型在收到每个工具结果后继续推理，而不是一轮只在开头思考一次。模型差异按 Anthropic 官方文档落实：Opus 4.5 / Sonnet 4.5 及更早的 Claude 4 需要该头；Opus 4.6+ / Sonnet 5 走自适应思考、该头已弃用并被安全忽略；Haiku 4.5 不支持。**两个 beta 现在合并成一个逗号分隔的头**——此前逐个 `Set` 会互相覆盖，同时用扩展缓存与交错思考时必有一个丢失。新选项 `WithInterleavedThinking(v)` 可强制开关：经 **Amazon Bedrock / Google Cloud Vertex AI** 转发时设 `false`（这两家会拒绝白名单外模型的该头），Claude API 本身对任何模型都接受并忽略不支持者。
+- **Anthropic 错误路径的端到端测试**（第四轮收尾）：错误信封解析、`request_id` 缺头时从响应体恢复、thinking 预算类 400 的整流重试（一元与流式各一条，断言确实只重试一次且第二次 payload 携带改写后的 budget/max_tokens）。此前 `parseAnthropicError` 覆盖率为 0、整流重试循环完全没有测试——三协议里唯独 Anthropic 的错误分支是空白。
 - 缓存机制的回归测试：断点 TTL/Type 三态、无断点时 `system` 保持字符串（wire 字节不变）、有断点时降级为 text-block 数组、断点在 image/document/tool_use/tool_result/工具定义上的落地、beta 头四条路径、`ExtendedCache` 等此前零覆盖的函数。
 
 ### 修复 · 正确性与安全

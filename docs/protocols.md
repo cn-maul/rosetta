@@ -82,6 +82,29 @@ req := &rosetta.ChatRequest{
 - Anthropic 限制：每请求最多 4 个断点，被缓存前缀需 ≥1024 token（Haiku 类 2048），过短的前缀上游不会缓存。
 - 用量回报：命中量见 `Usage.CachedInputTokens`（`cache_read_input_tokens`），本次写入量见 `Usage.CachedCreationTokens`（`cache_creation_input_tokens`），两者都计入 `Stats()`。**缓存量已经折进 `Usage.InputTokens` 与 `TotalTokens`**（与 OpenAI 的 `prompt_tokens` 口径一致）：`CachedInputTokens` 是 `InputTokens` 的子集，`CachedCreationTokens` 也已包含在 `InputTokens` 内，这两个字段只用于展示缓存明细，**不要再加进输入量**。线格式上 Anthropic 的 `input_tokens` 只计未缓存部分，折算是适配器做的（见 `docs/usage-stats.md`）。
 
+## Anthropic beta 头
+
+Anthropic 把部分能力放在 `anthropic-beta` 请求头后面。SDK 按**已构建的 wire payload** 判定当前请求需要哪些 beta，再把它们**逗号连接成一个头**——多个 beta 同时成立时逐个 `Set` 会互相覆盖，导致靠后的那个静默丢失并被上游 400 拒绝。
+
+| beta | 触发条件 | 缺失的后果 |
+|---|---|---|
+| `extended-cache-ttl-2025-04-11` | payload 中任一断点带 `ttl:"1h"` | 上游对该请求 400 |
+| `interleaved-thinking-2025-05-14` | payload **同时**含 `thinking` 与 `tools` | 模型不在工具调用之间推理（能力降级，不报错） |
+
+判定基于 payload 而非类型化请求，因此经 `Extra`（`WithExtraOverrides(true)`）注入的字段同样生效。
+
+**交错思考的模型差异**（依据 Anthropic 官方 extended-thinking 文档）：Claude Opus 4.5 / Sonnet 4.5 及更早的 Claude 4 模型**需要**该头才启用；Opus 4.6+ / Sonnet 5 走自适应思考、该头已弃用且被安全忽略；Haiku 4.5 不支持，头被接受但忽略。
+
+**Claude API 与 AWS Claude Platform 对任何模型都接受该头**，不支持时忽略，所以默认自动发送是安全的。例外是 **Amazon Bedrock 与 Google Cloud Vertex AI：它们会拒绝**发给白名单外模型的该头。
+
+```go
+// 端点经 Bedrock / Vertex 转发时关掉自动发送
+rosetta.WithInterleavedThinking(false)
+
+// 或强制发送（默认由 payload 自动判定）
+rosetta.WithInterleavedThinking(true)
+```
+
 ## Quirks
 
 已知偏差直接声明，跳过探测：

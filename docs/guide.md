@@ -32,6 +32,7 @@ client, err := rosetta.NewClient(
 | `WithLogger(l)` | 丢弃 | 接收 debug/warn 日志（重试、降级、告警） |
 | `WithThinkingFallback(v)` | false | 见 [thinking](#thinking-统一配置) |
 | `WithThinkingRectify(v)` | true | Anthropic 预算错误的响应式整流开关 |
+| `WithInterleavedThinking(v)` | 自动 | 强制开关 Anthropic 的 `interleaved-thinking-2025-05-14` beta 头。默认按 payload 是否**同时**含 thinking 与 tools 自动判定；端点经 Bedrock / Vertex 转发时设 `false`（这两家会拒绝白名单外模型的该头），见[协议与兼容](protocols.md) |
 | `WithMaxTokensField(f)` | 自动探测 | 强制 OpenAI Chat 的输出上限字段（`max_completion_tokens` / `max_tokens`） |
 | `WithStrictContextCheck(v)` | false | 上下文超限从告警变为报错 |
 | `WithModelInfo(...)` | 无 | 手动注入模型元数据（可多次调用，与文件配置合并，id 冲突时优先），见[模型体系](models.md) |
@@ -140,6 +141,8 @@ Thinking: &rosetta.ThinkingConfig{Effort: rosetta.EffortMedium} // 低/中/高�
 | Anthropic | `thinking.budget_tokens` | Effort ≈ 2048/8192/32768；显式预算原样；两者都没给默认 medium |
 
 Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；thinking 模式下丢弃 temperature/top_p；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。
+
+**工具调用之间的推理（交错思考）**：请求同时带 `Thinking` 与 `Tools` 时，SDK 自动附上 `anthropic-beta: interleaved-thinking-2025-05-14`，让模型在收到每个工具结果后继续推理，而不是在轮次开头思考一次就不再思考。该头对 Claude API 无副作用（不支持的模型忽略它），但 **Bedrock / Vertex 会对白名单外的模型报错**——端点经这类网关转发时用 `WithInterleavedThinking(false)` 关闭自动发送。模型差异与完整规则见[协议与兼容](protocols.md)。
 
 **能力门控**：对已知的非思考模型（手动配置的 `ModelInfo.Known && !SupportsThinking`），请求 thinking 默认报 `ErrThinkingUnsupported`；`WithThinkingFallback(true)` 改为静默去掉 thinking 配置。未知模型不做猜测、原样透传。
 
