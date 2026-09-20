@@ -744,7 +744,7 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 			// further events even if the server keeps sending.
 			if ended {
 				if truncated {
-					return nil, fmt.Errorf("rosetta: %w: anthropic stream ended without message_stop (partial response kept in Stream.Partial)", ErrStreamTruncated)
+					return nil, fmt.Errorf("%w: anthropic stream ended without message_stop (partial response kept in Stream.Partial)", ErrStreamTruncated)
 				}
 				return nil, io.EOF
 			}

@@ -1,5 +1,24 @@
 # 更新日志
 
+## v0.5.1 (2026-09-20)
+
+修复 v0.5.0 引入的错误消息文案回归。只影响人读的字符串，`errors.Is` 匹配一直正常；升级无需改代码。
+
+### 修复
+
+- **流错误不再双写 `rosetta:` 前缀。** v0.5.0 把 `ErrStreamTruncated` 的文案由 `"stream truncated"` 改成 `"rosetta: stream truncated"`（这项变更当时未记入日志），但四处包装点仍沿用了**包外部错误**的写法 `fmt.Errorf("rosetta: %w: ...")`，于是错误串变成 `rosetta: rosetta: stream truncated: ...`。
+  现在这四处包装点改用包**哨兵**的既定写法 `fmt.Errorf("%w: ...")`（哨兵自身已带前缀），与项目里其余 40 余处哨兵包装一致：`provider_anthropic.go`、`provider_openai_chat.go`、`provider_openai_responses.go` 的断流分支，以及 `stream.go` 的累计量溢出分支（后者包的是 v0.5.0 新增的 `ErrStreamOverflow`，同样双前缀）。
+  修复后对外错误串与 v0.4.0 **逐字节相同**：
+
+  ```
+  rosetta: stream truncated: openai-chat stream ended without [DONE] (partial response kept in Stream.Partial)
+  rosetta: stream truncated: responses stream ended without response.completed (partial response kept in Stream.Partial)
+  rosetta: stream truncated: anthropic stream ended without message_stop (partial response kept in Stream.Partial)
+  rosetta: stream accumulation exceeded safety limits: stream accumulation exceeded N bytes / M blocks (partial response kept in Stream.Partial)
+  ```
+
+  `errors.Is(err, ErrStreamTruncated)` / `errors.Is(err, ErrStreamOverflow)` 行为不变。新增 `stream_sentinel_test.go` 把三个协议的真实断流错误串钉住，并新增一条哨兵前缀约定测试（每个哨兵恰好一次 `rosetta: ` 前缀）。
+
 ## v0.5.0 (2026-09-20)
 
 第二、三、四轮审计的修复与语义对齐批次。**含调用方可见的行为变更**（见下节）——按 semver 视为 minor。

@@ -240,7 +240,7 @@ func (s *streamCore) Next() bool {
 		// Accumulation crossed a safety cap: fail the stream rather than
 		// let a hostile or buggy provider drive unbounded memory growth.
 		s.done = true
-		s.err = fmt.Errorf("rosetta: %w: stream accumulation exceeded %d bytes / %d blocks (partial response kept in Stream.Partial)", ErrStreamOverflow, maxStreamAccumBytes, maxStreamBlocks)
+		s.err = fmt.Errorf("%w: stream accumulation exceeded %d bytes / %d blocks (partial response kept in Stream.Partial)", ErrStreamOverflow, maxStreamAccumBytes, maxStreamBlocks)
 		s.releaseLocked()
 		s.mu.Unlock()
 		if call, usage, terr := s.takeOnEnd(); call != nil {

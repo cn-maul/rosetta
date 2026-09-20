@@ -505,7 +505,7 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 			// sending.
 			if ended {
 				if truncated {
-					return nil, fmt.Errorf("rosetta: %w: responses stream ended without response.completed (partial response kept in Stream.Partial)", ErrStreamTruncated)
+					return nil, fmt.Errorf("%w: responses stream ended without response.completed (partial response kept in Stream.Partial)", ErrStreamTruncated)
 				}
 				return nil, io.EOF
 			}

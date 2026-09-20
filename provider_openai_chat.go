@@ -478,7 +478,7 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 			// sending.
 			if ended {
 				if truncated {
-					return nil, fmt.Errorf("rosetta: %w: openai-chat stream ended without [DONE] (partial response kept in Stream.Partial)", ErrStreamTruncated)
+					return nil, fmt.Errorf("%w: openai-chat stream ended without [DONE] (partial response kept in Stream.Partial)", ErrStreamTruncated)
 				}
 				return nil, io.EOF
 			}
