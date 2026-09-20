@@ -278,6 +278,16 @@ func (s *streamCore) Partial() *ChatResponse {
 	return &cp
 }
 
+// model returns the response model captured so far under the mutex. The
+// owner callback (onEnd) runs outside the lock but still needs the model to
+// label its usage record; reading s.partial directly from there would be an
+// unsynchronized read that only happens to be safe.
+func (s *streamCore) model() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.partial.Model
+}
+
 func (s *streamCore) Collect() (*ChatResponse, error) {
 	for s.Next() {
 	}

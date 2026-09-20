@@ -6,14 +6,14 @@
 
 | 字段 | Chat 来源 | Responses 来源 | Anthropic 来源 |
 |---|---|---|---|
-| `InputTokens` | `prompt_tokens` | `input_tokens` | `input_tokens` |
+| `InputTokens` | `prompt_tokens` | `input_tokens` | `input_tokens` + `cache_read_input_tokens` + `cache_creation_input_tokens` |
 | `OutputTokens` | `completion_tokens` | `output_tokens` | `output_tokens` |
-| `TotalTokens` | `total_tokens`（缺省时求和） | `total_tokens`（缺省时求和） | input+output 求和 |
+| `TotalTokens` | `total_tokens`（缺省时求和） | `total_tokens`（缺省时求和） | input+output 求和（input 含缓存读/写） |
 | `CachedInputTokens` | `prompt_tokens_details.cached_tokens` | `input_tokens_details.cached_tokens` | `cache_read_input_tokens` |
 | `CachedCreationTokens` | —（自动缓存，不单独回报写入量） | — | `cache_creation_input_tokens` |
 | `ReasoningTokens` | `completion_tokens_details.reasoning_tokens` | `output_tokens_details.reasoning_tokens` | — |
 
-`Usage.IsZero()` 判断上游是否完全没有回报用量。
+`Usage.IsZero()` 判断上游是否完全没有回报用量；任一维度有值（**包括缓存与思考**）都算"报过了"。
 
 ## 记账
 
@@ -55,7 +55,7 @@ stats.ByProtocol[rosetta.ProtoOpenAIChat] // ModelUsage：按协议
 
 `ModelUsage` 与总量同构（Requests / 各 token 维度 / UsageMissing）。`Stats()` 返回深拷贝，可安全持有。
 
-注意各协议对 `InputTokens` 的口径不同：OpenAI 系的 `prompt_tokens`/`input_tokens` **已包含**命中缓存的部分，而 Anthropic 的 `input_tokens` 只计未缓存部分，缓存读/写分别落在 `CachedInputTokens`/`CachedCreationTokens`。跨协议对比真实输入量时，Anthropic 侧需用 `InputTokens + CachedInputTokens + CachedCreationTokens`。
+各协议对 `InputTokens` 的口径已经统一：**都包含**命中缓存的部分。OpenAI 系的 `prompt_tokens`/`input_tokens` 原生如此；Anthropic 线格式的 `input_tokens` 只计未缓存部分，适配器已把 `cache_read_input_tokens` 与 `cache_creation_input_tokens` 折进 `InputTokens`/`TotalTokens`，让跨协议的 `Input`/`Total` 可直接比较。因此 **Anthropic 侧的真实输入量就是 `InputTokens`**：`CachedInputTokens` 是它的子集，`CachedCreationTokens` 也已含在其中，两者只用于看缓存明细。**不要再把它们相加**——那会把 Anthropic 的输入量最高虚增一倍。
 
 ## 自定义持久化
 

@@ -203,6 +203,10 @@ var roleAllowedBlocks = map[Role]map[BlockType]bool{
 // are treated as placeholders and skipped — an image-only message with an
 // empty text prefix is valid — but a message left with no effective
 // content is an error.
+//
+// An empty text block that carries a CacheControl is rejected rather than
+// skipped: the block never reaches the wire, so the breakpoint would vanish
+// silently and the caller would believe a prefix was cached that was not.
 func (m Message) validate() error {
 	switch m.Role {
 	case RoleSystem, RoleUser, RoleAssistant, RoleTool:
@@ -225,6 +229,9 @@ func (m Message) validate() error {
 	}
 	for i, b := range m.Blocks {
 		if b.Type == BlockText && b.Text == "" {
+			if b.CacheControl != nil {
+				return fmt.Errorf("Blocks[%d]: empty text block cannot carry a cache breakpoint (it is dropped before the wire, so the marking would be lost)", i)
+			}
 			continue
 		}
 		if err := b.validate(); err != nil {

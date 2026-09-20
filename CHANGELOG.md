@@ -1,5 +1,57 @@
 # 更新日志
 
+## v0.5.0 (2026-09-20)
+
+第二、三、四轮审计的修复与语义对齐批次。**含调用方可见的行为变更**（见下节）——按 semver 视为 minor。
+
+### 行为变更（升级前必读）
+
+- **Anthropic 缓存量并入 `InputTokens`/`TotalTokens`**（第三轮 B9）。Anthropic 线格式的 `input_tokens` 只计未缓存部分，适配器现在把 `cache_read_input_tokens` 与 `cache_creation_input_tokens` 折进 `InputTokens`/`TotalTokens`，使三协议的 `Input`/`Total` 口径一致（`CachedInputTokens` ⊆ `InputTokens`）。**这会改变既有 `Stats()` 数字**：Anthropic 用户的 `InputTokens`/`TotalTokens` 会比 v0.4.0 高（多出缓存读+写），但更接近真实用量；原先按文档自行 `Input + Cached + Creation` 相加的调用方现在会**重复计数**，请只读 `InputTokens`。文档已同步（`docs/protocols.md`、`docs/usage-stats.md`）。
+- **`Usage.IsZero()` 现在把 `CachedInputTokens`/`CachedCreationTokens`/`ReasoningTokens` 计入判定**。只回报缓存（或只回报思考）token 的响应不再被当作"无用量"，`Stats().UsageMissing` 对这些 provider 会下降。
+- **Anthropic 一元响应缺 `stop_reason` 但含 tool call 时返回 `StopToolUse`** 而不是 `StopEnd`，与 Responses 适配器对齐。依赖 `StopReason` 决定"要不要执行工具"的 agent 循环行为会变（这正是修正点）。
+- **空 text 块携带 `CacheControl` 现在报 `ErrInvalidRequest`**。该块在渲染时被丢弃，断点从来上不了 wire，此前是静默失效；现在显式报错。
+- **`Extra` 计入上下文估算**（按其 JSON 长度）。用 `Extra` 注入大块内容的请求可能开始出现上下文告警，`WithStrictContextCheck(true)` 下可能被拒。
+- **Anthropic 的隐式输出上限参与上下文校验**。省略 `MaxOutputTokens` 时该协议实际会发 4096（thinking 时更高），此前输出侧不参与 `估算输入 + 输出上限 ≤ 窗口` 的判断，现在参与；同样的窗口设置下可能开始告警或报 `ErrContextTooLong`。
+- **失败/错误响应体的读取上限由 1 MiB 提到 8 MiB**（与 `/models` 一致），网关的大体积错误页不再被截断成解码错误。
+
+### 新增
+
+- **哨兵错误 `ErrStreamTruncated` 与 `ErrStreamOverflow`**：前者区分"provider 终止事件之前 EOF"与干净结束（部分结果仍保留在 `Stream.Partial()`），后者在单流累计内容超过 64 MiB 或 10000 个内容块时终止流。
+- **`Anthropic` 1 小时缓存的 beta 头判定改为基于已构建的 payload**，因此经 `Extra`（`WithExtraOverrides(true)`）注入的 `ttl:"1h"` 断点也能正确附带 `anthropic-beta: extended-cache-ttl-2025-04-11`（此前只扫类型化请求，这类断点上得了 wire 却拿不到 beta 头，被上游 400 拒绝）。
+- 缓存机制的回归测试：断点 TTL/Type 三态、无断点时 `system` 保持字符串（wire 字节不变）、有断点时降级为 text-block 数组、断点在 image/document/tool_use/tool_result/工具定义上的落地、beta 头四条路径、`ExtendedCache` 等此前零覆盖的函数。
+
+### 修复 · 正确性与安全
+
+- **跨主机重定向守卫装到默认与用户传入的 `http.Client`**：net/http 只剥离 `Authorization`/`Cookie`/`Proxy-*`，不会剥离 `x-api-key`；此前守卫只装在 `DetectClient` 探测路径，Anthropic 凭据可在一次 3xx 后泄露到第三方主机（307/308 还会重放含 prompt 的请求体）。
+- **OpenAI Chat/Responses 解码接住 `refusal` 与旧版 `function_call`**：refusal 折成文本块，`function_call` 折成 `BlockToolCall`；只有 refusal 的回复不再表现为"成功但内容为空"。
+- **Responses 流式 `error` 事件读嵌套信封**（`error.message`/`error.type`/`error.code`），不再产生信息全空、`Type` 被伪造成 `api_error` 的错误。
+- **Responses 流式输出按 `item_id`/`output_index` 归并**，交错到达的增量不再丢失整项。
+- **非 SSE 的 200 响应**（网关把 `stream:true` 回成普通 JSON）按完整回复处理，不再被当成截断的空流。
+- **流语义终止后的干净 EOF 不再误报截断**：已见 `message_delta` / `[DONE]` / `response.completed` 后，即使 `message_stop` 缺席也算正常结束。
+- **`Body.Close` 的错误不再冒充流失败**（改由 `Stream.Close()` 的返回值携带）。
+- **错误体脱敏加固**：`redactJSON` 改用 `UseNumber`，越界浮点无法再绕过；非 JSON（网关 HTML 等）与大体积错误体同样掩码，且 `Raw` 保持合法 JSON。
+- **`httpx` 预算耗尽时保留响应体**（不 drain），使调用方能读到最终 provider 错误而非空的 body。
+
+### 修复 · 防护与健壮性
+
+- **Anthropic 4 断点上限此前是死代码**：`countCacheControl` 未穿透构建器使用的 `[]map[string]any`，计数恒为 0，超限请求会直接打到上游吃 400。
+- **上下文门不可回绕**：token 字段上限（`maxWireInt`）加不回绕的越界判定，巨大的输出上限不再让超限请求读成"放得下"。
+- **`ChatRequest.validate` 加固**：拒绝 NaN/Inf 的采样参数、非 JSON 对象的工具参数、空工具名与重名工具、无法序列化的 `Extra`、空 stop sequence、越界的缓存 Type/TTL。
+- **流累加改摊还拼接**（`strings.Builder`）并加字节/块数上限，恶意或异常 provider 无法驱动无界的 O(n²) 内存增长。
+- **`MemoryUsageTracker` 零值可直接使用**（map 惰性创建）；聚合值对单次观测做饱和钳制，`MaxInt64` 量级不再把累计值加成负数。
+- **`ListModels` 响应缺 `data` 时报协议错误**而不是当空列表，不再清空已学到的远端层。
+- **`DetectClient` 尊重显式 `WithProtocol`**，不再被探测结果覆盖。
+- **估算器计入 thinking 签名与 redacted 数据**（多轮扩展思考的真实 prompt 占用）。
+- 注册表手动层同 id 条目做字段级合并，不再整条覆盖。
+- 流式 `message_delta` 的 usage 字段改为按**是否上报**（而非是否非零）覆盖 `message_start` 基线，显式上报的 0（缓存完全未命中）不再被忽略。
+- 用量记账的模型名改在流锁内读取，去掉 `onEnd` 回调中一处依赖时序假设的无锁读。
+
+### 工程
+
+- `docs/audit-2026-09-13*.md` / `docs/audit-2026-09-19*.md` / `docs/audit-2026-09-20.md` 四轮审计报告与逐条修复记录入库存档。
+- `TestExtraReservedKeys` 改为注入恒失败的 `RoundTripper`，不再依赖"某域名必须解析失败"——设了 `http_proxy` 的环境（CI、企业网、本机）此前必然误报。
+- 覆盖率 82.2% → 83.5%（CI 门禁 75%）；`ExtendedCache`、`CacheControl.validate`、`renderAnthropicSystem`、`payloadNeedsExtendedCacheTTL` 由 0%/40%/52.6%/未引用 提升到满覆盖。
+
 ## v0.4.0 (2026-09-13)
 
 新能力批次：检索配套 API（Embeddings / Rerank）与多模态输入扩展。

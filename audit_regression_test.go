@@ -267,6 +267,15 @@ func TestChatRequestStructuralValidation(t *testing.T) {
 	}
 }
 
+// errTransport fails every round trip. Tests that only need "the request
+// never reached a server" use it instead of dialing an unresolvable host:
+// with an HTTP proxy in the environment (http_proxy is commonly set in CI and
+// on developer machines) the proxy, not the resolver, handles api.test and
+// answers 502 — which made those tests fail for reasons unrelated to the SDK.
+type errTransport struct{ err error }
+
+func (t errTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
+
 func TestExtraReservedKeys(t *testing.T) {
 	steal := func() *ChatRequest {
 		return &ChatRequest{
@@ -280,9 +289,11 @@ func TestExtraReservedKeys(t *testing.T) {
 		t.Fatalf("reserved Extra key: err = %v, want ErrInvalidRequest", err)
 	}
 
-	// The opt-in restores override semantics: the request gets past
-	// payload build (here it fails at the HTTP layer instead).
-	c2 := newTestClient(t, WithExtraOverrides(true))
+	// The opt-in restores override semantics: the request gets past payload
+	// build and dies at the transport instead, which is injected so the
+	// outcome cannot depend on DNS, a proxy, or the network at all.
+	c2 := newTestClient(t, WithExtraOverrides(true),
+		WithHTTPClient(&http.Client{Transport: errTransport{err: errors.New("transport disabled in test")}}))
 	_, err := c2.Chat(context.Background(), steal())
 	var terr *TransportError
 	if !errors.As(err, &terr) {

@@ -53,20 +53,45 @@ func (p *anthropicProvider) headers(stream bool) http.Header {
 	return h
 }
 
-// needsExtendedCacheTTL reports whether any cache breakpoint in the request
-// asks for the 1-hour TTL, which Anthropic gates behind a beta header.
-func needsExtendedCacheTTL(req *ChatRequest) bool {
-	hourly := func(c *CacheControl) bool { return c != nil && c.TTL == "1h" }
-	for _, m := range req.Messages {
-		for _, b := range m.Blocks {
-			if hourly(b.CacheControl) {
+// payloadNeedsExtendedCacheTTL reports whether the *built payload* carries a
+// cache breakpoint asking for the 1-hour TTL, which Anthropic gates behind a
+// beta header.
+//
+// The probe deliberately inspects the payload rather than the typed request:
+// breakpoints can arrive through Extra (WithExtraOverrides(true) writing
+// cache_control into tools/messages/system), and those are merged into the
+// payload only after the typed fields are rendered. Scanning the typed
+// request alone would let an Extra-supplied "1h" breakpoint reach the wire
+// without the beta header, which Anthropic answers with a 400.
+func payloadNeedsExtendedCacheTTL(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		for k, val := range t {
+			if k == "cache_control" {
+				if cc, ok := val.(map[string]any); ok {
+					if ttl, ok := cc["ttl"].(string); ok && ttl == "1h" {
+						return true
+					}
+				}
+				continue
+			}
+			if payloadNeedsExtendedCacheTTL(val) {
 				return true
 			}
 		}
-	}
-	for _, t := range req.Tools {
-		if hourly(t.CacheControl) {
-			return true
+	case []any:
+		for _, item := range t {
+			if payloadNeedsExtendedCacheTTL(item) {
+				return true
+			}
+		}
+	case []map[string]any:
+		// Same reason as countCacheControl: the builder types messages,
+		// tools and content blocks as []map[string]any.
+		for _, item := range t {
+			if payloadNeedsExtendedCacheTTL(item) {
+				return true
+			}
 		}
 	}
 	return false
@@ -139,6 +164,16 @@ func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
 	}
 	pl.budget = b
 	return pl
+}
+
+// resolvedMaxOutput reports the output cap this provider will actually send
+// when the caller left MaxOutputTokens unset. Anthropic requires max_tokens
+// and substitutes a 4096 floor (grown further when a thinking budget demands
+// it), so the context check must ask the provider rather than assume "0 means
+// unlimited" — otherwise the output side of `in + out <= window` is skipped
+// on this protocol alone.
+func (p *anthropicProvider) resolvedMaxOutput(req *ChatRequest) int {
+	return p.plan(req).maxTokens
 }
 
 // rectify rewrites the budget once on a 400 error that cites thinking
@@ -515,14 +550,16 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/messages")
 	pl := p.plan(req)
-	hdr := p.headers(false)
-	if needsExtendedCacheTTL(req) {
-		hdr.Set("anthropic-beta", extendedCacheTTLBeta)
-	}
 	for {
 		payload, err := p.buildPayload(req, false, pl)
 		if err != nil {
 			return nil, err
+		}
+		// Headers are derived from the payload that is about to be sent, so
+		// a breakpoint contributed by Extra is seen by the beta switch too.
+		hdr := p.headers(false)
+		if payloadNeedsExtendedCacheTTL(payload) {
+			hdr.Set("anthropic-beta", extendedCacheTTLBeta)
 		}
 		call := &httpx.Call{
 			Method: method,
@@ -556,15 +593,15 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 	const method = http.MethodPost
 	url := joinEndpoint(p.c.settings.endpoint, "/messages")
 	pl := p.plan(req)
-	hdr := p.headers(true)
-	if needsExtendedCacheTTL(req) {
-		hdr.Set("anthropic-beta", extendedCacheTTLBeta)
-	}
 	var resp *http.Response
 	for {
 		payload, err := p.buildPayload(req, true, pl)
 		if err != nil {
 			return nil, err
+		}
+		hdr := p.headers(true)
+		if payloadNeedsExtendedCacheTTL(payload) {
+			hdr.Set("anthropic-beta", extendedCacheTTLBeta)
 		}
 		call := &httpx.Call{
 			Method: method,
@@ -758,18 +795,21 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 				if ch.Usage != nil {
 					// message_delta carries the authoritative final usage.
 					// Fold every field it reports over the message_start
-					// baseline, but only when it is non-zero: an omitted
-					// field must not clobber the baseline with 0.
-					if ch.Usage.OutputTokens.Value != 0 {
+					// baseline. Field presence — not a non-zero value — is
+					// the trigger: an omitted field must not clobber the
+					// baseline, but an explicitly reported 0 (cache fully
+					// missed) must override it, which a value comparison
+					// would silently ignore.
+					if ch.Usage.OutputTokens.Set {
 						usage.OutputTokens = ch.Usage.OutputTokens
 					}
-					if ch.Usage.InputTokens.Value != 0 {
+					if ch.Usage.InputTokens.Set {
 						usage.InputTokens = ch.Usage.InputTokens
 					}
-					if ch.Usage.CacheReadInputTokens.Value != 0 {
+					if ch.Usage.CacheReadInputTokens.Set {
 						usage.CacheReadInputTokens = ch.Usage.CacheReadInputTokens
 					}
-					if ch.Usage.CacheCreationInputTokens.Value != 0 {
+					if ch.Usage.CacheCreationInputTokens.Set {
 						usage.CacheCreationInputTokens = ch.Usage.CacheCreationInputTokens
 					}
 					hasUsage = true
@@ -962,6 +1002,7 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 		return nil, apiErr
 	}
 	out := &ChatResponse{ID: r.ID, Model: r.Model, Raw: truncateBody(body)}
+	sawToolCall := false
 	for _, blk := range r.Content {
 		switch blk.Type {
 		case "text":
@@ -975,6 +1016,7 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 			// unchanged; the Thinking field carries the redacted data.
 			out.Content = append(out.Content, Block{Type: BlockRedactedThinking, Thinking: blk.Data})
 		case "tool_use":
+			sawToolCall = true
 			out.Content = append(out.Content, Block{
 				Type:       BlockToolCall,
 				ToolCallID: blk.ID,
@@ -985,9 +1027,15 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 			// unknown content types are skipped
 		}
 	}
-	if r.StopReason != "" {
+	switch {
+	case r.StopReason != "":
 		out.StopReason = mapAnthropicStop(r.StopReason)
-	} else {
+	case sawToolCall:
+		// A missing stop_reason must not hide a tool call: an agent loop
+		// that branches on StopReason would skip execution. Mirrors the
+		// Responses adapter's correction.
+		out.StopReason = StopToolUse
+	default:
 		out.StopReason = StopEnd // unary 200 is complete by definition
 	}
 	if r.Usage != nil {

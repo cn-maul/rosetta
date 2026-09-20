@@ -25,8 +25,13 @@ type Usage struct {
 }
 
 // IsZero reports whether no token accounting was reported at all.
+//
+// The cache and reasoning fields count: a response that reports only cache
+// activity (or only thinking tokens) did report usage, and classifying it as
+// "no usage" would inflate UsageMissing and drop the record's real numbers.
 func (u Usage) IsZero() bool {
-	return u.InputTokens == 0 && u.OutputTokens == 0 && u.TotalTokens == 0
+	return u.InputTokens == 0 && u.OutputTokens == 0 && u.TotalTokens == 0 &&
+		u.CachedInputTokens == 0 && u.CachedCreationTokens == 0 && u.ReasoningTokens == 0
 }
 
 // UsageRecord is one observation fed to a UsageTracker.

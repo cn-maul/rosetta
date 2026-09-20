@@ -186,7 +186,11 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, erro
 	}
 	sc.attachCancel(cancel)
 	sc.onEnd = func(u Usage, err error) {
-		c.record(sc.partial.Model, u, err == nil && u.IsZero())
+		// sc.model() reads under the stream mutex: the callback fires
+		// outside the lock, so touching sc.partial directly would be an
+		// unsynchronized read whose safety rests only on an implicit
+		// ordering argument (the model is what identifies the record).
+		c.record(sc.model(), u, err == nil && u.IsZero())
 	}
 	return stream, nil
 }
@@ -309,6 +313,14 @@ func (c *Client) gateThinking(req *ChatRequest) (*ChatRequest, error) {
 		ErrThinkingUnsupported, req.Model)
 }
 
+// outputResolver is implemented by providers that substitute an output cap of
+// their own when the caller leaves MaxOutputTokens unset. Only Anthropic does
+// (it requires max_tokens and falls back to 4096, grown further in thinking
+// mode), but the hook is generic so the check stays protocol-agnostic.
+type outputResolver interface {
+	resolvedMaxOutput(req *ChatRequest) int
+}
+
 // checkContext compares the heuristic prompt estimate against the model's
 // context window. Default behavior is a warning; strict mode errors.
 func (c *Client) checkContext(req *ChatRequest) error {
@@ -318,6 +330,14 @@ func (c *Client) checkContext(req *ChatRequest) error {
 	}
 	in := req.estimateInputTokens(c.settings.estimates)
 	out := c.effectiveMaxOutput(req)
+	if out <= 0 {
+		// Zero is "let the provider decide", but on Anthropic the provider
+		// decides a concrete 4096 (or more), so the output side would
+		// otherwise never participate in the check on that protocol.
+		if r, ok := c.provider.(outputResolver); ok {
+			out = r.resolvedMaxOutput(req)
+		}
+	}
 	// Wrap-free overrun test: `in+out <= window` overflows to a negative when
 	// out is near MaxInt, wrongly reading a huge request as "fits" (audit B14).
 	if in > mi.ContextWindow || (out > 0 && out > mi.ContextWindow-in) {

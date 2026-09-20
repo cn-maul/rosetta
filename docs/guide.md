@@ -145,10 +145,12 @@ Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens �
 
 ## 上下文校验
 
-请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每段音频 500、每份文档 3000、每条消息 +4、每个工具定义 +24 与 schema 文本）比较 `估算输入 + 输出上限` 与窗口：
+请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每段音频 500、每份文档 3000、每条消息 +4、每个工具定义 +24 与 schema 文本、`Extra` 按其 JSON 长度）比较 `估算输入 + 输出上限` 与窗口：
 
 - 超限默认**仅告警**（进日志），请求照发；
 - `WithStrictContextCheck(true)` 改为返回 `ErrContextTooLong`。
+
+输出上限的取值顺序是 请求的 `MaxOutputTokens` → 注册表 `ModelInfo.MaxOutputTokens` → 客户端默认；Anthropic 协议在都未设置时按它自己的 4096 下限参与判断（请求了 thinking 时该值更高），OpenAI 协议则视为"由 provider 决定"、输出侧不参与。
 
 估算是保守近似，不是 tokenizer；需要精确计数请自行接真实 tokenizer 后自行校验。
 
@@ -224,6 +226,12 @@ rr, err := client.Rerank(ctx, &rosetta.RerankRequest{
 
 ## 附注
 
+- **默认继承进程的环境代理。** 不传 `WithHTTPClient` 时底层用的是 `http.DefaultTransport`，它会读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`。Go 对 `localhost` 与回环地址自动跳过代理，所以本地 Ollama/vLLM 安全；但**内网域名和 `http://` 端点会被送进代理**——`http://` 还会让 API key 以明文经过代理。需要直连时显式给一个不装代理的客户端：
+  ```go
+  rosetta.WithHTTPClient(&http.Client{Transport: &http.Transport{}})
+  ```
+  同理，写单测时若断言"请求到不了服务器"，别依赖某个不存在的域名解析失败——设了代理的机器上代理会代答（一条 `http_proxy` 就能让这类断言红掉），用恒失败的 `RoundTripper` 更可靠。
+- 默认的跨主机重定向守卫：SDK 会拒绝跳到别的主机的 3xx（net/http 只剥离 `Authorization`/`Cookie`，不会剥离 `x-api-key`），自己传 `http.Client` 时若已设 `CheckRedirect` 则以你的为准。
 - Windows 本地跑 `go test -race` 需要 CGO（gcc）；无 gcc 环境用 `go test ./...` 即可，CI（Linux）会跑 race。
 - **MinGW 装在含空格的路径下（如 `C:\Program Files\mingw64`）会导致所有 cgo 链接失败**（gcc 的 `*endfile` spec 引用 `default-manifest.o` 时路径未加引号）。把 MinGW 移到无空格路径是根治方案；临时绕过：导出并打补丁 specs 后在 `-ldflags` 中引用：
   ```bash
@@ -232,5 +240,5 @@ rr, err := client.Rerank(ctx, &rosetta.RerankRequest{
   go build -ldflags "-extldflags=-specs=C:/Users/<you>/mingw64-specs.txt" ./...
   ```
 - Windows Insider 构建（本机 build 29648）上 `-race` 可编译链接，但 TSan 运行时在固定地址分配 shadow memory 会报 `error code: 87` 而无法启动——属 OS 层限制，本地以 `go test ./...` 为准，race 由 CI（Linux）执行。
-- MinGW 在含空格路径下跑 `-race` 的另一条绕过：给链接器显式传短路径的库搜索目录，`CC='C:/PROGRA~1/mingw64/bin/gcc.exe' CGO_LDFLAGS='-B C:/PROGRA~1/mingw64/x86_64-w64-mingw32/lib/' go test -race ./...`（`PROGRA~1` 是 `Program Files` 的 DOS 短名，规避 ld 对未加引号路径的拆分）。
+- MinGW 在含空格路径下跑 `-race` 的另一条绕过：给链接器显式传短路径的库搜索目录，`CC='C:/PROGRA~1/mingw64/bin/gcc.exe' CGO_LDFLAGS='-B C:/PROGRA~1/mingw64/x86_64-w64-mingw32/lib/' go test -race ./...`（`PROGRA~1` 是 `Program Files` 的 DOS 短名，规避 ld 对未加引号路径的拆分）。**2026-09-20 复测：这条绕过在当前工具链上已失效**（`ld.exe: cannot find C:/Program`）——gcc 内部仍按编译期前缀展开成长路径。可靠做法是把 MinGW 装到无空格路径（如 `C:\mingw64`）并设 `CC=C:/mingw64/bin/gcc.exe`，或改在 WSL / Linux 上跑本地 race 检查。
 - 示例程序读 `ROSETTA_ENDPOINT` / `ROSETTA_API_KEY` / `ROSETTA_MODEL` 环境变量：`go run ./examples/chat`。

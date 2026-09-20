@@ -80,7 +80,7 @@ req := &rosetta.ChatRequest{
 - 断点可打在 text / image / document / tool_result / tool_use 块与工具定义上；打在 Anthropic 不支持的位置（如 thinking 块）会本地报错，而非静默丢弃。
 - system 断点用一条带 `CacheControl` 的 `RoleSystem` 消息表达（`ChatRequest.System` 是纯字符串、无法携带断点）。有断点时适配器把 `system` 渲染成 Anthropic 的 text-block 数组；无断点时仍是原来的字符串，**wire 字节不变**，不影响既有调用的命中。
 - Anthropic 限制：每请求最多 4 个断点，被缓存前缀需 ≥1024 token（Haiku 类 2048），过短的前缀上游不会缓存。
-- 用量回报：命中量见 `Usage.CachedInputTokens`（`cache_read_input_tokens`），本次写入量见 `Usage.CachedCreationTokens`（`cache_creation_input_tokens`），两者都计入 `Stats()`。注意 Anthropic 的 `InputTokens` 只含未缓存部分，真实输入 = `InputTokens + CachedInputTokens + CachedCreationTokens`。
+- 用量回报：命中量见 `Usage.CachedInputTokens`（`cache_read_input_tokens`），本次写入量见 `Usage.CachedCreationTokens`（`cache_creation_input_tokens`），两者都计入 `Stats()`。**缓存量已经折进 `Usage.InputTokens` 与 `TotalTokens`**（与 OpenAI 的 `prompt_tokens` 口径一致）：`CachedInputTokens` 是 `InputTokens` 的子集，`CachedCreationTokens` 也已包含在 `InputTokens` 内，这两个字段只用于展示缓存明细，**不要再加进输入量**。线格式上 Anthropic 的 `input_tokens` 只计未缓存部分，折算是适配器做的（见 `docs/usage-stats.md`）。
 
 ## Quirks
 

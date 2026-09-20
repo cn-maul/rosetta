@@ -1,5 +1,7 @@
 package rosetta
 
+import "encoding/json"
+
 // MultimediaTokenEstimates overrides the flat per-block token estimates
 // used by the context-window check. The built-in defaults are deliberately
 // coarse (multimedia tokenization is provider- and resolution-specific);
@@ -46,8 +48,9 @@ func EstimateTokens(text string) int {
 }
 
 // estimateInputTokens approximates the prompt size of a request, including
-// per-message overhead, flat per-block multimedia estimates and the tool
-// definitions offered to the model.
+// per-message overhead, flat per-block multimedia estimates, the tool
+// definitions offered to the model, and a serialized-length fallback for
+// Extra (which reaches the payload after every typed field is rendered).
 func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 	est = est.resolve()
 	total := 0
@@ -90,6 +93,18 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 		// Per-tool overhead plus the name, description and schema text.
 		total += 24 + EstimateTokens(t.Name) + EstimateTokens(t.Description)
 		total += EstimateTokens(string(t.Parameters))
+	}
+	if len(r.Extra) > 0 {
+		// Extra is the documented escape hatch for provider-specific fields
+		// and is merged into the payload after the typed fields, so a caller
+		// can inject arbitrary context (a whole document, a long tool
+		// catalog) that the walk above never sees. Falling back to the
+		// serialized length keeps the gate from being bypassed entirely;
+		// it over-counts structure and keys, which suits an estimate that
+		// must err on the high side.
+		if b, err := json.Marshal(r.Extra); err == nil {
+			total += EstimateTokens(string(b))
+		}
 	}
 	return total
 }
