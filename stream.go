@@ -3,8 +3,9 @@ package rosetta
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
-	"slices"
+	"strings"
 	"sync"
 )
 
@@ -32,6 +33,7 @@ type Event struct {
 	Model          string
 	Text           string
 	Signature      string // thinking signature passthrough (Anthropic)
+	BlockIndex     int    // content-block index for text/thinking merging (Anthropic); 0 elsewhere
 	ToolIndex      int
 	ToolID         string
 	ToolName       string
@@ -99,7 +101,29 @@ type streamCore struct {
 	cur      *Event
 	partial  ChatResponse
 	usage    Usage
+
+	// Accumulation uses per-block builders appended amortized, not string
+	// += (which is O(n²) per delta) — audit B8. Blocks are keyed by provider
+	// content-block index so out-of-order emitters merge into the right block
+	// (audit C17). Content is materialized from these on read.
+	acc      []*accBlock
+	textPos  map[int]int
+	thinkPos map[int]int
 	toolPos  map[int]int
+	accBytes int
+	overflow bool
+}
+
+// accBlock accumulates one output block. Exactly one of the builders is
+// active, determined by kind.
+type accBlock struct {
+	kind      BlockType
+	text      strings.Builder
+	thinking  strings.Builder
+	signature string
+	toolID    string
+	toolName  string
+	args      strings.Builder
 }
 
 // newStream wires a Stream from an event producer. onEnd, when non-nil,
@@ -108,15 +132,63 @@ func newStream(next func() (*Event, error), onEnd func(Usage, error)) *streamCor
 	return &streamCore{next: next, onEnd: onEnd}
 }
 
+// bufferedStream replays a fully-decoded, non-event-stream ChatResponse as a
+// one-shot unified stream. Gateways that answer a stream:true request with a
+// buffered 200 application/json body would otherwise have their complete
+// reply mistaken for a truncated (empty) SSE stream (audit B3).
+func bufferedStream(cr *ChatResponse) Stream {
+	events := make([]*Event, 0, len(cr.Content)+2)
+	events = append(events, &Event{Type: EventMessageStart, ID: cr.ID, Model: cr.Model})
+	for _, b := range cr.Content {
+		switch b.Type {
+		case BlockText:
+			events = append(events, &Event{Type: EventTextDelta, Text: b.Text})
+		case BlockThinking:
+			events = append(events, &Event{Type: EventThinkingDelta, Text: b.Thinking, Signature: b.Signature})
+		case BlockRedactedThinking:
+			events = append(events, &Event{Type: EventThinkingDelta, Text: b.Thinking})
+		case BlockToolCall:
+			events = append(events, &Event{Type: EventToolCall, ToolID: b.ToolCallID, ToolName: b.ToolName, ArgumentsDelta: b.Arguments})
+		}
+	}
+	u := cr.Usage
+	events = append(events, &Event{Type: EventMessageEnd, StopReason: cr.StopReason, Usage: &u})
+	i := 0
+	return newStream(func() (*Event, error) {
+		if i >= len(events) {
+			return nil, io.EOF
+		}
+		ev := events[i]
+		i++
+		return ev, nil
+	}, nil)
+}
+
 // attachCancel lets the owner release the HTTP context when the stream
-// terminates for any reason.
+// terminates for any reason. The write is lock-guarded because releaseLocked
+// reads the field under the same lock (audit C11); if the stream already
+// terminated, the cancel runs immediately so it is never dropped.
 func (s *streamCore) attachCancel(cancel context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.released {
+		cancel()
+		return
+	}
 	s.cancel = cancel
 }
 
 // attachCloser registers the response body for closing when the stream
-// terminates, so early Close and clean end both free the connection.
+// terminates, so early Close and clean end both free the connection. As with
+// attachCancel the write is lock-guarded, and an already-released stream
+// closes the body on the spot rather than leaking it.
 func (s *streamCore) attachCloser(c io.Closer) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.released {
+		_ = c.Close()
+		return
+	}
 	s.closer = c
 }
 
@@ -164,6 +236,18 @@ func (s *streamCore) Next() bool {
 	}
 	s.apply(ev)
 	s.cur = ev
+	if s.overflow {
+		// Accumulation crossed a safety cap: fail the stream rather than
+		// let a hostile or buggy provider drive unbounded memory growth.
+		s.done = true
+		s.err = fmt.Errorf("rosetta: %w: stream accumulation exceeded %d bytes / %d blocks (partial response kept in Stream.Partial)", ErrStreamOverflow, maxStreamAccumBytes, maxStreamBlocks)
+		s.releaseLocked()
+		s.mu.Unlock()
+		if call, usage, terr := s.takeOnEnd(); call != nil {
+			call(usage, terr)
+		}
+		return false
+	}
 	s.mu.Unlock()
 	return true
 }
@@ -190,9 +274,7 @@ func (s *streamCore) Partial() *ChatResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := s.partial
-	// Clone inside the lock: Next() mutates existing blocks in place, so a
-	// post-unlock clone of Content would race the live stream.
-	cp.Content = slices.Clone(cp.Content)
+	cp.Content = s.buildContent()
 	return &cp
 }
 
@@ -249,21 +331,46 @@ func (s *streamCore) takeOnEnd() (call func(Usage, error), usage Usage, err erro
 	return
 }
 
-// apply folds an event into the accumulated partial response.
+// Stream accumulation caps (audit B8). The bytes cap bounds total text,
+// thinking and tool-argument volume a single stream may pile up — SSE
+// per-event caps do not bound the number of events. The block cap bounds
+// distinct content blocks (an attacker controls ToolIndex). Both trip the
+// stream with ErrStreamOverflow rather than growing without limit.
+const (
+	maxStreamAccumBytes = 64 << 20 // 64 MiB of accumulated content
+	maxStreamBlocks     = 10_000
+)
+
+// apply folds an event into the accumulator. Deltas append into per-block
+// strings.Builder instances (amortized, not O(n²) string +=) keyed by the
+// provider content-block index, so out-of-order emitters never fold text or
+// a signature into the wrong block. Content is materialized on read.
 func (s *streamCore) apply(ev *Event) {
 	switch ev.Type {
 	case EventMessageStart:
 		s.partial.ID = ev.ID
 		s.partial.Model = ev.Model
 	case EventTextDelta:
-		appendBlockText(&s.partial.Content, ev.Text)
-	case EventThinkingDelta:
-		appendBlockThinking(&s.partial.Content, ev.Text, ev.Signature)
-	case EventToolCall:
-		if s.toolPos == nil {
-			s.toolPos = make(map[int]int)
+		if b := s.blockFor(&s.textPos, ev.BlockIndex, BlockText, len(ev.Text)); b != nil {
+			b.text.WriteString(ev.Text)
 		}
-		appendToolDelta(&s.partial.Content, s.toolPos, ev)
+	case EventThinkingDelta:
+		if b := s.blockFor(&s.thinkPos, ev.BlockIndex, BlockThinking, len(ev.Text)); b != nil {
+			b.thinking.WriteString(ev.Text)
+			if ev.Signature != "" {
+				b.signature = ev.Signature
+			}
+		}
+	case EventToolCall:
+		if b := s.blockFor(&s.toolPos, ev.ToolIndex, BlockToolCall, len(ev.ArgumentsDelta)); b != nil {
+			if ev.ToolID != "" {
+				b.toolID = ev.ToolID
+			}
+			if ev.ToolName != "" {
+				b.toolName = ev.ToolName
+			}
+			b.args.WriteString(ev.ArgumentsDelta)
+		}
 	case EventMessageEnd:
 		if ev.StopReason != "" {
 			s.partial.StopReason = ev.StopReason
@@ -275,41 +382,59 @@ func (s *streamCore) apply(ev *Event) {
 	}
 }
 
-func appendBlockText(blocks *[]Block, text string) {
-	if text == "" {
-		return
+// blockFor returns the accumulator for a given provider index, creating it
+// on first use, and accounts bytes against the caps. A nil return means the
+// stream has overflowed; the caller drops the delta and Next surfaces the
+// error.
+func (s *streamCore) blockFor(pos *map[int]int, index int, kind BlockType, addBytes int) *accBlock {
+	if i, ok := (*pos)[index]; ok {
+		s.chargeBytes(addBytes)
+		return s.acc[i]
 	}
-	if n := len(*blocks); n > 0 && (*blocks)[n-1].Type == BlockText {
-		(*blocks)[n-1].Text += text
-		return
+	if len(s.acc) >= maxStreamBlocks {
+		s.overflow = true
+		return nil
 	}
-	*blocks = append(*blocks, Block{Type: BlockText, Text: text})
-}
-
-func appendBlockThinking(blocks *[]Block, text, signature string) {
-	if n := len(*blocks); n > 0 && (*blocks)[n-1].Type == BlockThinking {
-		(*blocks)[n-1].Thinking += text
-		if signature != "" {
-			(*blocks)[n-1].Signature = signature
+	if addBytes > 0 {
+		s.chargeBytes(addBytes)
+		if s.overflow {
+			return nil
 		}
-		return
 	}
-	*blocks = append(*blocks, Block{Type: BlockThinking, Thinking: text, Signature: signature})
+	if *pos == nil {
+		*pos = make(map[int]int)
+	}
+	i := len(s.acc)
+	(*pos)[index] = i
+	s.acc = append(s.acc, &accBlock{kind: kind})
+	return s.acc[i]
 }
 
-func appendToolDelta(blocks *[]Block, pos map[int]int, ev *Event) {
-	idx, ok := pos[ev.ToolIndex]
-	if !ok {
-		idx = len(*blocks)
-		*blocks = append(*blocks, Block{Type: BlockToolCall})
-		pos[ev.ToolIndex] = idx
+func (s *streamCore) chargeBytes(n int) {
+	if n <= 0 {
+		return
 	}
-	b := &(*blocks)[idx]
-	if ev.ToolID != "" {
-		b.ToolCallID = ev.ToolID
+	s.accBytes += n
+	if s.accBytes > maxStreamAccumBytes {
+		s.overflow = true
 	}
-	if ev.ToolName != "" {
-		b.ToolName = ev.ToolName
+}
+
+// buildContent materializes the accumulated blocks into a snapshot slice.
+func (s *streamCore) buildContent() []Block {
+	if len(s.acc) == 0 {
+		return nil
 	}
-	b.Arguments += ev.ArgumentsDelta
+	out := make([]Block, len(s.acc))
+	for i, b := range s.acc {
+		switch b.kind {
+		case BlockText:
+			out[i] = Block{Type: BlockText, Text: b.text.String()}
+		case BlockThinking:
+			out[i] = Block{Type: BlockThinking, Thinking: b.thinking.String(), Signature: b.signature}
+		case BlockToolCall:
+			out[i] = Block{Type: BlockToolCall, ToolCallID: b.toolID, ToolName: b.toolName, Arguments: b.args.String()}
+		}
+	}
+	return out
 }

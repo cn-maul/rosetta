@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
+	"github.com/cn-maul/rosetta/internal/jsonx"
 	"github.com/cn-maul/rosetta/internal/sse"
 )
 
@@ -88,6 +89,15 @@ func countCacheControl(v any) int {
 		}
 		return n
 	case []any:
+		n := 0
+		for _, item := range t {
+			n += countCacheControl(item)
+		}
+		return n
+	case []map[string]any:
+		// The Anthropic builder types messages, tools and content blocks as
+		// []map[string]any, not []any; without this case the walk stopped at
+		// the payload root and the guard always counted 0.
 		n := 0
 		for _, item := range t {
 			n += countCacheControl(item)
@@ -208,7 +218,7 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 	if stream {
 		payload["stream"] = true
 	}
-	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
+	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, anthropicReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	if n := countCacheControl(payload); n > maxCacheBreakpoints {
@@ -537,7 +547,7 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 			}
 			return nil, apiErr
 		}
-		return decodeAnthropicResponse(body)
+		return decodeAnthropicResponse(body, method, url, requestID(resp.Header))
 	}
 }
 
@@ -580,7 +590,19 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 		}
 		return nil, apiErr
 	}
-	s := newStream(p.streamEvents(resp.Body, method, url, requestID(resp.Header)), nil)
+	reqID := requestID(resp.Header)
+	if bufferedJSONResponse(resp.Header.Get("Content-Type")) {
+		body, rerr := readBody(resp, method, url, bodyLimit)
+		if rerr != nil {
+			return nil, rerr
+		}
+		cr, derr := decodeAnthropicResponse(body, method, url, reqID)
+		if derr != nil {
+			return nil, derr
+		}
+		return bufferedStream(cr), nil
+	}
+	s := newStream(p.streamEvents(resp.Body, method, url, reqID), nil)
 	s.attachCloser(resp.Body)
 	return s, nil
 }
@@ -631,11 +653,19 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 			if err != nil {
 				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
 				// covers a real HTTP truncation (chunked stream cut before the
-				// final zero chunk, gateway timeout). Both mean message_stop
-				// never arrived.
-				if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && !ended {
+				// final zero chunk, gateway timeout).
+				if errors.Is(err, io.ErrUnexpectedEOF) && !ended {
 					ended = true
 					truncated = true
+					return endEvent(), nil
+				}
+				if errors.Is(err, io.EOF) && !ended {
+					ended = true
+					// message_delta (which carries the authoritative
+					// stop_reason) is the semantic terminal; a clean close
+					// after it is complete even without message_stop
+					// (audit B2).
+					truncated = stop == ""
 					return endEvent(), nil
 				}
 				return nil, err
@@ -702,15 +732,15 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 				switch ch.Delta.Type {
 				case "text_delta":
 					if ch.Delta.Text != "" {
-						return &Event{Type: EventTextDelta, Text: ch.Delta.Text}, nil
+						return &Event{Type: EventTextDelta, Text: ch.Delta.Text, BlockIndex: ch.Index}, nil
 					}
 				case "thinking_delta":
 					if ch.Delta.Thinking != "" {
-						return &Event{Type: EventThinkingDelta, Text: ch.Delta.Thinking}, nil
+						return &Event{Type: EventThinkingDelta, Text: ch.Delta.Thinking, BlockIndex: ch.Index}, nil
 					}
 				case "signature_delta":
 					if ch.Delta.Signature != "" {
-						return &Event{Type: EventThinkingDelta, Signature: ch.Delta.Signature}, nil
+						return &Event{Type: EventThinkingDelta, Signature: ch.Delta.Signature, BlockIndex: ch.Index}, nil
 					}
 				case "input_json_delta":
 					if ch.Delta.PartialJSON != "" {
@@ -727,18 +757,19 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 				}
 				if ch.Usage != nil {
 					// message_delta carries the authoritative final usage.
-					// Fold every field it reports (output_tokens always;
-					// input and cache counts when present) over the
-					// message_start baseline so cache accounting that only
-					// arrives at the end is not lost.
-					usage.OutputTokens = ch.Usage.OutputTokens
-					if ch.Usage.InputTokens != 0 {
+					// Fold every field it reports over the message_start
+					// baseline, but only when it is non-zero: an omitted
+					// field must not clobber the baseline with 0.
+					if ch.Usage.OutputTokens.Value != 0 {
+						usage.OutputTokens = ch.Usage.OutputTokens
+					}
+					if ch.Usage.InputTokens.Value != 0 {
 						usage.InputTokens = ch.Usage.InputTokens
 					}
-					if ch.Usage.CacheReadInputTokens != 0 {
+					if ch.Usage.CacheReadInputTokens.Value != 0 {
 						usage.CacheReadInputTokens = ch.Usage.CacheReadInputTokens
 					}
-					if ch.Usage.CacheCreationInputTokens != 0 {
+					if ch.Usage.CacheCreationInputTokens.Value != 0 {
 						usage.CacheCreationInputTokens = ch.Usage.CacheCreationInputTokens
 					}
 					hasUsage = true
@@ -788,7 +819,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 			return nil, parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header))
 		}
 		var list struct {
-			Data []struct {
+			Data *[]struct {
 				ID          string `json:"id"`
 				DisplayName string `json:"display_name"`
 			} `json:"data"`
@@ -798,7 +829,13 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		if err := json.Unmarshal(body, &list); err != nil {
 			return nil, fmt.Errorf("rosetta: decoding model list: %w", err)
 		}
-		for _, m := range list.Data {
+		// Missing/null "data" is a malformed catalog, not an empty one:
+		// treating it as empty would wipe the previously learned remote
+		// layer (audit B11).
+		if list.Data == nil {
+			return nil, fmt.Errorf("rosetta: model list response is missing the required \"data\" field")
+		}
+		for _, m := range *list.Data {
 			if m.ID == "" {
 				continue
 			}
@@ -807,7 +844,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		if !list.HasMore || page > 100 {
 			return models, nil
 		}
-		if next := list.LastID; next != "" && len(list.Data) > 0 {
+		if next := list.LastID; next != "" && len(*list.Data) > 0 {
 			after = next
 			continue
 		}
@@ -834,19 +871,26 @@ func mapAnthropicStop(s string) StopReason {
 // ---- wire types ----
 
 type anthroUsage struct {
-	InputTokens              int64 `json:"input_tokens"`
-	OutputTokens             int64 `json:"output_tokens"`
-	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	InputTokens              jsonx.FlexInt64 `json:"input_tokens"`
+	OutputTokens             jsonx.FlexInt64 `json:"output_tokens"`
+	CacheReadInputTokens     jsonx.FlexInt64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens jsonx.FlexInt64 `json:"cache_creation_input_tokens"`
 }
 
 func (u *anthroUsage) toUsage() Usage {
+	// Anthropic's input_tokens counts only *uncached* prompt tokens; the
+	// cache read/write counts are disjoint. The unified Usage follows OpenAI
+	// semantics where CachedInputTokens ⊆ InputTokens, so fold the cache
+	// counts into the input (and therefore total) baseline.
+	cached := u.CacheReadInputTokens.Value
+	creation := u.CacheCreationInputTokens.Value
+	input := u.InputTokens.Value + cached + creation
 	return Usage{
-		InputTokens:          u.InputTokens,
-		OutputTokens:         u.OutputTokens,
-		TotalTokens:          u.InputTokens + u.OutputTokens,
-		CachedInputTokens:    u.CacheReadInputTokens,
-		CachedCreationTokens: u.CacheCreationInputTokens,
+		InputTokens:          input,
+		OutputTokens:         u.OutputTokens.Value,
+		TotalTokens:          input + u.OutputTokens.Value,
+		CachedInputTokens:    cached,
+		CachedCreationTokens: creation,
 	}
 }
 
@@ -905,13 +949,17 @@ type anthroResponse struct {
 	Error      *anthroErrorBody `json:"error"`
 }
 
-func decodeAnthropicResponse(body []byte) (*ChatResponse, error) {
+func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	var r anthroResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("rosetta: decoding anthropic response: %w", err)
 	}
 	if r.Error != nil {
-		return nil, r.Error.apiError(200)
+		// An in-band 200 error still carries request context, so callers can
+		// log and retry it like a non-2xx failure.
+		apiErr := r.Error.apiError(200)
+		attachRequest(apiErr, rc)
+		return nil, apiErr
 	}
 	out := &ChatResponse{ID: r.ID, Model: r.Model, Raw: truncateBody(body)}
 	for _, blk := range r.Content {

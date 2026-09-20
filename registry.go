@@ -1,6 +1,7 @@
 package rosetta
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,6 +55,10 @@ func (r *Registry) LoadFile(path string) error {
 // parseModelsFile reads and validates a manual model configuration file,
 // marking every entry Known. It does not touch the registry, so callers
 // can merge the result with other manual sources before installing it.
+// Unknown keys and empty ids are hard errors (audit C6): a misspelled field
+// would otherwise decode to its zero value — a mistyped "context_window"
+// silently reading as unlimited — and a key-less entry would vanish without
+// a word.
 func parseModelsFile(path string) ([]ModelInfo, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -62,15 +67,18 @@ func parseModelsFile(path string) ([]ModelInfo, error) {
 	var doc struct {
 		Models []ModelInfo `json:"models"`
 	}
-	if err := json.Unmarshal(data, &doc); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("rosetta: parsing models file %s: %w", path, err)
 	}
 	infos := make([]ModelInfo, 0, len(doc.Models))
-	for _, m := range doc.Models {
-		if m.ID != "" {
-			m.Known = true
-			infos = append(infos, m)
+	for i, m := range doc.Models {
+		if m.ID == "" {
+			return nil, fmt.Errorf("rosetta: models file %s: models[%d] has an empty id", path, i)
 		}
+		m.Known = true
+		infos = append(infos, m)
 	}
 	return infos, nil
 }
@@ -86,7 +94,17 @@ func (r *Registry) SetManual(infos []ModelInfo) error {
 		}
 		m.Known = true
 		normalizeInfo(&m)
-		layer[m.ID] = cloneModelInfo(m)
+		m = cloneModelInfo(m)
+		if prev, ok := layer[m.ID]; ok {
+			// Manual sources sharing an id merge field-by-field rather than
+			// the later entry wholesale replacing the earlier. WithModelsFile
+			// entries are installed before explicit WithModelInfo ones, so the
+			// later (explicit) entry is the high layer: a sparse override must
+			// not zero the file entry's ContextWindow, MaxOutputTokens or
+			// aliases (audit B16).
+			m = cloneModelInfo(mergeInfo(m, prev))
+		}
+		layer[m.ID] = m
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -185,10 +203,11 @@ func mergeInfo(high, low ModelInfo) ModelInfo {
 	if !out.SupportsThinking {
 		out.SupportsThinking = low.SupportsThinking
 	}
-	// Boolean OR merge cannot express "not supported"; DisableThinking is
-	// the explicit revocation knob — a sparse manual entry can thus veto
-	// the remote catalog's SupportsThinking=true.
-	out.DisableThinking = high.DisableThinking || low.DisableThinking
+	// DisableThinking is the explicit revocation knob. A high (manual) entry
+	// that itself asserts SupportsThinking wins over a lower layer's
+	// DisableThinking — a remote/manual-lower claim must not revoke a manual
+	// declaration (audit C23); otherwise the lower layer's disable still holds.
+	out.DisableThinking = high.DisableThinking || (low.DisableThinking && !high.SupportsThinking)
 	if out.DisableThinking {
 		out.SupportsThinking = false
 	}

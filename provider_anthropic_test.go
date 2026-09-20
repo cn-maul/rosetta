@@ -255,7 +255,10 @@ func TestAnthropicDecodeResponse(t *testing.T) {
 	if resp.StopReason != StopLength {
 		t.Fatalf("stop = %s", resp.StopReason)
 	}
-	if resp.Usage.InputTokens != 9 || resp.Usage.CachedInputTokens != 2 || resp.Usage.TotalTokens != 13 {
+	// Anthropic's input_tokens excludes cache; the unified Usage folds the
+	// disjoint cache counts into InputTokens (and therefore TotalTokens) so
+	// CachedInputTokens stays a subset of Input across protocols (audit B9).
+	if resp.Usage.InputTokens != 11 || resp.Usage.CachedInputTokens != 2 || resp.Usage.TotalTokens != 15 {
 		t.Fatalf("usage = %+v", resp.Usage)
 	}
 
@@ -378,5 +381,94 @@ func TestMapAnthropicStop(t *testing.T) {
 		if got := mapAnthropicStop(in); got != want {
 			t.Errorf("mapAnthropicStop(%q) = %s, want %s", in, got, want)
 		}
+	}
+}
+
+// cacheBlocks builds a single user turn carrying n cache breakpoints.
+func cacheBlocks(n int) *ChatRequest {
+	blocks := make([]Block, 0, n)
+	for i := 0; i < n; i++ {
+		blocks = append(blocks, Block{Type: BlockText, Text: "seg", CacheControl: EphemeralCache()})
+	}
+	return &ChatRequest{Model: "claude-x", Messages: []Message{{Role: RoleUser, Blocks: blocks}}}
+}
+
+// B1: the four-breakpoint guard must actually fire on the SDK's own
+// []map[string]any containers (previously dead code that always counted 0).
+func TestAnthropicCacheBreakpointGuardFires(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+
+	if _, err := p.buildPayload(cacheBlocks(4), false, p.plan(cacheBlocks(4))); err != nil {
+		t.Fatalf("4 breakpoints must be allowed: %v", err)
+	}
+	req := cacheBlocks(5)
+	_, err := p.buildPayload(req, false, p.plan(req))
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("5 breakpoints must be rejected, got %v", err)
+	}
+}
+
+// B1: the guard also counts across tools and system segments, not just user
+// blocks.
+func TestAnthropicCacheBreakpointGuardAcrossSections(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+	req := cacheBlocks(3)
+	req.System = "sys"
+	req.Tools = []ToolDefinition{
+		{Name: "a", CacheControl: EphemeralCache()},
+		{Name: "b", CacheControl: EphemeralCache()},
+	}
+	// 3 user + 2 tools = 5 > 4.
+	if _, err := p.buildPayload(req, false, p.plan(req)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("cross-section breakpoints must be rejected, got %v", err)
+	}
+}
+
+// B4/C16: a stringified usage in message_start must not kill the stream, and
+// a message_delta that omits output_tokens must not zero the baseline.
+func TestAnthropicStreamUsageFlexibleAndMerged(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+	body := "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":\"9\",\"output_tokens\":5}}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":\"9\"}}\n\n" +
+		"data: {\"type\":\"message_stop\"}\n\n"
+	next := p.streamEvents(tBody(body))
+	var endEv *Event
+	for {
+		ev, err := next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("stringified usage must not fail the stream: %v", err)
+		}
+		if ev.Type == EventMessageEnd {
+			endEv = ev
+			break
+		}
+	}
+	if endEv == nil || endEv.Usage == nil {
+		t.Fatal("no usage on end event")
+	}
+	// input 9 + cache 0 = 9; output baseline 5 preserved (delta omitted it).
+	if endEv.Usage.OutputTokens != 5 || endEv.Usage.InputTokens != 9 {
+		t.Fatalf("merged usage = %+v, want input 9 output 5", endEv.Usage)
+	}
+}
+
+// C18: an in-band 200 error from the unary decoder keeps request context.
+func TestAnthropicInBandErrorKeepsRequestContext(t *testing.T) {
+	_, err := decodeAnthropicResponse(
+		[]byte(`{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`),
+		"POST", "http://api.test/v1/messages", "req-1")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want APIError", err)
+	}
+	if apiErr.Method != "POST" || apiErr.URL == "" || apiErr.RequestID != "req-1" {
+		t.Fatalf("in-band error lost request context: %+v", apiErr)
 	}
 }

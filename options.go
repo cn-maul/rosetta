@@ -30,6 +30,7 @@ type settings struct {
 	embedEndpoint    string
 	embedAPIKey      string
 	protocol         Protocol
+	protocolSet      bool // WithProtocol supplied explicitly (B12)
 	httpClient       *http.Client
 	timeout          time.Duration
 	maxRetries       int
@@ -92,7 +93,7 @@ func WithEmbeddingAPIKey(v string) Option {
 // WithProtocol forces a wire protocol. When omitted, it resolves from
 // auto-detection (DetectClient), then OpenAI Chat.
 func WithProtocol(p Protocol) Option {
-	return func(s *settings) { s.protocol = p }
+	return func(s *settings) { s.protocol = p; s.protocolSet = true }
 }
 
 // WithModelInfo installs manual model metadata (highest merge priority in

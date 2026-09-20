@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -55,12 +56,31 @@ type Client struct {
 // New returns a Client with production defaults.
 func New() *Client {
 	return &Client{
-		HTTP:       &http.Client{},
+		HTTP:       &http.Client{CheckRedirect: CrossHostSafeRedirect},
 		MaxRetries: 2,
 		Base:       400 * time.Millisecond,
 		Cap:        8 * time.Second,
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+}
+
+// CrossHostSafeRedirect is an http.Client CheckRedirect policy that refuses
+// to follow a redirect to a different host. net/http automatically strips
+// only Authorization/Cookie/Proxy-* on a host change — headers such as
+// Anthropic's x-api-key would otherwise be re-sent verbatim to a third-party
+// host chosen by the remote endpoint, leaking credentials (and, on 307/308
+// replays, the request body). The comparison uses the case-insensitive
+// hostname and ignores the port, so legitimate same-host redirects are
+// allowed while cross-host ones are refused. A caller supplying their own
+// *http.Client keeps any CheckRedirect they set.
+func CrossHostSafeRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return http.ErrUseLastResponse
+	}
+	if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
+		return fmt.Errorf("httpx: refusing cross-host redirect %s -> %s", via[0].URL.Hostname(), req.URL.Hostname())
+	}
+	return nil
 }
 
 // Do executes the call, retrying as configured. It returns the first
@@ -88,14 +108,19 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 			if wait > maxRetryAfter {
 				wait = maxRetryAfter
 			}
-			drain(resp)
 		} else {
 			wait = c.backoff(attempt)
 		}
 		if slept+wait > maxTotalWait {
-			return resp, err // retry budget exhausted; surface the last outcome
+			// Budget exhausted. Return the response with its body still
+			// open so the caller can parse the final provider error instead
+			// of a dead body that would masquerade as a transport failure.
+			return resp, err
 		}
 		slept += wait
+		if resp != nil {
+			drain(resp) // we are retrying: this attempt's body is discarded
+		}
 		c.log("retrying request", "url", call.URL, "attempt", attempt+1, "wait", wait.String())
 		timer := time.NewTimer(wait)
 		select {

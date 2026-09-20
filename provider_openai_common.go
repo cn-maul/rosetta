@@ -36,6 +36,26 @@ func fileDataURL(b Block) (string, error) {
 	return "data:" + media + ";base64," + b.FileData, nil
 }
 
+// rejectionHit reports whether a 400 APIError rejects one of the named
+// optional fields. A provider-supplied error.param is authoritative — it
+// names the rejected field directly — so it is matched first; only when it
+// is absent does the matcher fall back to scanning the message for a field
+// name plus a rejection hint, which keeps unrelated 400s from misfiring.
+// Shared by both OpenAI-family sanitizers so the compat ladder behaves
+// identically whichever field the gateway labels.
+func rejectionHit(apiErr *APIError, names ...string) bool {
+	if param := strings.ToLower(apiErr.Param); param != "" {
+		for _, n := range names {
+			if strings.Contains(param, n) {
+				return true
+			}
+		}
+		return false
+	}
+	low := strings.ToLower(apiErr.Message)
+	return containsAny(low, names...) && containsAny(low, hintWords...)
+}
+
 // openAIHeaders builds the common header set for OpenAI-family calls.
 func openAIHeaders(c *Client, accept string) http.Header {
 	h := http.Header{}
@@ -66,15 +86,21 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
 	}
 	var list struct {
-		Data []struct {
+		Data *[]struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil {
 		return nil, fmt.Errorf("rosetta: decoding model list: %w", err)
 	}
-	models := make([]ModelInfo, 0, len(list.Data))
-	for _, m := range list.Data {
+	// A 200 with no "data" field (or an explicit null) is a malformed catalog,
+	// not an empty one. Treating it as empty would let SetRemote wipe every
+	// previously learned remote entry (audit B11).
+	if list.Data == nil {
+		return nil, fmt.Errorf("rosetta: model list response is missing the required \"data\" field")
+	}
+	models := make([]ModelInfo, 0, len(*list.Data))
+	for _, m := range *list.Data {
 		if m.ID == "" {
 			continue
 		}

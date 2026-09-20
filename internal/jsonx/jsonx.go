@@ -1,3 +1,5 @@
+//go:build !nojsonv2
+
 // Package jsonx provides lenient JSON field decoding for third-party
 // services whose OpenAI compatibility is imperfect: numbers serialized as
 // strings, message content as an array of parts instead of a string,
@@ -7,10 +9,12 @@
 // The decoders are implemented once on top of encoding/json/v2
 // (jsontext token streaming, stable since Go 1.27): values are dispatched
 // on their token kind, so no byte round-trips are needed. The v2
-// UnmarshalJSONFrom entry point is called directly by the v1
-// encoding/json API (v2-backed since Go 1.27); this package therefore
-// requires the default jsonv2 build mode and does not support the
-// GOEXPERIMENT=nojsonv2 opt-out.
+// UnmarshalJSONFrom entry point is only invoked by encoding/json when the
+// jsonv2 experiment is active (the default). Under GOEXPERIMENT=nojsonv2
+// v1 would ignore UnmarshalJSONFrom entirely and silently decode every field
+// to its zero value, so the package is built only when jsonv2 is available:
+// the constraint turns that silent corruption into a clear build failure
+// (audit C12).
 package jsonx
 
 import (
@@ -194,3 +198,44 @@ func (f *ContentString) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 }
 
 func (f ContentString) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }
+
+// FlexJSONString decodes a field that is normally a JSON string holding
+// serialized JSON (OpenAI tool-call "arguments"), but which Anthropic-style
+// gateways sometimes return as a raw object or array. Whatever the shape,
+// the caller gets back the JSON text it expects: a string value yields its
+// contents verbatim (so incremental stream fragments concatenate cleanly),
+// any other value yields its compact re-serialized text, and null yields
+// the empty string. It never fails the surrounding payload.
+type FlexJSONString struct {
+	Value string
+	Set   bool
+}
+
+func (f *FlexJSONString) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	f.Value, f.Set = "", true
+	switch dec.PeekKind() {
+	case '"':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.Value = tok.String()
+	case 'n':
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
+		f.Set = false
+	default:
+		val, err := dec.ReadValue()
+		if err != nil {
+			return err
+		}
+		// ReadValue hands back a well-formed value, so compaction cannot
+		// fail; strip any incidental whitespace to yield canonical text.
+		_ = val.Compact()
+		f.Value = string(val)
+	}
+	return nil
+}
+
+func (f FlexJSONString) MarshalJSON() ([]byte, error) { return json.Marshal(f.Value) }

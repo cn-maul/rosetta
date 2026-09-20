@@ -1,3 +1,5 @@
+//go:build !nojsonv2
+
 package jsonx
 
 import (
@@ -135,6 +137,36 @@ func TestMarshal(t *testing.T) {
 			}
 			if string(b) != tt.want {
 				t.Fatalf("Marshal(%+v) = %s, want %s", tt.f, b, tt.want)
+			}
+		})
+	}
+}
+
+func TestFlexJSONString(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		value string
+		set   bool
+	}{
+		{"string-of-json", `{"a":1}`, `{"a":1}`, true},
+		{"raw-string", `"hello"`, "hello", true},
+		{"object-compacted", `{ "a" : 1 , "b" : [ 2 , 3 ] }`, `{"a":1,"b":[2,3]}`, true},
+		{"array", `[1,2,3]`, `[1,2,3]`, true},
+		{"number", `42`, "42", true},
+		{"null", `null`, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var wrapper struct {
+				F FlexJSONString `json:"f"`
+			}
+			payload := []byte(`{"f":` + tt.input + `}`)
+			if err := json.Unmarshal(payload, &wrapper); err != nil {
+				t.Fatalf("Unmarshal(%s) error: %v", tt.input, err)
+			}
+			if wrapper.F.Value != tt.value || wrapper.F.Set != tt.set {
+				t.Fatalf("got (%q, %v), want (%q, %v)", wrapper.F.Value, wrapper.F.Set, tt.value, tt.set)
 			}
 		})
 	}

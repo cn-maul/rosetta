@@ -245,6 +245,9 @@ func (b Block) validate() error {
 		if b.ImageURL == "" {
 			return fmt.Errorf("image block needs ImageURL")
 		}
+		if err := validateImageURL(b.ImageURL); err != nil {
+			return err
+		}
 	case BlockAudio:
 		if b.AudioData == "" {
 			return fmt.Errorf("audio block has no AudioData")
@@ -271,8 +274,15 @@ func (b Block) validate() error {
 		if b.ToolCallID == "" || b.ToolName == "" {
 			return fmt.Errorf("tool_call block needs ToolCallID and ToolName")
 		}
-		if b.Arguments != "" && !json.Valid([]byte(b.Arguments)) {
-			return fmt.Errorf("tool_call arguments are not valid JSON")
+		// Arguments reach the model as a tool input object; a syntactically
+		// valid but non-object payload (an array or a scalar) is silently
+		// coerced to {} by the adapters, corrupting the tool pairing, so the
+		// object shape is required up front (audit C3).
+		if b.Arguments != "" {
+			trimmed := strings.TrimSpace(b.Arguments)
+			if len(trimmed) == 0 || trimmed[0] != '{' || !json.Valid([]byte(trimmed)) {
+				return fmt.Errorf("tool_call arguments must be a JSON object")
+			}
 		}
 	case BlockToolResult:
 		if b.ToolCallID == "" {
@@ -302,6 +312,33 @@ func (b Block) validate() error {
 		}
 	}
 	return nil
+}
+
+// validateImageURL checks an image reference: an http(s) URL passes through,
+// a data: URL must be well-formed with a non-empty (and, for base64, valid)
+// payload; any other form — file://, ftp://, bare base64, an HTML data URL
+// reaching a non-image sink — is rejected locally instead of being forwarded
+// to the provider's image_url.url field (audit C2).
+func validateImageURL(u string) error {
+	switch {
+	case strings.HasPrefix(u, "http://"), strings.HasPrefix(u, "https://"):
+		return nil
+	case strings.HasPrefix(u, "data:"):
+		rest := strings.TrimPrefix(u, "data:")
+		head, payload, ok := strings.Cut(rest, ",")
+		if !ok {
+			return fmt.Errorf("image data: URL is malformed (missing comma)")
+		}
+		if payload == "" {
+			return fmt.Errorf("image data: URL has an empty payload")
+		}
+		if strings.Contains(head, ";base64") && !isBase64(payload) {
+			return fmt.Errorf("image data: URL payload is not valid base64")
+		}
+		return nil
+	default:
+		return fmt.Errorf("image URL must be an http(s) or data: URL")
+	}
 }
 
 // validateFileData checks inline file content: a data: URL must be

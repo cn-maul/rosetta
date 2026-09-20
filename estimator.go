@@ -61,6 +61,13 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 			case BlockText:
 				total += EstimateTokens(b.Text)
 			case BlockThinking:
+				// The signature is replayed verbatim on every turn, so it
+				// occupies real prompt tokens; ignoring it undercounts a
+				// multi-turn extended-thinking conversation (audit B15).
+				total += EstimateTokens(b.Thinking) + EstimateTokens(b.Signature)
+			case BlockRedactedThinking:
+				// Redacted reasoning rides in the Thinking field as an opaque
+				// base64 payload that is also replayed unchanged.
 				total += EstimateTokens(b.Thinking)
 			case BlockImage:
 				total += est.Image

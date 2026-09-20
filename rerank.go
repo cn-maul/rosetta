@@ -105,13 +105,18 @@ func (c *Client) Rerank(ctx context.Context, req *RerankRequest) (*RerankRespons
 	if err != nil {
 		return nil, err
 	}
-	// WithExtraOverrides(true) lets Extra replace documents; the response
-	// must then be validated against what is actually on the wire.
-	docs := req.Documents
-	if v, ok := payload["documents"].([]string); ok {
-		docs = v
+	// WithExtraOverrides(true) lets Extra replace documents; validate the
+	// reply against what is actually on the wire. Normalize through JSON so
+	// an override of any shape is read, and reject an override to an empty
+	// list rather than skipping the index range check (audit C20).
+	expectedDocs := len(req.Documents)
+	if n, ok := wireSliceLen(payload["documents"]); ok {
+		if n == 0 {
+			return nil, fmt.Errorf("%w: rerank documents is empty after Extra override", ErrInvalidRequest)
+		}
+		expectedDocs = n
 	}
-	resp, err := decodeRerankResponse(body, len(docs))
+	resp, err := decodeRerankResponse(body, expectedDocs)
 	if err != nil {
 		return nil, err
 	}

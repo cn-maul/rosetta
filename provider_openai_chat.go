@@ -126,7 +126,7 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 			pl["stream_options"] = map[string]any{"include_usage": true}
 		}
 	}
-	if err := mergeExtra(pl, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
+	if err := mergeExtra(pl, req.Extra, p.c.settings.extraOverrides, openaiChatReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	return pl, nil
@@ -290,20 +290,9 @@ func (p *openaiChatProvider) sanitize(st *oaSendState, apiErr *APIError, model s
 	if apiErr.Type != "" && !strings.Contains(strings.ToLower(apiErr.Type), "invalid_request") {
 		return false
 	}
-	low := strings.ToLower(apiErr.Message)
-	param := strings.ToLower(apiErr.Param)
-	// hit reports whether apiErr rejects one of the named fields.
-	hit := func(names ...string) bool {
-		if param != "" {
-			for _, n := range names {
-				if strings.Contains(param, n) {
-					return true
-				}
-			}
-			return false
-		}
-		return containsAny(low, names...) && containsAny(low, hintWords...)
-	}
+	// hit reports whether apiErr rejects one of the named fields, using the
+	// shared param-aware matcher.
+	hit := func(names ...string) bool { return rejectionHit(apiErr, names...) }
 	remember := func(fn func()) {
 		p.mu.Lock()
 		defer p.mu.Unlock()
@@ -388,7 +377,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 			}
 			return nil, apiErr
 		}
-		return decodeOpenAIChatResponse(body)
+		return decodeOpenAIChatResponse(body, method, url, resp.Header.Get("X-Request-Id"))
 	}
 }
 
@@ -429,7 +418,22 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		}
 		return nil, apiErr
 	}
-	s := newStream(p.streamEvents(resp.Body, method, url, resp.Header.Get("X-Request-Id")), nil)
+	reqID := resp.Header.Get("X-Request-Id")
+	if bufferedJSONResponse(resp.Header.Get("Content-Type")) {
+		// A 200 that is not event-stream carries a buffered JSON body —
+		// either a complete completion or an error the SSE scanner would
+		// silently drop (audit B3). Decode it and replay as one stream.
+		body, rerr := readBody(resp, method, url, bodyLimit)
+		if rerr != nil {
+			return nil, rerr
+		}
+		cr, derr := decodeOpenAIChatResponse(body, method, url, reqID)
+		if derr != nil {
+			return nil, derr
+		}
+		return bufferedStream(cr), nil
+	}
+	s := newStream(p.streamEvents(resp.Body, method, url, reqID), nil)
 	s.attachCloser(resp.Body)
 	return s, nil
 }
@@ -482,11 +486,19 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 			if err != nil {
 				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
 				// covers a real HTTP truncation (chunked stream cut before the
-				// final zero chunk, gateway timeout). Both mean [DONE] never
-				// arrived.
-				if (errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) && !ended {
+				// final zero chunk, gateway timeout).
+				if errors.Is(err, io.ErrUnexpectedEOF) && !ended {
 					ended = true
 					truncated = true
+					return endEvent(), nil
+				}
+				if errors.Is(err, io.EOF) && !ended {
+					ended = true
+					// A clean close that already carried a semantic terminal
+					// (finish_reason) is a complete response even without the
+					// [DONE] sentinel (audit B2); only an un-terminated stream
+					// counts as truncated.
+					truncated = stop == ""
 					return endEvent(), nil
 				}
 				return nil, err
@@ -534,16 +546,27 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 				if d.Content.Set && d.Content.Value != "" {
 					events = append(events, &Event{Type: EventTextDelta, Text: d.Content.Value})
 				}
-				if d.ReasoningContent != nil && *d.ReasoningContent != "" {
-					events = append(events, &Event{Type: EventThinkingDelta, Text: *d.ReasoningContent})
+				if d.Refusal.Set && d.Refusal.Value != "" {
+					events = append(events, &Event{Type: EventTextDelta, Text: d.Refusal.Value})
+				}
+				if d.ReasoningContent.Set && d.ReasoningContent.Value != "" {
+					events = append(events, &Event{Type: EventThinkingDelta, Text: d.ReasoningContent.Value})
 				}
 				for _, tc := range d.ToolCalls {
 					events = append(events, &Event{
 						Type:           EventToolCall,
 						ToolIndex:      tc.Index,
-						ToolID:         tc.ID,
+						ToolID:         tc.ID.Value,
 						ToolName:       tc.Function.Name,
-						ArgumentsDelta: tc.Function.Arguments,
+						ArgumentsDelta: tc.Function.Arguments.Value,
+					})
+				}
+				if fc := d.FunctionCall; fc != nil && (fc.Name != "" || fc.Arguments.Value != "") {
+					events = append(events, &Event{
+						Type:           EventToolCall,
+						ToolIndex:      0,
+						ToolName:       fc.Name,
+						ArgumentsDelta: fc.Arguments.Value,
 					})
 				}
 				if choice.FinishReason.Set && choice.FinishReason.Value != "" {
@@ -645,13 +668,21 @@ func (u *oaUsage) toUsage() Usage {
 }
 
 type oaToolCall struct {
-	Index    int    `json:"index"`
-	ID       string `json:"id"`
-	Type     string `json:"type"`
+	Index    int              `json:"index"`
+	ID       jsonx.FlexString `json:"id"`
+	Type     string           `json:"type"`
 	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Name      string               `json:"name"`
+		Arguments jsonx.FlexJSONString `json:"arguments"`
 	} `json:"function"`
+}
+
+// oaFunctionCall is the legacy (pre tool_calls) OpenAI shape, still returned
+// by some gateways and Anthropic→OpenAI translators as
+// {"name","arguments"} with finish_reason "function_call".
+type oaFunctionCall struct {
+	Name      string               `json:"name"`
+	Arguments jsonx.FlexJSONString `json:"arguments"`
 }
 
 type oaChunk struct {
@@ -662,8 +693,10 @@ type oaChunk struct {
 		Delta struct {
 			Role             string              `json:"role"`
 			Content          jsonx.ContentString `json:"content"`
-			ReasoningContent *string             `json:"reasoning_content"`
+			ReasoningContent jsonx.ContentString `json:"reasoning_content"`
+			Refusal          jsonx.FlexString    `json:"refusal"`
 			ToolCalls        []oaToolCall        `json:"tool_calls"`
+			FunctionCall     *oaFunctionCall     `json:"function_call"`
 		} `json:"delta"`
 		FinishReason jsonx.FlexString `json:"finish_reason"`
 	} `json:"choices"`
@@ -677,8 +710,10 @@ type oaResponse struct {
 	Choices []struct {
 		Message struct {
 			Content          jsonx.ContentString `json:"content"`
-			ReasoningContent *string             `json:"reasoning_content"`
+			ReasoningContent jsonx.ContentString `json:"reasoning_content"`
+			Refusal          jsonx.FlexString    `json:"refusal"`
 			ToolCalls        []oaToolCall        `json:"tool_calls"`
+			FunctionCall     *oaFunctionCall     `json:"function_call"`
 		} `json:"message"`
 		FinishReason jsonx.FlexString `json:"finish_reason"`
 	} `json:"choices"`
@@ -686,36 +721,60 @@ type oaResponse struct {
 	Error *oaErrorBody `json:"error"`
 }
 
-func decodeOpenAIChatResponse(body []byte) (*ChatResponse, error) {
+func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	var r oaResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("rosetta: decoding openai-chat response: %w", err)
 	}
 	if r.Error != nil {
-		return nil, r.Error.apiError(200)
+		apiErr := r.Error.apiError(200)
+		attachRequest(apiErr, rc)
+		return nil, apiErr
 	}
-	if len(r.Choices) == 0 {
-		return nil, errors.New("rosetta: openai-chat response contains no choices")
-	}
-	choice := &r.Choices[0]
 	out := &ChatResponse{
 		ID:    r.ID,
 		Model: r.Model,
 		Raw:   truncateBody(body),
 	}
+	if r.Usage != nil {
+		out.Usage = r.Usage.toUsage()
+	}
+	if len(r.Choices) == 0 {
+		// A 200 with no choices is unusual but not an error: some gateways
+		// return it for filtered or empty completions. Hand back a valid
+		// (empty) response that keeps the billing usage instead of failing
+		// the whole call with an untyped error.
+		out.StopReason = StopEnd
+		return out, nil
+	}
+	choice := &r.Choices[0]
 	msg := &choice.Message
-	if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
-		out.Content = append(out.Content, Block{Type: BlockThinking, Thinking: *msg.ReasoningContent})
+	if msg.ReasoningContent.Set && msg.ReasoningContent.Value != "" {
+		out.Content = append(out.Content, Block{Type: BlockThinking, Thinking: msg.ReasoningContent.Value})
 	}
 	if msg.Content.Set && msg.Content.Value != "" {
 		out.Content = append(out.Content, Block{Type: BlockText, Text: msg.Content.Value})
 	}
+	// A refusal arrives with content null; surface its text so the answer
+	// does not silently vanish.
+	if !msg.Content.Set && msg.Refusal.Set && msg.Refusal.Value != "" {
+		out.Content = append(out.Content, Block{Type: BlockText, Text: msg.Refusal.Value})
+	}
 	for _, tc := range msg.ToolCalls {
 		out.Content = append(out.Content, Block{
 			Type:       BlockToolCall,
-			ToolCallID: tc.ID,
+			ToolCallID: tc.ID.Value,
 			ToolName:   tc.Function.Name,
-			Arguments:  tc.Function.Arguments,
+			Arguments:  tc.Function.Arguments.Value,
+		})
+	}
+	// Legacy function_call folds into the unified tool-call block (no id:
+	// the shape predates tool call ids).
+	if fc := msg.FunctionCall; fc != nil && (fc.Name != "" || fc.Arguments.Value != "") {
+		out.Content = append(out.Content, Block{
+			Type:      BlockToolCall,
+			ToolName:  fc.Name,
+			Arguments: fc.Arguments.Value,
 		})
 	}
 	if choice.FinishReason.Set && choice.FinishReason.Value != "" {
@@ -726,9 +785,6 @@ func decodeOpenAIChatResponse(body []byte) (*ChatResponse, error) {
 	// for truncation detection instead).
 	if out.StopReason == "" {
 		out.StopReason = StopEnd
-	}
-	if r.Usage != nil {
-		out.Usage = r.Usage.toUsage()
 	}
 	return out, nil
 }

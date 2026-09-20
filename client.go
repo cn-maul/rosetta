@@ -46,6 +46,14 @@ func buildSettings(opts []Option) (*settings, error) {
 	default:
 		return nil, fmt.Errorf("rosetta: unknown protocol %q", st.protocol)
 	}
+	// The output-cap field name is pinned for OpenAI Chat only; a typo here
+	// would otherwise silently drop the cap (unbounded cost/latency), so it
+	// is constrained to the two real spellings (audit C5).
+	switch st.maxTokensField {
+	case "", "max_tokens", "max_completion_tokens":
+	default:
+		return nil, fmt.Errorf("rosetta: invalid WithMaxTokensField %q (use \"max_tokens\" or \"max_completion_tokens\")", st.maxTokensField)
+	}
 	if st.endpoint == "" {
 		st.endpoint = defaultEndpoint(st.protocol)
 	}
@@ -76,7 +84,13 @@ func NewClient(opts ...Option) (*Client, error) {
 
 	hx := httpx.New()
 	if st.httpClient != nil {
-		hx.HTTP = st.httpClient
+		// Copy so the cross-host redirect guard (A1) does not mutate the
+		// caller's client, and honor any CheckRedirect they already set.
+		guarded := *st.httpClient
+		if guarded.CheckRedirect == nil {
+			guarded.CheckRedirect = httpx.CrossHostSafeRedirect
+		}
+		hx.HTTP = &guarded
 	}
 	hx.MaxRetries = st.maxRetries
 	if st.retryBase > 0 {
@@ -162,8 +176,13 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, erro
 	}
 	sc, ok := stream.(*streamCore)
 	if !ok {
+		// Unreachable today: every provider returns a *streamCore. A future
+		// provider that did not would leak its HTTP context and body here —
+		// cancel() kills the context and the caller has no closer — so fail
+		// loudly instead (audit C11).
+		_ = stream.Close()
 		cancel()
-		return stream, nil
+		return nil, fmt.Errorf("%w: provider returned an unmanaged stream", ErrNotSupported)
 	}
 	sc.attachCancel(cancel)
 	sc.onEnd = func(u Usage, err error) {
@@ -299,14 +318,15 @@ func (c *Client) checkContext(req *ChatRequest) error {
 	}
 	in := req.estimateInputTokens(c.settings.estimates)
 	out := c.effectiveMaxOutput(req)
-	if in <= mi.ContextWindow && (out <= 0 || in+out <= mi.ContextWindow) {
-		return nil
+	// Wrap-free overrun test: `in+out <= window` overflows to a negative when
+	// out is near MaxInt, wrongly reading a huge request as "fits" (audit B14).
+	if in > mi.ContextWindow || (out > 0 && out > mi.ContextWindow-in) {
+		if c.settings.strictContext {
+			return contextTooLongError(req.Model, in, out, mi.ContextWindow)
+		}
+		c.settings.logger.Warn("rosetta: prompt may exceed model context window",
+			"model", req.Model, "estimated_input", in, "max_output", out, "context_window", mi.ContextWindow)
 	}
-	if c.settings.strictContext {
-		return contextTooLongError(req.Model, in, out, mi.ContextWindow)
-	}
-	c.settings.logger.Warn("rosetta: prompt may exceed model context window",
-		"model", req.Model, "estimated_input", in, "max_output", out, "context_window", mi.ContextWindow)
 	return nil
 }
 

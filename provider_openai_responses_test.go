@@ -419,3 +419,129 @@ func TestResponsesListModelsE2E(t *testing.T) {
 		}
 	})
 }
+
+// collectStream drains p.streamEvents into accumulated blocks/args, mirroring
+// how Stream folds events.
+func collectStream(t *testing.T, p *openaiResponsesProvider, body string) *ChatResponse {
+	t.Helper()
+	core := &streamCore{}
+	next := p.streamEvents(tBody(body))
+	for {
+		ev, err := next()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("stream error: %v", err)
+		}
+		core.apply(ev)
+	}
+	return core.Partial()
+}
+
+func responsesProvider(t *testing.T) *openaiResponsesProvider {
+	t.Helper()
+	c := newTestClient(t, WithProtocol(ProtoOpenAIResponses))
+	return c.provider.(*openaiResponsesProvider)
+}
+
+// A3: the Responses error event nests details under "error".
+func TestResponsesStreamNestedErrorEnvelope(t *testing.T) {
+	p := responsesProvider(t)
+	next := p.streamEvents(tBody(
+		"data: {\"type\":\"error\",\"error\":{\"message\":\"Rate limit exceeded\",\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\"}}\n\n"))
+	_, err := next()
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v, want APIError", err)
+	}
+	if apiErr.Message != "Rate limit exceeded" || apiErr.Code != "rate_limit_exceeded" || apiErr.Type != "rate_limit_error" {
+		t.Fatalf("nested error lost detail: %+v", apiErr)
+	}
+}
+
+// B5 #1: a function_call announced then finalized without any argument
+// delta must still carry its arguments.
+func TestResponsesStreamDoneFillsMissingArgs(t *testing.T) {
+	p := responsesProvider(t)
+	body := "data: {\"type\":\"response.output_item.added\",\"output_index\":3,\"item\":{\"type\":\"function_call\",\"call_id\":\"c3\",\"name\":\"fn\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":3,\"item\":{\"type\":\"function_call\",\"call_id\":\"c3\",\"name\":\"fn\",\"arguments\":\"{\\\"a\\\":1}\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	resp := collectStream(t, p, body)
+	if len(resp.Content) != 1 || resp.Content[0].Type != BlockToolCall {
+		t.Fatalf("content = %+v", resp.Content)
+	}
+	if resp.Content[0].Arguments != `{"a":1}` || resp.Content[0].ToolCallID != "c3" {
+		t.Fatalf("done arguments not filled: %+v", resp.Content[0])
+	}
+}
+
+// B5 #1 (no duplication): when deltas already streamed the arguments, the
+// finalizing done must not append them a second time.
+func TestResponsesStreamDoneDoesNotDuplicateArgs(t *testing.T) {
+	p := responsesProvider(t)
+	body := "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c0\",\"name\":\"fn\"}}\n\n" +
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"a\\\":1}\"}\n\n" +
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c0\",\"name\":\"fn\",\"arguments\":\"{\\\"a\\\":1}\"}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	resp := collectStream(t, p, body)
+	if len(resp.Content) != 1 || resp.Content[0].Arguments != `{"a":1}` {
+		t.Fatalf("arguments duplicated or lost: %+v", resp.Content)
+	}
+}
+
+// B5 #2: a message finalized only via output_item.done (no text delta) must
+// still produce its text.
+func TestResponsesStreamDoneMessageText(t *testing.T) {
+	p := responsesProvider(t)
+	body := "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	resp := collectStream(t, p, body)
+	if resp.Text() != "hello" {
+		t.Fatalf("done-only message text lost: %q", resp.Text())
+	}
+}
+
+// B5 #2 (no duplication): text deltas suppress the finalizing done content.
+func TestResponsesStreamDoneMessageTextNoDup(t *testing.T) {
+	p := responsesProvider(t)
+	body := "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"hello\"}\n\n" +
+		"data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	resp := collectStream(t, p, body)
+	if resp.Text() != "hello" {
+		t.Fatalf("done duplicated streamed text: %q", resp.Text())
+	}
+}
+
+// B5 #3: response.text.delta alias is honored.
+func TestResponsesStreamTextDeltaAlias(t *testing.T) {
+	p := responsesProvider(t)
+	body := "data: {\"type\":\"response.text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	resp := collectStream(t, p, body)
+	if resp.Text() != "hi" {
+		t.Fatalf("text.delta alias ignored: %q", resp.Text())
+	}
+}
+
+// B5 #4: argument deltas keyed only by item_id coalesce onto the announced
+// call even when output_index is omitted (parallel calls).
+func TestResponsesStreamArgDeltaItemIDKeying(t *testing.T) {
+	p := responsesProvider(t)
+	body := "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item_id\":\"A\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f1\"}}\n\n" +
+		"data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item_id\":\"B\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c2\",\"name\":\"f2\"}}\n\n" +
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"B\",\"delta\":\"{\\\"x\\\":1}\"}\n\n" +
+		"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"A\",\"delta\":\"{\\\"y\\\":2}\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+	resp := collectStream(t, p, body)
+	byName := map[string]string{}
+	for _, b := range resp.Content {
+		if b.Type == BlockToolCall {
+			byName[b.ToolName] = b.Arguments
+		}
+	}
+	if byName["f1"] != `{"y":2}` || byName["f2"] != `{"x":1}` {
+		t.Fatalf("item_id keying mismatched args: %+v", resp.Content)
+	}
+}

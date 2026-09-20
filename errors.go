@@ -1,6 +1,7 @@
 package rosetta
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,11 @@ var (
 	// a clean finish. The partial response stays available via
 	// Stream.Partial; match with errors.Is.
 	ErrStreamTruncated = errors.New("rosetta: stream truncated")
+	// ErrStreamOverflow is returned when a single stream's accumulated
+	// content exceeds the safety caps (total bytes or distinct blocks), which
+	// bounds memory against a hostile or buggy provider. The partial response
+	// stays available via Stream.Partial; match with errors.Is.
+	ErrStreamOverflow = errors.New("rosetta: stream accumulation exceeded safety limits")
 )
 
 // TransportError wraps a lower-level network failure (DNS, connect, TLS,
@@ -49,7 +55,7 @@ type TransportError struct {
 }
 
 func (e *TransportError) Error() string {
-	return fmt.Sprintf("rosetta: transport error during %s %s: %v", e.Method, e.URL, e.Err)
+	return fmt.Sprintf("rosetta: transport error during %s %s: %v", e.Method, safeURL(e.URL), e.Err)
 }
 
 func (e *TransportError) Unwrap() error { return e.Err }
@@ -75,7 +81,7 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "rosetta: %s %s -> %d", e.Method, e.URL, e.StatusCode)
+	fmt.Fprintf(&b, "rosetta: %s %s -> %d", e.Method, safeURL(e.URL), e.StatusCode)
 	// Type/Code/Message are taken verbatim from the provider body, which can
 	// echo the caller's key or prompt; mask credential patterns before the
 	// string reaches any log.
@@ -95,6 +101,24 @@ func (e *APIError) Error() string {
 // transport wraps a network error with request context.
 func transport(err error, method, url string) error {
 	return &TransportError{Method: method, URL: url, Err: err}
+}
+
+// attachRequest fills an APIError's request context from a
+// (method, url, requestID) triple, taken as loose strings so the unary
+// decoders can accept it optionally without breaking zero-arg callers.
+func attachRequest(e *APIError, rc []string) {
+	if e == nil {
+		return
+	}
+	if len(rc) > 0 {
+		e.Method = rc[0]
+	}
+	if len(rc) > 1 {
+		e.URL = rc[1]
+	}
+	if len(rc) > 2 {
+		e.RequestID = rc[2]
+	}
 }
 
 // Response body caps, unified across adapters. A single tight cap rejects
@@ -124,6 +148,20 @@ func readBody(resp *http.Response, method, url string, limit int64) ([]byte, err
 		return nil, transport(err, method, url)
 	}
 	return body, nil
+}
+
+// bufferedJSONResponse reports whether a 2xx stream response carries a
+// buffered JSON body rather than an event stream: the Content-Type is
+// present but is not text/event-stream. An absent Content-Type is treated as
+// (legacy) SSE, so streams from servers that omit the header are not
+// misrouted. A non-event-stream 2xx to a stream:true request holds either a
+// complete completion or an error the SSE scanner would silently drop
+// (audit B3).
+func bufferedJSONResponse(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	return !strings.Contains(strings.ToLower(contentType), "text/event-stream")
 }
 
 // retryableStatus reports whether an HTTP status is worth retrying. The
@@ -177,26 +215,39 @@ func safeTruncateBody(body []byte) json.RawMessage {
 
 // secretRe matches common credential shapes a provider might echo back into
 // an error body or message: OpenAI/Anthropic "sk-...", Google "AIza...",
+// AWS "AKIA...", GitHub "ghp_/gho_/ghs_/ghu_/ghr_...", Slack "xox...",
 // and JWT "eyJ<header>.<payload>.<sig>" tokens. Matches are masked before
 // anything reaches logs or error strings.
-var secretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}`)
+var secretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}`)
 
 // maskSecrets replaces credential patterns in s with a fixed marker.
 func maskSecrets(s string) string { return secretRe.ReplaceAllString(s, "***") }
 
+// safeURL renders a request URL for an error string: displayEndpoint strips
+// userinfo/query/fragment, and maskSecrets catches path-embedded credentials
+// (e.g. a proxy routing key as …/proxy/sk-ant-…) that survive normalization
+// (audit C9).
+func safeURL(u string) string { return maskSecrets(displayEndpoint(u)) }
+
 // redactJSON masks sensitive values in a valid-JSON body while keeping it
-// valid JSON: sensitive-keyed string values become "[redacted]" and
-// key-material patterns are masked everywhere. Best effort — on any
-// structural surprise the original (truncated) body is returned.
+// valid JSON: sensitive-keyed values become "[redacted]" and key-material
+// patterns are masked everywhere. It decodes numbers with UseNumber so large
+// integers and unusual exponents round-trip byte-for-byte instead of being
+// corrupted through float64. On any decode/marshal surprise it still masks
+// credential patterns over the original bytes rather than returning them
+// untouched — a value that json.Valid accepts but the decoder rejects (an
+// out-of-range number literal) must never switch redaction off.
 func redactJSON(raw json.RawMessage) json.RawMessage {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return raw
+	if err := dec.Decode(&v); err != nil {
+		return secretRe.ReplaceAll(raw, []byte("***"))
 	}
 	redactValue(v)
 	out, err := json.Marshal(v)
 	if err != nil {
-		return raw
+		return secretRe.ReplaceAll(raw, []byte("***"))
 	}
 	return secretRe.ReplaceAll(out, []byte("***"))
 }
@@ -205,7 +256,9 @@ func redactValue(v any) {
 	switch t := v.(type) {
 	case map[string]any:
 		for k, val := range t {
-			if _, ok := val.(string); ok && isSensitiveKey(k) {
+			// Redact any value type under a sensitive key: credentials
+			// smuggled as a number or nested object must not survive.
+			if isSensitiveKey(k) {
 				t[k] = "[redacted]"
 				continue
 			}
@@ -223,9 +276,11 @@ func isSensitiveKey(k string) bool {
 	low = strings.ReplaceAll(low, "-", "")
 	low = strings.ReplaceAll(low, "_", "")
 	switch {
-	case strings.Contains(low, "apikey"), strings.Contains(low, "secret"),
+	case strings.Contains(low, "key"), strings.Contains(low, "secret"),
 		strings.Contains(low, "token"), strings.Contains(low, "password"),
-		strings.Contains(low, "authorization"), strings.Contains(low, "credential"):
+		strings.Contains(low, "authorization"), strings.Contains(low, "credential"),
+		strings.Contains(low, "bearer"), strings.Contains(low, "access"),
+		strings.Contains(low, "session"), strings.Contains(low, "cookie"):
 		return true
 	}
 	return false

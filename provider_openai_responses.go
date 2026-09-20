@@ -80,7 +80,6 @@ func (p *openaiResponsesProvider) sanitize(st *respSendState, apiErr *APIError, 
 	if isValueRejection(apiErr) {
 		return false
 	}
-	low := strings.ToLower(apiErr.Message)
 	if apiErr.Type != "" && !strings.Contains(strings.ToLower(apiErr.Type), "invalid_request") {
 		return false
 	}
@@ -101,12 +100,12 @@ func (p *openaiResponsesProvider) sanitize(st *respSendState, apiErr *APIError, 
 		}
 	}
 	switch {
-	case st.reasoning && containsAny(low, "reasoning") && containsAny(low, hintWords...):
+	case st.reasoning && rejectionHit(apiErr, "reasoning"):
 		st.reasoning = false
 		remember("reasoning", true)
 		p.c.settings.logger.Debug("responses: upstream rejected the reasoning field; dropping it", "model", model)
 		return true
-	case st.maxOutput && containsAny(low, "max_output_tokens") && containsAny(low, hintWords...):
+	case st.maxOutput && rejectionHit(apiErr, "max_output_tokens"):
 		st.maxOutput = false
 		remember("max_output", true)
 		p.c.settings.logger.Debug("responses: upstream rejected max_output_tokens; letting the provider decide the cap", "model", model)
@@ -148,7 +147,7 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 			}
 			return nil, apiErr
 		}
-		return decodeResponsesResponse(body)
+		return decodeResponsesResponse(body, method, url, resp.Header.Get("X-Request-Id"))
 	}
 }
 
@@ -185,7 +184,19 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 			}
 			return nil, apiErr
 		}
-		s := newStream(p.streamEvents(resp.Body, method, url, resp.Header.Get("X-Request-Id")), nil)
+		reqID := resp.Header.Get("X-Request-Id")
+		if bufferedJSONResponse(resp.Header.Get("Content-Type")) {
+			body, rerr := readBody(resp, method, url, bodyLimit)
+			if rerr != nil {
+				return nil, rerr
+			}
+			cr, derr := decodeResponsesResponse(body, method, url, reqID)
+			if derr != nil {
+				return nil, derr
+			}
+			return bufferedStream(cr), nil
+		}
+		s := newStream(p.streamEvents(resp.Body, method, url, reqID), nil)
 		s.attachCloser(resp.Body)
 		return s, nil
 	}
@@ -215,12 +226,19 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st
 			payload["max_output_tokens"] = max
 		}
 	}
-	if req.Thinking != nil {
-		if st.reasoning {
-			if eff := req.effort(); eff != EffortUnset {
-				payload["reasoning"] = map[string]any{"effort": string(eff)}
-			}
+	// Sampling params (temperature/top_p) are only rejected when a
+	// reasoning config actually rides the wire; gate the drop on that,
+	// not merely on the caller having set Thinking (a sticky reasoning
+	// drop or an unset effort sends no reasoning, so there is no
+	// conflict).
+	emitReasoning := false
+	if req.Thinking != nil && st.reasoning {
+		if eff := req.effort(); eff != EffortUnset {
+			payload["reasoning"] = map[string]any{"effort": string(eff)}
+			emitReasoning = true
 		}
+	}
+	if emitReasoning {
 		if req.Temperature != nil {
 			p.c.settings.logger.Debug("responses: dropping temperature for a reasoning request")
 		}
@@ -257,7 +275,7 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st
 	if stream {
 		payload["stream"] = true
 	}
-	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, chatReservedPayloadKeys); err != nil {
+	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, openaiResponsesReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	return payload, nil
@@ -397,8 +415,69 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 		// announced guards output_item.added vs output_item.done so a
 		// minimal emitter that skips the incremental events still has its
 		// finalized function_call delivered once.
-		announced map[int]bool
+		announced     = map[int]bool{}
+		argDeltaSeen  = map[int]bool{}
+		textDeltaSeen = map[int]bool{}
+		// toolIdxByID keys function-call events by item_id so argument
+		// deltas coalesce even when output_index is absent or reused.
+		toolIdxByID map[string]int
+		// nextToolIdx allocates a fresh unified index when an emitter omits
+		// output_index; lastToolIdx tracks the most recent call for orphan
+		// argument deltas.
+		nextToolIdx int
+		lastToolIdx = -1
 	)
+	// resolveToolIdx returns the unified ToolIndex for a function-call item
+	// announcement, preferring a registered item_id, then an explicit
+	// output_index, and finally allocating the next slot when the emitter
+	// omits both.
+	resolveToolIdx := func(itemID string, outIdx *int) int {
+		if itemID != "" {
+			if i, ok := toolIdxByID[itemID]; ok {
+				return i
+			}
+		}
+		idx := -1
+		if outIdx != nil {
+			idx = *outIdx
+		}
+		if idx == -1 {
+			idx = nextToolIdx
+			nextToolIdx++
+		} else if idx >= nextToolIdx {
+			nextToolIdx = idx + 1
+		}
+		if itemID != "" {
+			if toolIdxByID == nil {
+				toolIdxByID = map[string]int{}
+			}
+			toolIdxByID[itemID] = idx
+		}
+		return idx
+	}
+	// deltaToolIdx maps an argument delta to its call. Deltas must attach to
+	// an already-announced call, so it never allocates: item_id first, then
+	// output_index, then the most recent call.
+	deltaToolIdx := func(itemID string, outIdx *int) int {
+		if itemID != "" {
+			if i, ok := toolIdxByID[itemID]; ok {
+				return i
+			}
+		}
+		if outIdx != nil {
+			if itemID != "" {
+				if toolIdxByID == nil {
+					toolIdxByID = map[string]int{}
+				}
+				toolIdxByID[itemID] = *outIdx
+			}
+			return *outIdx
+		}
+		if lastToolIdx >= 0 {
+			return lastToolIdx
+		}
+		return 0
+	}
 	endEvent := func() *Event {
 		// A completed turn that requested a tool call ends as tool_use, not
 		// end_turn: the Responses API reports status "completed" even when
@@ -469,39 +548,80 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 			case "response.output_item.added":
 				if ev.Item != nil && ev.Item.Type == "function_call" {
 					sawToolCall = true
-					if announced == nil {
-						announced = map[int]bool{}
-					}
-					announced[ev.OutputIndex] = true
+					idx := resolveToolIdx(ev.ItemID, ev.OutputIndex)
+					announced[idx] = true
+					lastToolIdx = idx
 					return &Event{
 						Type:      EventToolCall,
-						ToolIndex: ev.OutputIndex,
+						ToolIndex: idx,
 						ToolID:    ev.Item.CallID,
 						ToolName:  ev.Item.Name,
 					}, nil
 				}
 			case "response.output_item.done":
-				// The finalized item is normally assembled from the earlier
-				// added + argument-delta events. Only when a minimal emitter
-				// skipped those do we surface the complete function_call here
-				// so its id/name/arguments are never lost.
-				if ev.Item != nil && ev.Item.Type == "function_call" {
+				if ev.Item == nil {
+					break
+				}
+				switch ev.Item.Type {
+				case "function_call":
 					sawToolCall = true
-					if !announced[ev.OutputIndex] {
-						if announced == nil {
-							announced = map[int]bool{}
-						}
-						announced[ev.OutputIndex] = true
+					idx := resolveToolIdx(ev.ItemID, ev.OutputIndex)
+					if !announced[idx] {
+						announced[idx] = true
+						lastToolIdx = idx
 						return &Event{
 							Type:           EventToolCall,
-							ToolIndex:      ev.OutputIndex,
+							ToolIndex:      idx,
 							ToolID:         ev.Item.CallID,
 							ToolName:       ev.Item.Name,
-							ArgumentsDelta: ev.Item.Arguments,
+							ArgumentsDelta: ev.Item.Arguments.Value,
 						}, nil
 					}
+					// Announced earlier but no argument delta ever arrived:
+					// fill in the finalized arguments (the block's args are
+					// still empty, so this completes rather than corrupts).
+					if !argDeltaSeen[idx] && ev.Item.Arguments.Value != "" {
+						return &Event{
+							Type:           EventToolCall,
+							ToolIndex:      idx,
+							ToolID:         ev.Item.CallID,
+							ToolName:       ev.Item.Name,
+							ArgumentsDelta: ev.Item.Arguments.Value,
+						}, nil
+					}
+				case "message":
+					// A minimal emitter may finalize a message only here,
+					// with no output_text.delta events; surface its text so
+					// the reply is never lost.
+					ti := 0
+					if ev.OutputIndex != nil {
+						ti = *ev.OutputIndex
+					}
+					if !textDeltaSeen[ti] {
+						var sb strings.Builder
+						for _, part := range ev.Item.Content {
+							if part.Type == "output_text" && part.Text != "" {
+								if sb.Len() > 0 {
+									sb.WriteString("\n")
+								}
+								sb.WriteString(part.Text)
+							}
+						}
+						if sb.Len() > 0 {
+							return &Event{Type: EventTextDelta, Text: sb.String()}, nil
+						}
+					}
 				}
-			case "response.output_text.delta":
+			case "response.output_text.delta", "response.text.delta":
+				if ev.Delta != "" {
+					ti := 0
+					if ev.OutputIndex != nil {
+						ti = *ev.OutputIndex
+					}
+					textDeltaSeen[ti] = true
+					return &Event{Type: EventTextDelta, Text: ev.Delta}, nil
+				}
+			case "response.refusal.delta":
 				if ev.Delta != "" {
 					return &Event{Type: EventTextDelta, Text: ev.Delta}, nil
 				}
@@ -512,9 +632,11 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 			case "response.function_call_arguments.delta":
 				if ev.Delta != "" {
 					sawToolCall = true
+					idx := deltaToolIdx(ev.ItemID, ev.OutputIndex)
+					argDeltaSeen[idx] = true
 					return &Event{
 						Type:           EventToolCall,
-						ToolIndex:      ev.OutputIndex,
+						ToolIndex:      idx,
 						ArgumentsDelta: ev.Delta,
 					}, nil
 				}
@@ -550,7 +672,15 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				}
 				return nil, &APIError{StatusCode: 200, Message: "response.failed", Type: "api_error", Method: method, URL: url, RequestID: requestID}
 			case "error":
-				apiErr := (&oaErrorBody{Message: ev.Message, Type: "api_error", Code: json.RawMessage(maybeQuote(ev.Code))}).apiError(200)
+				// The Responses error envelope nests details under "error"
+				// ({"type":"error","error":{...}}); read that first and fall
+				// back to the flat shape only for non-conforming emitters.
+				var apiErr *APIError
+				if ev.Error != nil {
+					apiErr = ev.Error.apiError(200)
+				} else {
+					apiErr = (&oaErrorBody{Message: ev.Message, Type: "api_error", Code: json.RawMessage(maybeQuote(ev.Code))}).apiError(200)
+				}
 				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
 				return nil, apiErr
 			default:
@@ -622,11 +752,11 @@ func (u *oaRespUsage) toUsage() Usage {
 }
 
 type oaRespOutputItem struct {
-	Type      string `json:"type"`
-	Role      string `json:"role"`
-	CallID    string `json:"call_id"`
-	Name      string `json:"name"`
-	Arguments string `json:"arguments"`
+	Type      string               `json:"type"`
+	Role      string               `json:"role"`
+	CallID    string               `json:"call_id"`
+	Name      string               `json:"name"`
+	Arguments jsonx.FlexJSONString `json:"arguments"`
 	Content   []struct {
 		Type string `json:"type"` // output_text | reasoning_text
 		Text string `json:"text"`
@@ -657,27 +787,35 @@ func (r *oaRespResponse) IncompleteReason() string {
 }
 
 type oaRespEvent struct {
-	Type        string `json:"type"`
-	OutputIndex int    `json:"output_index"`
-	Delta       string `json:"delta"`
-	Code        string `json:"code"`
-	Message     string `json:"message"`
+	Type        string       `json:"type"`
+	ItemID      string       `json:"item_id"`
+	OutputIndex *int         `json:"output_index"`
+	Delta       string       `json:"delta"`
+	Code        string       `json:"code"`
+	Message     string       `json:"message"`
+	Error       *oaErrorBody `json:"error"`
 	Item        *struct {
-		Type      string `json:"type"`
-		CallID    string `json:"call_id"`
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
+		Type      string               `json:"type"`
+		CallID    string               `json:"call_id"`
+		Name      string               `json:"name"`
+		Arguments jsonx.FlexJSONString `json:"arguments"`
+		Content   []struct {
+			Type string `json:"type"` // output_text
+			Text string `json:"text"`
+		} `json:"content"`
 	} `json:"item"`
 	Response *oaRespResponse `json:"response"`
 }
 
-func decodeResponsesResponse(body []byte) (*ChatResponse, error) {
+func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	var r oaRespResponse
 	if err := json.Unmarshal(body, &r); err != nil {
 		return nil, fmt.Errorf("rosetta: decoding responses payload: %w", err)
 	}
 	if r.Error != nil {
-		return nil, r.Error.apiError(200)
+		apiErr := r.Error.apiError(200)
+		attachRequest(apiErr, rc)
+		return nil, apiErr
 	}
 	out := &ChatResponse{ID: r.ID, Model: r.Model, Raw: truncateBody(body)}
 	var sawToolCall bool
@@ -716,7 +854,7 @@ func decodeResponsesResponse(body []byte) (*ChatResponse, error) {
 				Type:       BlockToolCall,
 				ToolCallID: item.CallID,
 				ToolName:   item.Name,
-				Arguments:  item.Arguments,
+				Arguments:  item.Arguments.Value,
 			})
 		}
 	}

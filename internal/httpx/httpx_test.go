@@ -3,6 +3,7 @@ package httpx
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -259,4 +260,58 @@ func TestRetryStatus(t *testing.T) {
 			t.Errorf("RetryableStatus(%d) = true, want false", code)
 		}
 	}
+}
+
+// A1: the SDK-owned default client must install the cross-host redirect guard.
+func TestNewInstallsRedirectGuard(t *testing.T) {
+	if New().HTTP.CheckRedirect == nil {
+		t.Fatal("New() must install a CheckRedirect guard so x-api-key is not leaked on cross-host redirects")
+	}
+}
+
+func TestCrossHostSafeRedirect(t *testing.T) {
+	req := func(hostport string) *http.Request {
+		return httptest.NewRequest(http.MethodGet, "http://"+hostport+"/x", nil)
+	}
+	via := []*http.Request{req("api.test:443")}
+	if err := CrossHostSafeRedirect(req("api.test:8443"), via); err != nil {
+		t.Fatalf("same-host port change must be allowed, got %v", err)
+	}
+	if err := CrossHostSafeRedirect(req("API.TEST:443"), via); err != nil {
+		t.Fatalf("case-different same host must be allowed, got %v", err)
+	}
+	if err := CrossHostSafeRedirect(req("evil.test:443"), via); err == nil {
+		t.Fatal("cross-host redirect must be refused")
+	}
+}
+
+// B6: exhausting the retry sleep budget must not hand back an already-closed
+// body; the caller still needs to read the final provider error.
+func TestDoBudgetExhaustionKeepsBodyReadable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := startTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, "final-503-body")
+		}))
+		c := New()
+		c.HTTP = srv.Client()
+		c.MaxRetries = 50
+		c.Base = time.Minute // per-attempt wait is clamped to maxRetryAfter
+		c.Cap = time.Minute
+		resp, err := c.Do(context.Background(), &Call{Method: http.MethodGet, URL: srv.URL})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("resp = %+v", resp)
+		}
+		b, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr != nil {
+			t.Fatalf("reading returned body failed (B6 regression): %v", rerr)
+		}
+		if string(b) != "final-503-body" {
+			t.Fatalf("body = %q", b)
+		}
+	})
 }

@@ -437,9 +437,49 @@ func TestOpenAIChatDecodeResponseEdgeCases(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 
-	// No choices at all.
-	if _, err := decodeOpenAIChatResponse([]byte(`{"choices":[]}`)); err == nil {
-		t.Fatal("empty choices must error")
+	// No choices at all: a valid, empty response that keeps usage rather
+	// than an untyped error (audit C15).
+	resp, err = decodeOpenAIChatResponse([]byte(`{"id":"c9","model":"m","choices":[],"usage":{"prompt_tokens":3,"completion_tokens":0,"total_tokens":3}}`))
+	if err != nil {
+		t.Fatalf("empty choices must decode to a valid response: %v", err)
+	}
+	if resp.ID != "c9" || resp.StopReason != StopEnd || len(resp.Content) != 0 {
+		t.Fatalf("empty choices = %+v", resp)
+	}
+	if resp.Usage.InputTokens != 3 || resp.Usage.TotalTokens != 3 {
+		t.Fatalf("empty choices dropped usage: %+v", resp.Usage)
+	}
+
+	// Refusal arrives with null content; its text must survive (audit A2).
+	resp, err = decodeOpenAIChatResponse([]byte(`{"choices":[{"message":{"content":null,"refusal":"I can't do that"},"finish_reason":"stop"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Text() != "I can't do that" {
+		t.Fatalf("refusal dropped: %q", resp.Text())
+	}
+
+	// Legacy function_call folds into a tool-call block (audit A2).
+	resp, err = decodeOpenAIChatResponse([]byte(`{"choices":[{"message":{"content":null,"function_call":{"name":"get_weather","arguments":"{\"city\":\"NY\"}"}},"finish_reason":"function_call"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Type != BlockToolCall ||
+		resp.Content[0].ToolName != "get_weather" || resp.Content[0].Arguments != `{"city":"NY"}` {
+		t.Fatalf("function_call = %+v", resp.Content)
+	}
+	if resp.StopReason != StopToolUse {
+		t.Fatalf("function_call stop = %s", resp.StopReason)
+	}
+
+	// tool_calls with an object-shaped arguments field (Anthropic-style
+	// gateway) must not fail the payload (audit B4).
+	resp, err = decodeOpenAIChatResponse([]byte(`{"choices":[{"message":{"content":"ok","tool_calls":[{"id":7,"type":"function","function":{"name":"f","arguments":{"a":1,"b":2}}}]},"finish_reason":"tool_calls"}]}`))
+	if err != nil {
+		t.Fatalf("object arguments must decode: %v", err)
+	}
+	if len(resp.Content) != 2 || resp.Content[1].Arguments != `{"a":1,"b":2}` || resp.Content[1].ToolCallID != "7" {
+		t.Fatalf("object arguments = %+v", resp.Content)
 	}
 }
 

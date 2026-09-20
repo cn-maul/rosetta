@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 )
 
 // Effort is a protocol-independent thinking dial.
@@ -17,8 +18,10 @@ const (
 )
 
 // ThinkingConfig requests reasoning from the model. Exactly one of Effort
-// or BudgetTokens is typically set; if both are set BudgetTokens wins on
-// Anthropic (native budget) and maps to the nearest Effort elsewhere.
+// or BudgetTokens is typically set. When both are set the precedence is
+// protocol-specific and fixed: Anthropic takes BudgetTokens as the native
+// budget, while the OpenAI protocols — which accept only a coarse level —
+// take the explicit Effort (see effort()).
 type ThinkingConfig struct {
 	// Effort is a coarse dial: low/medium/high. OpenAI Chat sends it as
 	// reasoning_effort; Responses as reasoning.effort; Anthropic maps it
@@ -78,9 +81,14 @@ func EphemeralCache() *CacheControl { return &CacheControl{} }
 // ExtendedCache returns a 1-hour Anthropic cache breakpoint.
 func ExtendedCache() *CacheControl { return &CacheControl{TTL: "1h"} }
 
-// validate checks the breakpoint's TTL, which Anthropic constrains to
-// "5m" or "1h".
+// validate checks the breakpoint's Type and TTL, which Anthropic constrains
+// to "ephemeral" and "5m"/"1h" respectively.
 func (c *CacheControl) validate() error {
+	switch c.Type {
+	case "", "ephemeral":
+	default:
+		return fmt.Errorf("cache type %q unsupported (Anthropic only accepts \"ephemeral\")", c.Type)
+	}
 	switch c.TTL {
 	case "", "5m", "1h":
 		return nil
@@ -153,26 +161,34 @@ type ChatRequest struct {
 	Extra map[string]any
 }
 
-// Reserved-key sets are per API family, not a global union: blocking the
-// union would reject legitimate keys on requests that have no SDK-managed
-// counterpart (e.g. ChatRequest.Extra["user"] — chat payloads have no user
-// field, but embeddings do). Each caller passes the set for its own API.
-// WithExtraOverrides(true) lifts the check for callers who really mean it.
+// Reserved-key sets are per protocol, matching exactly the top-level fields
+// that each adapter's payload builder writes: blocking a key the adapter
+// never sets (e.g. "tool_choice" on Anthropic, "input" on OpenAI Chat) would
+// reject a legitimate Extra passthrough. Each caller passes the set for its
+// own protocol. WithExtraOverrides(true) lifts the check entirely.
 var (
-	// chatReservedPayloadKeys covers the three chat protocols' spellings
-	// (OpenAI Chat, Responses, Anthropic).
-	chatReservedPayloadKeys = map[string]bool{
-		// request identity and transport
-		"model": true, "stream": true,
-		// conversation content
-		"messages": true, "input": true, "system": true,
-		// output caps (all three protocols' spellings)
-		"max_tokens": true, "max_completion_tokens": true, "max_output_tokens": true,
-		// sampling
-		"temperature": true, "top_p": true, "stop": true, "stop_sequences": true,
-		// tools and thinking
-		"tools": true, "tool_choice": true, "stream_options": true,
-		"thinking": true, "reasoning": true, "reasoning_effort": true,
+	// openaiChatReservedPayloadKeys covers POST /chat/completions. Both
+	// output-cap spellings are reserved because the probe picks one at
+	// runtime (max_completion_tokens, or max_tokens on legacy services).
+	openaiChatReservedPayloadKeys = map[string]bool{
+		"model": true, "messages": true, "stream": true,
+		"max_tokens": true, "max_completion_tokens": true,
+		"temperature": true, "top_p": true, "stop": true,
+		"tools": true, "reasoning_effort": true, "stream_options": true,
+	}
+	// openaiResponsesReservedPayloadKeys covers POST /responses.
+	openaiResponsesReservedPayloadKeys = map[string]bool{
+		"model": true, "input": true, "stream": true,
+		"max_output_tokens": true,
+		"temperature":       true, "top_p": true,
+		"tools": true, "reasoning": true,
+	}
+	// anthropicReservedPayloadKeys covers POST /v1/messages.
+	anthropicReservedPayloadKeys = map[string]bool{
+		"model": true, "messages": true, "system": true, "stream": true,
+		"max_tokens":  true,
+		"temperature": true, "top_p": true, "stop_sequences": true,
+		"tools": true, "thinking": true,
 	}
 	// embeddingsReservedPayloadKeys covers POST /embeddings payloads.
 	embeddingsReservedPayloadKeys = map[string]bool{
@@ -203,6 +219,44 @@ func mergeExtra(dst map[string]any, extra map[string]any, allowOverride bool, re
 	return nil
 }
 
+// wireSliceLen reports the element count of a payload value that is (or
+// JSON-normalizes to) an array; ok is false when the value is absent or not
+// an array. After a WithExtraOverrides replacement the value can be any JSON
+// shape — a []any parsed from Extra, not just the SDK's []string — so a plain
+// type switch would silently ignore the override and validate against a stale
+// count (audit C20).
+func wireSliceLen(v any) (int, bool) {
+	if v == nil {
+		return 0, false
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return 0, false
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return 0, false
+	}
+	return len(arr), true
+}
+
+// wireInt coerces a payload value to an int through JSON, so an override of a
+// numeric field arriving as a float64 (from json) is still read.
+func wireInt(v any) (int, bool) {
+	if v == nil {
+		return 0, false
+	}
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return 0, false
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, false
+	}
+	return int(n), true
+}
+
 // Float returns a pointer to v (for Temperature/TopP fields).
 //
 //go:fix inline
@@ -212,6 +266,13 @@ func Float(v float64) *float64 { return new(v) }
 //
 //go:fix inline
 func Bool(v bool) *bool { return new(v) }
+
+// maxWireInt bounds token-count fields that reach a provider's JSON body.
+// Any real context window is orders of magnitude smaller; the cap exists to
+// stop absurd values from wrapping int arithmetic (audit B14). 2^30 is chosen
+// so the Anthropic plan's `budget + 4096` growth stays positive even on a
+// 32-bit int.
+const maxWireInt = 1 << 30
 
 // validate checks structural requirements shared by all protocols, so
 // obviously broken requests fail locally with ErrInvalidRequest instead of
@@ -230,10 +291,13 @@ func (r *ChatRequest) validate() error {
 	if r.MaxOutputTokens < 0 {
 		return fmt.Errorf("%w: MaxOutputTokens must not be negative", ErrInvalidRequest)
 	}
-	if r.Temperature != nil && (*r.Temperature < 0 || *r.Temperature > 2) {
+	if r.MaxOutputTokens > maxWireInt {
+		return fmt.Errorf("%w: MaxOutputTokens %d exceeds the supported maximum %d", ErrInvalidRequest, r.MaxOutputTokens, maxWireInt)
+	}
+	if r.Temperature != nil && !inRange(*r.Temperature, 0, 2) {
 		return fmt.Errorf("%w: Temperature %v outside [0, 2]", ErrInvalidRequest, *r.Temperature)
 	}
-	if r.TopP != nil && (*r.TopP < 0 || *r.TopP > 1) {
+	if r.TopP != nil && !inRange(*r.TopP, 0, 1) {
 		return fmt.Errorf("%w: TopP %v outside [0, 1]", ErrInvalidRequest, *r.TopP)
 	}
 	if r.Thinking != nil {
@@ -245,20 +309,56 @@ func (r *ChatRequest) validate() error {
 		if r.Thinking.BudgetTokens < 0 {
 			return fmt.Errorf("%w: Thinking.BudgetTokens must not be negative", ErrInvalidRequest)
 		}
+		if r.Thinking.BudgetTokens > maxWireInt {
+			return fmt.Errorf("%w: Thinking.BudgetTokens %d exceeds the supported maximum %d", ErrInvalidRequest, r.Thinking.BudgetTokens, maxWireInt)
+		}
+	}
+	for i, s := range r.StopSequences {
+		if s == "" {
+			return fmt.Errorf("%w: StopSequences[%d] is empty", ErrInvalidRequest, i)
+		}
 	}
 	for i, m := range r.Messages {
 		if err := m.validate(); err != nil {
 			return fmt.Errorf("%w: Messages[%d]: %w", ErrInvalidRequest, i, err)
 		}
 	}
+	seenTool := make(map[string]bool, len(r.Tools))
 	for i, t := range r.Tools {
+		if t.Name == "" {
+			return fmt.Errorf("%w: Tools[%d].Name must not be empty", ErrInvalidRequest, i)
+		}
+		if seenTool[t.Name] {
+			return fmt.Errorf("%w: duplicate tool name %q", ErrInvalidRequest, t.Name)
+		}
+		seenTool[t.Name] = true
+		if len(t.Parameters) > 0 && !json.Valid(t.Parameters) {
+			return fmt.Errorf("%w: Tools[%d].Parameters is not valid JSON", ErrInvalidRequest, i)
+		}
 		if t.CacheControl != nil {
 			if err := t.CacheControl.validate(); err != nil {
 				return fmt.Errorf("%w: Tools[%d]: %w", ErrInvalidRequest, i, err)
 			}
 		}
 	}
+	if len(r.Extra) > 0 {
+		// A non-serializable Extra (NaN, a channel, a self-referencing map)
+		// fails later inside json.Marshal and surfaces as a TransportError
+		// naming a full URL, so probe it here where it is an ErrInvalidRequest.
+		if _, err := json.Marshal(r.Extra); err != nil {
+			return fmt.Errorf("%w: Extra is not JSON-serializable: %v", ErrInvalidRequest, err)
+		}
+	}
 	return nil
+}
+
+// inRange reports whether v is finite and within [lo, hi]. NaN and the
+// infinities compare false against every bound, so they must be rejected
+// explicitly — otherwise they slip past validation and json.Marshal later
+// rejects them, misclassifying a local programming error as a transport
+// failure (audit B13).
+func inRange(v, lo, hi float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= lo && v <= hi
 }
 
 // effort resolves the effective effort dial for the request.

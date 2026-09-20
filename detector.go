@@ -40,17 +40,7 @@ func DetectProtocol(ctx context.Context, endpoint, apiKey string) (Protocol, err
 // re-send credentials on cross-host redirects (net/http only strips
 // Authorization/Cookie automatically, never x-api-key).
 func newProbeClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Second, CheckRedirect: blockCrossHostRedirect}
-}
-
-func blockCrossHostRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) > 0 && req.URL.Host != via[0].URL.Host {
-		return fmt.Errorf("rosetta: refusing cross-host redirect %s -> %s during protocol probe", via[0].URL.Host, req.URL.Host)
-	}
-	if len(via) >= 10 {
-		return http.ErrUseLastResponse
-	}
-	return nil
+	return &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpx.CrossHostSafeRedirect}
 }
 
 // detectByProbe probes GET /models, first with Bearer auth then with
@@ -64,10 +54,12 @@ func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	probeURL := joinEndpoint(endpoint, "/models")
-	try := func(auth string) (int, []byte, error) {
+	// classify reads the live body so an oversized catalog still classifies
+	// from its first page (see classifyCatalog).
+	try := func(auth string) (Protocol, bool, int, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 		if err != nil {
-			return 0, nil, err
+			return "", false, 0, err
 		}
 		req.Header.Set("Accept", "application/json")
 		if apiKey != "" {
@@ -80,41 +72,87 @@ func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client
 		}
 		resp, err := hc.Do(req)
 		if err != nil {
-			return 0, nil, err
+			return "", false, 0, err
 		}
 		defer resp.Body.Close()
-		body, err := httpx.ReadBody(resp.Body, detectBodyLimit)
-		return resp.StatusCode, body, err
+		if resp.StatusCode != http.StatusOK {
+			return "", false, resp.StatusCode, nil
+		}
+		proto, ok := classifyCatalog(io.LimitReader(resp.Body, detectBodyLimit))
+		return proto, ok, resp.StatusCode, nil
 	}
 	for _, auth := range []string{"bearer", "x-api-key"} {
-		status, body, err := try(auth)
+		proto, ok, status, err := try(auth)
 		if err != nil {
 			if ctx.Err() != nil {
 				return "", false, ctx.Err()
 			}
-			logger.Debug("rosetta: protocol probe transport failure", "auth", auth, "err", err.Error())
+			logger.Warn("rosetta: protocol probe transport failure", "auth", auth, "err", err.Error())
 			continue
 		}
 		if status != http.StatusOK {
 			logger.Debug("rosetta: protocol probe non-200", "auth", auth, "status", status)
 			continue
 		}
-		var doc struct {
-			Data []map[string]any `json:"data"`
+		if ok {
+			return proto, true, nil
 		}
-		if json.Unmarshal(body, &doc) != nil || len(doc.Data) == 0 {
-			logger.Debug("rosetta: protocol probe could not parse /models catalog", "auth", auth)
+		logger.Debug("rosetta: protocol probe could not classify /models catalog", "auth", auth)
+	}
+	logger.Warn("rosetta: protocol undetermined, defaulting to OpenAI Chat", "endpoint", displayEndpoint(endpoint))
+	return ProtoOpenAIChat, false, nil
+}
+
+// classifyCatalog streams a /models catalog and classifies it from the first
+// element of its "data" array: Anthropic entries carry type:"model", OpenAI
+// entries carry object:"model". Streaming (rather than unmarshaling the whole
+// body) lets a catalog larger than the read limit still classify from its
+// first page, and tolerates unrelated top-level keys in any order.
+func classifyCatalog(r io.Reader) (Protocol, bool) {
+	dec := json.NewDecoder(r)
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", false
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		key, _ := keyTok.(string)
+		if key != "data" {
+			var skip json.RawMessage
+			if dec.Decode(&skip) != nil {
+				return "", false
+			}
 			continue
 		}
-		if doc.Data[0]["type"] == "model" {
-			return ProtoAnthropic, true, nil
+		dt, err := dec.Token()
+		if err != nil {
+			return "", false
 		}
-		if doc.Data[0]["object"] == "model" {
-			return ProtoOpenAIChat, true, nil
+		if d, ok := dt.(json.Delim); !ok || d != '[' {
+			return "", false
 		}
+		if !dec.More() {
+			return "", false
+		}
+		var first map[string]json.RawMessage
+		if dec.Decode(&first) != nil {
+			return "", false
+		}
+		if v, ok := first["type"]; ok && string(v) == `"model"` {
+			return ProtoAnthropic, true
+		}
+		if v, ok := first["object"]; ok && string(v) == `"model"` {
+			return ProtoOpenAIChat, true
+		}
+		return "", false
 	}
-	logger.Debug("rosetta: protocol undetermined, defaulting to OpenAI Chat", "endpoint", displayEndpoint(endpoint))
-	return ProtoOpenAIChat, false, nil
+	return "", false
 }
 
 // DetectClient builds a Client with automatic protocol detection: the
@@ -129,13 +167,20 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 	if st.endpoint == "" {
 		return nil, ErrNoEndpoint
 	}
+	// An explicit WithProtocol wins: do not probe, and do not let a probe
+	// result override the caller's pinned protocol (B12).
+	if st.protocolSet {
+		return NewClient(opts...)
+	}
 	hc := st.httpClient
 	if hc == nil {
 		hc = newProbeClient()
 	} else {
 		// Copy so the redirect guard does not mutate the caller's client.
 		guarded := *hc
-		guarded.CheckRedirect = blockCrossHostRedirect
+		if guarded.CheckRedirect == nil {
+			guarded.CheckRedirect = httpx.CrossHostSafeRedirect
+		}
 		if guarded.Timeout == 0 {
 			guarded.Timeout = 10 * time.Second
 		}
@@ -146,11 +191,10 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 		ctx, cancel = context.WithTimeout(ctx, st.timeout)
 		defer cancel()
 	}
-	proto, classified, err := detectByProbe(ctx, st.endpoint, st.apiKey, hc, st.logger)
+	proto, _, err := detectByProbe(ctx, st.endpoint, st.apiKey, hc, st.logger)
 	if err != nil {
 		return nil, fmt.Errorf("rosetta: detecting protocol for %s: %w", displayEndpoint(st.endpoint), err)
 	}
-	_ = classified // fallback is intentional; detectByProbe already logged it
 	// Force a copy so the appended option cannot leak into the caller's
 	// backing array.
 	opts = append(opts[:len(opts):len(opts)], WithProtocol(proto))

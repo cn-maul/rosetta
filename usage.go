@@ -91,10 +91,43 @@ func NewMemoryUsageTracker() *MemoryUsageTracker {
 	}
 }
 
-// Record accumulates one observation.
+// maxAggregateTokens is the per-field ceiling a single observation may
+// contribute before saturation. A provider reporting a total near MaxInt64
+// would otherwise make `+=` in Record wrap the running aggregate negative
+// (audit C21); clamping the input bounds keeps every sum monotonic.
+const maxAggregateTokens = 1 << 40
+
+// clampTokens bounds one token count to [0, maxAggregateTokens]: negatives
+// (which no provider should send, but a hostile or buggy one can) and
+// absurd magnitudes are both folded back into range.
+func clampTokens(v int64) int64 {
+	if v < 0 {
+		return 0
+	}
+	if v > maxAggregateTokens {
+		return maxAggregateTokens
+	}
+	return v
+}
+
+// Record accumulates one observation. A zero-value MemoryUsageTracker is
+// usable directly: the maps are lazily created here so the exported type
+// does not require NewMemoryUsageTracker (audit B10).
 func (t *MemoryUsageTracker) Record(_ context.Context, r UsageRecord) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.byModel == nil {
+		t.byModel = make(map[string]ModelUsage)
+	}
+	if t.byProto == nil {
+		t.byProto = make(map[Protocol]ModelUsage)
+	}
+	r.Usage.InputTokens = clampTokens(r.Usage.InputTokens)
+	r.Usage.OutputTokens = clampTokens(r.Usage.OutputTokens)
+	r.Usage.TotalTokens = clampTokens(r.Usage.TotalTokens)
+	r.Usage.CachedInputTokens = clampTokens(r.Usage.CachedInputTokens)
+	r.Usage.CachedCreationTokens = clampTokens(r.Usage.CachedCreationTokens)
+	r.Usage.ReasoningTokens = clampTokens(r.Usage.ReasoningTokens)
 	add := func(m *ModelUsage) {
 		m.Requests++
 		m.InputTokens += r.Usage.InputTokens

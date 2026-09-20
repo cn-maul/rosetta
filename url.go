@@ -29,14 +29,20 @@ func validateEndpoint(raw string) error {
 }
 
 // displayEndpoint renders a raw endpoint for error messages with the query
-// string stripped: callers sometimes paste a key into the URL, and even a
-// rejected endpoint should not echo that credential back into logs.
+// string and any userinfo stripped: callers sometimes paste a key into the
+// URL, and even a rejected endpoint should not echo that credential back into
+// logs.
 func displayEndpoint(raw string) string {
 	u, err := url.Parse(raw)
-	if err != nil || u.RawQuery == "" {
+	if err != nil {
 		return raw
 	}
+	if u.User == nil && u.RawQuery == "" && u.Fragment == "" {
+		return raw
+	}
+	u.User = nil
 	u.RawQuery = ""
+	u.Fragment = ""
 	return u.String()
 }
 
