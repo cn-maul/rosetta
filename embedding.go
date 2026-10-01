@@ -102,17 +102,23 @@ func (c *Client) Embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingRe
 	// wire, not the original request fields. Normalize through JSON so an
 	// override of any shape ([]any, float64) is read, not just the SDK's
 	// []string/int — and an override to an empty list is a hard error, not a
-	// skipped count check (audit C20).
+	// skipped count check (audit C20). When no override is in play the SDK's
+	// own []string/int is authoritative, so the expensive JSON round-trip is
+	// skipped.
 	expected := len(req.Input)
-	if n, ok := wireSliceLen(payload["input"]); ok {
-		if n == 0 {
-			return nil, fmt.Errorf("%w: embeddings input is empty after Extra override", ErrInvalidRequest)
+	if c.settings.extraOverrides && len(req.Extra) > 0 {
+		if n, ok := wireSliceLen(payload["input"]); ok {
+			if n == 0 {
+				return nil, fmt.Errorf("%w: embeddings input is empty after Extra override", ErrInvalidRequest)
+			}
+			expected = n
 		}
-		expected = n
 	}
 	dimensions := req.Dimensions
-	if v, ok := wireInt(payload["dimensions"]); ok {
-		dimensions = v
+	if c.settings.extraOverrides && len(req.Extra) > 0 {
+		if v, ok := wireInt(payload["dimensions"]); ok {
+			dimensions = v
+		}
 	}
 	resp, err := decodeEmbeddingsResponse(body, expected, dimensions)
 	if err != nil {

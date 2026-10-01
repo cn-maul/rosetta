@@ -31,7 +31,7 @@ import (
 type openaiResponsesProvider struct {
 	c *Client
 
-	mu sync.Mutex
+	mu sync.RWMutex
 	// Sticky downgrades are remembered per model: one model rejecting a
 	// field says nothing about another model's capabilities.
 	stickyNoReasoning map[string]bool // upstream rejected the reasoning object
@@ -46,8 +46,8 @@ type respSendState struct {
 
 func (p *openaiResponsesProvider) initialState(model string) *respSendState {
 	st := &respSendState{reasoning: true, maxOutput: true}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.stickyNoReasoning[model] {
 		st.reasoning = false
 	}
@@ -125,11 +125,19 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 		if err != nil {
 			return nil, err
 		}
+		hdr := openAIHeaders(p.c, "application/json")
+		retry := httpx.RetryIdempotent
+		if p.c.settings.quirks.NoIdempotencyKey {
+			retry = httpx.RetryDefault
+		} else {
+			hdr.Set("Idempotency-Key", newIdempotencyKey())
+		}
 		call := &httpx.Call{
-			Method: method,
-			URL:    url,
-			Header: openAIHeaders(p.c, "application/json"),
-			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+			Method:      method,
+			URL:         url,
+			Header:      hdr,
+			Body:        func() ([]byte, error) { return json.Marshal(payload) },
+			RetryPolicy: retry,
 		}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
@@ -162,11 +170,19 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 		if err != nil {
 			return nil, err
 		}
+		hdr := openAIHeaders(p.c, "text/event-stream")
+		retry := httpx.RetryIdempotent
+		if p.c.settings.quirks.NoIdempotencyKey {
+			retry = httpx.RetryDefault
+		} else {
+			hdr.Set("Idempotency-Key", newIdempotencyKey())
+		}
 		call := &httpx.Call{
-			Method: method,
-			URL:    url,
-			Header: openAIHeaders(p.c, "text/event-stream"),
-			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+			Method:      method,
+			URL:         url,
+			Header:      hdr,
+			Body:        func() ([]byte, error) { return json.Marshal(payload) },
+			RetryPolicy: retry,
 		}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
@@ -667,10 +683,11 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 			case "response.failed":
 				if ev.Response != nil && ev.Response.Error != nil {
 					apiErr := ev.Response.Error.apiError(200)
+					apiErr.InBand = true
 					apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
 					return nil, apiErr
 				}
-				return nil, &APIError{StatusCode: 200, Message: "response.failed", Type: "api_error", Method: method, URL: url, RequestID: requestID}
+				return nil, &APIError{StatusCode: 200, InBand: true, Message: "response.failed", Type: "api_error", Method: method, URL: url, RequestID: requestID}
 			case "error":
 				// The Responses error envelope nests details under "error"
 				// ({"type":"error","error":{...}}); read that first and fall
@@ -681,6 +698,7 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				} else {
 					apiErr = (&oaErrorBody{Message: ev.Message, Type: "api_error", Code: json.RawMessage(maybeQuote(ev.Code))}).apiError(200)
 				}
+				apiErr.InBand = true
 				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
 				return nil, apiErr
 			default:
@@ -700,6 +718,8 @@ func mapResponsesStop(status, reason string) StopReason {
 			return StopLength
 		case "content_filter":
 			return StopContentFilter
+		case "refusal":
+			return StopRefusal
 		default:
 			return StopOther
 		}
@@ -814,6 +834,7 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	}
 	if r.Error != nil {
 		apiErr := r.Error.apiError(200)
+		apiErr.InBand = true
 		attachRequest(apiErr, rc)
 		return nil, apiErr
 	}

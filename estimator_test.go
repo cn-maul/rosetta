@@ -63,9 +63,9 @@ func TestEstimateInputTokens(t *testing.T) {
 				Parameters: json.RawMessage(`{"type":"object","properties":{}}`)},
 		},
 	}
-	// user 2+4; tool: 24 + name (11 ascii→3) + desc (15 ascii→4) + schema
-	// (33 ascii→9) = 40; total 45
-	if got := req.estimateInputTokens(MultimediaTokenEstimates{}); got != 45 {
-		t.Fatalf("estimateInputTokens() with tools = %d, want 45", got)
+	// user 2+4; tool: 24 + name (11 ascii) + desc (15 ascii) + schema
+	// (33 ascii) = 24 + 15 (rounded once over 61 ascii) = 39; total 44
+	if got := req.estimateInputTokens(MultimediaTokenEstimates{}); got != 44 {
+		t.Fatalf("estimateInputTokens() with tools = %d, want 44", got)
 	}
 }

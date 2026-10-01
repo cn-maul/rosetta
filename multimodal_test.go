@@ -143,7 +143,7 @@ func TestAnthropicDocumentBlocks(t *testing.T) {
 	p := c.provider.(*anthropicProvider)
 	build := func(blocks ...Block) (map[string]any, error) {
 		req := &ChatRequest{Model: "claude-sonnet-4-5", Messages: []Message{{Role: RoleUser, Blocks: blocks}}}
-		pl, err := p.buildPayload(req, false, p.plan(req))
+		pl, _, err := p.buildPayload(req, false, p.plan(req))
 		if err != nil {
 			return nil, err
 		}

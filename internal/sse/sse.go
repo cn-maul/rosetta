@@ -33,10 +33,11 @@ type Event struct {
 // are handled transparently (bytes are only interpreted once a full line
 // has arrived).
 type Scanner struct {
-	r    *bufio.Reader
-	name string
-	id   string
-	data [][]byte
+	r       *bufio.Reader
+	name    string
+	id      string
+	data    [][]byte
+	pending []byte // remainder after a lone-CR split, awaiting the next readLine
 }
 
 // New returns a Scanner reading from r.
@@ -80,7 +81,10 @@ func (s *Scanner) Next() (*Event, error) {
 				if size > maxEventBytes {
 					return nil, ErrTooLarge
 				}
-				s.data = append(s.data, value)
+				// readLine returns a slice into the reusable bufio buffer, so
+				// the value must be copied before it is stored — the next
+				// ReadSlice would otherwise overwrite these bytes.
+				s.data = append(s.data, append([]byte(nil), value...))
 			case "id":
 				s.id = string(value)
 			default:
@@ -93,50 +97,91 @@ func (s *Scanner) Next() (*Event, error) {
 // take flushes the accumulated event, or returns nil when no data lines
 // were collected (per the SSE spec an event without data is not
 // dispatched). Its fields are reset either way so a discarded event never
-// leaks its name or id into the next dispatched one.
+// leaks its name or id into the next dispatched one. A single data line is
+// returned directly (no Join copy); s.data is reset to [:0] so its backing
+// array is reused for the next event.
 func (s *Scanner) take() *Event {
 	if len(s.data) == 0 {
 		s.name, s.id = "", ""
 		return nil
 	}
-	ev := &Event{Name: s.name, ID: s.id, Data: bytes.Join(s.data, []byte("\n"))}
-	s.name, s.id, s.data = "", "", nil
+	var data []byte
+	if len(s.data) == 1 {
+		data = s.data[0]
+	} else {
+		data = bytes.Join(s.data, []byte("\n"))
+	}
+	ev := &Event{Name: s.name, ID: s.id, Data: data}
+	s.name, s.id = "", ""
+	s.data = s.data[:0]
 	return ev
 }
 
-// readLine returns the next line without its terminator. It accumulates
-// byte-by-byte so a server that never emits a line terminator cannot drive
-// unbounded allocation: the size guard fires before the buffer grows past
-// maxLineBytes. Terminators follow the SSE spec — LF, CRLF, or a lone CR.
+// readLine returns the next line without its terminator. It uses
+// bufio.Reader.ReadSlice('\n') so a line that fits in the buffer is returned
+// as a slice into the buffer with no per-byte ReadByte loop or copy; only a
+// line spanning a buffer boundary is accumulated. The returned slice is only
+// valid until the next read, so callers that retain it (data values) must
+// copy it. Terminators follow the SSE spec — LF, CRLF, or a lone CR — and
+// the maxLineBytes guard fires before the buffer grows unbounded.
 func (s *Scanner) readLine() ([]byte, error) {
+	// Drain any pending remainder from a previous lone-CR split.
+	if len(s.pending) > 0 {
+		line := s.pending
+		s.pending = nil
+		return s.splitCR(line), nil
+	}
 	var buf []byte
 	for {
-		b, err := s.r.ReadByte()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				if len(buf) > 0 {
-					return buf, nil // final line without a terminator
-				}
-				return nil, io.EOF
+		line, err := s.r.ReadSlice('\n')
+		if err == nil {
+			line = line[:len(line)-1] // strip the '\n' terminator
+			if len(buf) == 0 {
+				return s.splitCR(line), nil
 			}
-			return nil, err
+			buf = append(buf, line...)
+			return s.splitCR(buf), nil
 		}
-		switch b {
-		case '\n':
-			return buf, nil
-		case '\r':
-			// CR ends the line; consume a following LF to complete CRLF.
-			if nb, perr := s.r.Peek(1); perr == nil && len(nb) > 0 && nb[0] == '\n' {
-				_, _ = s.r.ReadByte()
-			}
-			return buf, nil
-		default:
-			if len(buf) >= maxLineBytes+1 {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			// The line spans a buffer boundary; accumulate and keep reading.
+			buf = append(buf, line...)
+			if len(buf) > maxLineBytes {
 				return nil, ErrTooLarge
 			}
-			buf = append(buf, b)
+			continue
 		}
+		if errors.Is(err, io.EOF) {
+			if len(buf) > 0 {
+				buf = append(buf, line...)
+			} else {
+				buf = line
+			}
+			if len(buf) == 0 {
+				return nil, io.EOF
+			}
+			return s.splitCR(buf), nil // final line without a terminator
+		}
+		return nil, err
 	}
+}
+
+// splitCR handles CR as a line terminator (the SSE spec allows LF, CRLF, or
+// a lone CR). It strips a trailing CR (CRLF) and, when a CR appears
+// mid-line (a lone CR), splits there and buffers the remainder for the next
+// readLine call.
+func (s *Scanner) splitCR(line []byte) []byte {
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	if i := bytes.IndexByte(line, '\r'); i >= 0 {
+		rest := line[i+1:]
+		if len(rest) > 0 && rest[0] == '\n' {
+			rest = rest[1:] // CRLF: consume the LF
+		}
+		s.pending = rest
+		line = line[:i]
+	}
+	return line
 }
 
 // splitField splits "field: value" / "field:value" / "field".

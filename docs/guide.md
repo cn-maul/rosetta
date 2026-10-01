@@ -23,8 +23,8 @@ client, err := rosetta.NewClient(
 | `WithEndpoint(url)` | 协议官方地址 | API 基地址，见上方规则 |
 | `WithAPIKey(key)` | 无（必填） | 凭证 |
 | `WithProtocol(p)` | `ProtoOpenAIChat` | `ProtoOpenAIChat` / `ProtoOpenAIResponses` / `ProtoAnthropic`；也可由 `DetectClient` 探测决定 |
-| `WithHTTPClient(c)` | `&http.Client{}` | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式；也用于 `DetectClient` 的协议探测 |
-| `WithTimeout(d)` | 无 | 仅约束非流式调用（Chat / ListModels / ModelInfo），以及 `DetectClient` 的协议探测 |
+| `WithHTTPClient(c)` | SDK 自建 Transport | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式；也用于 `DetectClient` 的协议探测。默认 Transport 的代理行为见[附注](#附注) |
+| `WithTimeout(d)` | 60s | 仅约束非流式调用（Chat / ListModels / ModelInfo / Embed / Rerank），以及 `DetectClient` 的协议探测；`WithTimeout(0)` 关闭默认上界。流式不受影响，由调用方 ctx 管辖 |
 | `WithMaxRetries(n)` | 2 | 可重试失败（网络错误、408/429/5xx/529）的重试次数，见[重试策略](protocols.md#重试策略) |
 | `WithRetryBase(d)` | 400ms | 退避基数（逐次翻倍 ±20%，上限 8s） |
 | `WithDefaultMaxOutputTokens(n)` | 无 | 请求未指定输出上限时的默认值 |
@@ -42,7 +42,7 @@ client, err := rosetta.NewClient(
 | `WithAnthropicBearerAuth(v)` | false | 额外发送 `Authorization: Bearer`（默认只发 `x-api-key`；仅认证方式只有 Bearer 的兼容网关需要） |
 | `WithExtraOverrides(v)` | false | 允许 `Extra` 覆盖 SDK 管理的负载字段（默认冲突即报 `ErrInvalidRequest`）。保留键按 API 族划分：chat（`model`/`messages`/`stream`/输出上限/采样/工具/thinking 等）、embeddings（`model`/`input`/`dimensions`/`user`/`encoding_format`）、rerank（`model`/`query`/`documents`/`top_n`/`return_documents`）——因此 `ChatRequest.Extra["user"]` 合法（chat 没有 user 字段），而 `EmbeddingRequest.Extra["user"]` 会被拒 |
 | `WithMultimediaTokenEstimates(e)` | 1500/500/3000 | 上下文检查中图片/音频/文档块的平估 token 数 |
-| `WithQuirks(q)` | 无 | 声明第三方兼容性偏差，见[协议与兼容](protocols.md) |
+| `WithQuirks(q)` | 无 | 声明第三方兼容性偏差（`LegacyMaxTokens` / `NoStreamUsage` / `NoIdempotencyKey`），见[协议与兼容](protocols.md) |
 
 ## 消息与内容块
 
@@ -73,6 +73,8 @@ rosetta.AssistantBlocks(                  // assistant 含工具调用/思考回
 )
 rosetta.ToolResult("call_1", "get_weather", "sunny 22C") // 工具结果（RoleTool）
 ```
+
+回放轮若**只剩** thinking / redacted-thinking 块（协议无法回放，或 Anthropic 缺签名），请求构建期显式报 `ErrInvalidRequest` 并说明原因——不再退化成空 content 消息或整轮静默消失。
 
 `ChatRequest.System` 是顶层系统提示的快捷方式，与消息列表中的 system 消息按顺序合并。
 
@@ -148,7 +150,7 @@ Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens �
 
 ## 上下文校验
 
-请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每段音频 500、每份文档 3000、每条消息 +4、每个工具定义 +24 与 schema 文本、`Extra` 按其 JSON 长度）比较 `估算输入 + 输出上限` 与窗口：
+请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每段音频 500、每份文档 3000、每条消息 +4、每个工具定义 +24 与 schema 文本、`Extra` 按其 JSON 长度）比较 `估算输入 + 输出上限` 与窗口。文本 token 按全部文本累计后**一次取整**（v0.6.0 起，不再逐块取整累加，短块多的请求估算略降、更接近真实）：
 
 - 超限默认**仅告警**（进日志），请求照发；
 - `WithStrictContextCheck(true)` 改为返回 `ErrContextTooLong`。
@@ -196,9 +198,9 @@ if apiErr, ok := errors.AsType[*rosetta.APIError](err); ok {
 }
 ```
 
-哨兵错误（`errors.Is` 匹配）：`ErrNoEndpoint`、`ErrNoAPIKey`、`ErrUnknownModel`、`ErrContextTooLong`、`ErrThinkingUnsupported`、`ErrInvalidRequest`、`ErrNotSupported`、`ErrStreamTruncated`。
+哨兵错误（`errors.Is` 匹配）：`ErrNoEndpoint`、`ErrNoAPIKey`、`ErrUnknownModel`、`ErrContextTooLong`、`ErrThinkingUnsupported`、`ErrInvalidRequest`、`ErrNotSupported`、`ErrStreamTruncated`、`ErrStreamOverflow`。
 
-`APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / Raw`，由三协议的错误体归一而来。`Raw` 存储前做保守脱敏（**先脱敏后截断**，超 4KB 的大错误体同样生效）：敏感键的值替换为 `[redacted]`，`sk-…` 密钥材料统一掩码；但错误信息与 Raw 仍可能包含 provider 回显的内容，请避免把完整错误对象直接写入公开日志。注意 `Retryable` 是给调用方的重试提示（408/429/5xx/529 为 true），**SDK 自身只按重试策略自动重试**：GET 类请求默认重试，chat 等非幂等 POST 默认不自动重试（embedding/rerank 幂等，按策略重试）。流内错误（HTTP 200 但 SSE 事件报错）与流截断（`ErrStreamTruncated`）不看 HTTP 状态码判断。另外：第三方网关以 400 拒绝某个可选字段**取值**（如 `reasoning.effort: low`）时按配置错误原样报错，不会触发"删除整个字段"的降级；字段级拒绝的降级记忆按模型隔离。
+`APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / InBand / Raw`，由三协议的错误体归一而来。`InBand=true` 标记"信内"错误——HTTP 200 但响应体或流事件内嵌了 `error`：传输层确实成功，`StatusCode` 保持 200，**按 `StatusCode >= 400` 判定失败的调用方应同时检查 `InBand`**。`Raw` 存储前做保守脱敏（**先脱敏后截断**，超 4KB 的大错误体同样生效）：敏感键的值替换为 `[redacted]`，`sk-…` 密钥材料统一掩码；但错误信息与 Raw 仍可能包含 provider 回显的内容，请避免把完整错误对象直接写入公开日志。注意 `Retryable` 是给调用方的重试提示（408/429/5xx/529 为 true），**SDK 自身只按重试策略自动重试**：GET 类请求默认重试；chat POST（三协议）v0.6.0 起默认携带 `Idempotency-Key` 并对 429/503 做传输层退避重试（默认最多 2 次），对不识别该头或绝不能重放请求的网关，用 `WithQuirks(Quirks{NoIdempotencyKey: true})` 恢复 v0.5.x 行为（不发该头、429/503 立即报错）；embedding/rerank 幂等，按策略重试。流内错误（HTTP 200 但 SSE 事件报错，即 `InBand=true`）与流截断（`ErrStreamTruncated`）不看 HTTP 状态码判断。另外：第三方网关以 400 拒绝某个可选字段**取值**（如 `reasoning.effort: low`）时按配置错误原样报错，不会触发"删除整个字段"的降级；字段级拒绝的降级记忆按模型隔离。
 
 ## 嵌入与重排
 
@@ -229,12 +231,12 @@ rr, err := client.Rerank(ctx, &rosetta.RerankRequest{
 
 ## 附注
 
-- **默认继承进程的环境代理。** 不传 `WithHTTPClient` 时底层用的是 `http.DefaultTransport`，它会读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`。Go 对 `localhost` 与回环地址自动跳过代理，所以本地 Ollama/vLLM 安全；但**内网域名和 `http://` 端点会被送进代理**——`http://` 还会让 API key 以明文经过代理。需要直连时显式给一个不装代理的客户端：
+- **默认直连，不读环境代理（v0.6.0 起的行为变更）。** SDK 自建默认 `*http.Transport`（`MaxIdleConnsPerHost=64`、显式 h2、30s `ResponseHeaderTimeout`），未设置 `Proxy`——`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` **不再生效**（v0.5.x 及以前经 `http.DefaultTransport` 默认继承环境代理）。内网域名与 `http://` 端点默认直连，API key 不会以明文流经代理；需要环境代理时显式传：
   ```go
-  rosetta.WithHTTPClient(&http.Client{Transport: &http.Transport{}})
+  rosetta.WithHTTPClient(&http.Client{Transport: http.DefaultTransport}) // 读环境代理
   ```
   同理，写单测时若断言"请求到不了服务器"，别依赖某个不存在的域名解析失败——设了代理的机器上代理会代答（一条 `http_proxy` 就能让这类断言红掉），用恒失败的 `RoundTripper` 更可靠。
-- 默认的跨主机重定向守卫：SDK 会拒绝跳到别的主机的 3xx（net/http 只剥离 `Authorization`/`Cookie`，不会剥离 `x-api-key`），自己传 `http.Client` 时若已设 `CheckRedirect` 则以你的为准。
+- 默认的跨主机重定向守卫：SDK 会拒绝跳到别的主机的 3xx（net/http 只剥离 `Authorization`/`Cookie`，不会剥离 `x-api-key`），拒绝是永久错误、立即返回（v0.6.0 起不再消耗退避序列）；自己传 `http.Client` 时若已设 `CheckRedirect` 则以你的为准。
 - Windows 本地跑 `go test -race` 需要 CGO（gcc）；无 gcc 环境用 `go test ./...` 即可，CI（Linux）会跑 race。
 - **MinGW 装在含空格的路径下（如 `C:\Program Files\mingw64`）会导致所有 cgo 链接失败**（gcc 的 `*endfile` spec 引用 `default-manifest.o` 时路径未加引号）。把 MinGW 移到无空格路径是根治方案；临时绕过：导出并打补丁 specs 后在 `-ldflags` 中引用：
   ```bash

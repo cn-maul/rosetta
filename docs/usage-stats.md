@@ -30,11 +30,13 @@ client, _ := rosetta.NewClient(
 type UsageRecord struct {
 	Time         time.Time
 	Protocol     Protocol
-	Model        string
+	Model        string // 规范化后的规范 ID（别名请求归并到规范名下，见下）
 	Usage        Usage
-	UsageMissing bool // 上游 200 但没有返回任何用量数据（兼容服务常见）
+	UsageMissing bool // 上游 200 但没有返回任何用量数据（兼容服务常见）；调用方主动 Close 的流不计入
 }
 ```
+
+`Model` 在记账前解析为注册表的规范 ID：同一模型用别名和全名各调一次，用量落在 `ByModel` 的同一个 key 下，而不是拆成两个。
 
 ## 查询
 

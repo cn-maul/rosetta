@@ -14,7 +14,7 @@
 - 布尔字段遵循 OR 语义：手动条目声明 `SupportsThinking: true` 后，远端条目无法撤销它；反向撤销用手动条目的 `DisableThinking: true`（例如远端目录错误地声明了 thinking 支持时）。`DisableThinking` 是显式撤销开关：无论是否发生跨层合并，只要条目声明了它，合并结果强制 `SupportsThinking=false`。
 - **别名冲突即报错**：同一别名解析到多个规范 ID（同层、跨层或遮蔽其他模型 ID）时，`NewClient` / `ListModels` 直接报错，而不是按 map 顺序随机归属。
 - **Known 语义**（原则：自定义模型不猜测）：手动配置 `Known=true`；仅靠 `/models` 发现的条目 `Known=false`，不推断任何能力。thinking 门控与上下文校验只对 `Known=true` 的条目生效。
-- 别名：手动条目可声明 `Aliases`，查询时自动归一到规范 ID。
+- 别名：手动条目可声明 `Aliases`，查询时自动归一到规范 ID。请求发出前 SDK 也会把别名解析为规范 ID 再上 wire（未知模型原样透传，不触发 `/models` 探测）——上游按 model 隔离前缀缓存，别名与全名混用必然 miss 一侧；记账同理归并。
 - **声明的元数据参与请求门控**：`ContextWindow` 用于上下文校验；`MaxOutputTokens` 在请求未显式给出输出上限时作为输出上限生效（回退链：请求值 → 注册表 → `WithDefaultMaxOutputTokens`）。
 - **`Type` 分类**：`chat`（默认假设）/ `embedding` / `rerank`。OpenAI 系 `/models` 不声明模型类型，SDK 不会猜测——需要区分时通过手动配置声明；它目前用于目录标注，`Embed` / `Rerank` 调用本身不依赖它。
 
@@ -45,7 +45,7 @@ models, err := client.RefreshModels(ctx)           // 同 ListModels（显式刷
 ```
 
 - `ListModels` 每次调用都拉取远端并写入注册表的 remote 层；`Chat`/`ChatStream` 的门控只用手动层，**不会**暗中发起网络请求。
-- `ModelInfo` 在手动层查不到时，会做一次 best-effort 的远端发现再查一次，仍无则返回 `ErrUnknownModel`。
+- `ModelInfo` 在手动层查不到时，会做一次 best-effort 的远端发现再查一次，仍无则返回 `ErrUnknownModel`。确认未知的 id 记 30 秒负缓存，期间重复查询不再打 `/models`（串行批量校验同一未知 id 不会放大流量）；TTL 过后下次查询重试发现。
 
 ## 协议探测
 

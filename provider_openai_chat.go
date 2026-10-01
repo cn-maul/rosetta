@@ -27,7 +27,7 @@ import (
 type openaiChatProvider struct {
 	c *Client
 
-	mu sync.Mutex
+	mu sync.RWMutex
 	// Sticky downgrades are remembered per model: one model's field support
 	// says nothing about another's behind a multi-model gateway, so a
 	// legacy model rejecting max_completion_tokens must not downgrade the
@@ -50,8 +50,8 @@ func (p *openaiChatProvider) initialState(model string) *oaSendState {
 		streamOptions: !p.c.settings.quirks.NoStreamUsage,
 		reasoning:     true,
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	// Precedence: explicit WithMaxTokensField pin > probed sticky state >
 	// LegacyMaxTokens quirk > modern default.
 	switch {
@@ -88,11 +88,31 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 	if max := p.c.effectiveMaxOutput(req); max > 0 {
 		pl[st.tokensField] = max
 	}
-	if req.Temperature != nil {
-		pl["temperature"] = *req.Temperature
+	// Sampling params (temperature/top_p) are rejected by reasoning-capable
+	// models, so they are dropped whenever reasoning_effort actually rides
+	// the wire — mirroring the Responses adapter (G1). A sticky reasoning
+	// drop or an unset effort sends no reasoning, so there is no conflict.
+	emitReasoning := false
+	if req.Thinking != nil && st.reasoning {
+		if eff := req.effort(); eff != EffortUnset {
+			pl["reasoning_effort"] = string(eff)
+			emitReasoning = true
+		}
 	}
-	if req.TopP != nil {
-		pl["top_p"] = *req.TopP
+	if emitReasoning {
+		if req.Temperature != nil {
+			p.c.settings.logger.Debug("openai-chat: dropping temperature for a reasoning request")
+		}
+		if req.TopP != nil {
+			p.c.settings.logger.Debug("openai-chat: dropping top_p for a reasoning request")
+		}
+	} else {
+		if req.Temperature != nil {
+			pl["temperature"] = *req.Temperature
+		}
+		if req.TopP != nil {
+			pl["top_p"] = *req.TopP
+		}
 	}
 	if len(req.StopSequences) > 0 {
 		pl["stop"] = req.StopSequences
@@ -114,11 +134,6 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 			})
 		}
 		pl["tools"] = tools
-	}
-	if req.Thinking != nil && st.reasoning {
-		if eff := req.effort(); eff != EffortUnset {
-			pl["reasoning_effort"] = string(eff)
-		}
 	}
 	if stream {
 		pl["stream"] = true
@@ -155,9 +170,14 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 				mm["content"] = t
 			}
 			var tcs []map[string]any
+			hadThinking := false
 			for _, b := range m.Blocks {
+				if b.Type == BlockThinking || b.Type == BlockRedactedThinking {
+					hadThinking = true
+					continue // thinking/redacted-thinking blocks are not replayable here
+				}
 				if b.Type != BlockToolCall {
-					continue // thinking blocks are not replayable here
+					continue
 				}
 				tcs = append(tcs, map[string]any{
 					"id":   b.ToolCallID,
@@ -170,6 +190,13 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 			}
 			if len(tcs) > 0 {
 				mm["tool_calls"] = tcs
+			}
+			if len(mm) == 1 && hadThinking {
+				// The assistant turn has no replayable content and carried
+				// thinking or redacted-thinking blocks, which this protocol
+				// cannot replay. Emit a clear error instead of a degenerate
+				// empty message that strict gateways reject (G6).
+				return nil, fmt.Errorf("%w: assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay", ErrInvalidRequest)
 			}
 			if len(mm) == 1 {
 				mm["content"] = ""
@@ -355,11 +382,19 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 		if err != nil {
 			return nil, err
 		}
+		hdr := p.headers("application/json")
+		retry := httpx.RetryIdempotent
+		if p.c.settings.quirks.NoIdempotencyKey {
+			retry = httpx.RetryDefault
+		} else {
+			hdr.Set("Idempotency-Key", newIdempotencyKey())
+		}
 		call := &httpx.Call{
-			Method: method,
-			URL:    url,
-			Header: p.headers("application/json"),
-			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+			Method:      method,
+			URL:         url,
+			Header:      hdr,
+			Body:        func() ([]byte, error) { return json.Marshal(payload) },
+			RetryPolicy: retry,
 		}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
@@ -393,11 +428,19 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		if err != nil {
 			return nil, err
 		}
+		hdr := p.headers("text/event-stream")
+		retry := httpx.RetryIdempotent
+		if p.c.settings.quirks.NoIdempotencyKey {
+			retry = httpx.RetryDefault
+		} else {
+			hdr.Set("Idempotency-Key", newIdempotencyKey())
+		}
 		call := &httpx.Call{
-			Method: method,
-			URL:    url,
-			Header: p.headers("text/event-stream"),
-			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+			Method:      method,
+			URL:         url,
+			Header:      hdr,
+			Body:        func() ([]byte, error) { return json.Marshal(payload) },
+			RetryPolicy: retry,
 		}
 		r, err := p.c.http.Do(ctx, call)
 		if err != nil {
@@ -523,6 +566,7 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 			}
 			if ch.Error != nil {
 				apiErr := ch.Error.apiError(200)
+				apiErr.InBand = true
 				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
 				return nil, apiErr
 			}
@@ -598,6 +642,8 @@ func mapOpenAIStop(s string) StopReason {
 		return StopToolUse
 	case "content_filter":
 		return StopContentFilter
+	case "refusal":
+		return StopRefusal
 	default:
 		return StopOther
 	}
@@ -728,6 +774,7 @@ func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) 
 	}
 	if r.Error != nil {
 		apiErr := r.Error.apiError(200)
+		apiErr.InBand = true
 		attachRequest(apiErr, rc)
 		return nil, apiErr
 	}
@@ -755,9 +802,10 @@ func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) 
 	if msg.Content.Set && msg.Content.Value != "" {
 		out.Content = append(out.Content, Block{Type: BlockText, Text: msg.Content.Value})
 	}
-	// A refusal arrives with content null; surface its text so the answer
-	// does not silently vanish.
-	if !msg.Content.Set && msg.Refusal.Set && msg.Refusal.Value != "" {
+	// A refusal surfaces as text whenever present, matching the streaming
+	// path (G5): a refusal that arrives alongside content must not be
+	// silently dropped from the unary reply.
+	if msg.Refusal.Set && msg.Refusal.Value != "" {
 		out.Content = append(out.Content, Block{Type: BlockText, Text: msg.Refusal.Value})
 	}
 	for _, tc := range msg.ToolCalls {

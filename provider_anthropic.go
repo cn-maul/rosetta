@@ -62,48 +62,80 @@ func (p *anthropicProvider) headers(stream bool) http.Header {
 	return h
 }
 
-// payloadNeedsExtendedCacheTTL reports whether the *built payload* carries a
-// cache breakpoint asking for the 1-hour TTL, which Anthropic gates behind a
-// beta header.
-//
-// The probe deliberately inspects the payload rather than the typed request:
+// anthroPayloadScan is the result of a single pass over a built Anthropic
+// payload, producing the three facts the request path needs: whether a 1h
+// cache TTL is requested (extended-cache-ttl beta), whether extended
+// thinking is combined with tools (interleaved-thinking beta), and how many
+// cache_control breakpoints are present (the 4-breakpoint ceiling).
+type anthroPayloadScan struct {
+	needsExtendedTTL bool
+	needsInterleaved bool
+	breakpoints      int
+}
+
+// scanAnthropicPayload walks a built payload once, collecting all three
+// facts in a single traversal instead of three separate recursive walks
+// (M3). It deliberately inspects the payload rather than the typed request:
 // breakpoints can arrive through Extra (WithExtraOverrides(true) writing
 // cache_control into tools/messages/system), and those are merged into the
 // payload only after the typed fields are rendered. Scanning the typed
 // request alone would let an Extra-supplied "1h" breakpoint reach the wire
 // without the beta header, which Anthropic answers with a 400.
-func payloadNeedsExtendedCacheTTL(v any) bool {
-	switch t := v.(type) {
-	case map[string]any:
-		for k, val := range t {
-			if k == "cache_control" {
-				if cc, ok := val.(map[string]any); ok {
-					if ttl, ok := cc["ttl"].(string); ok && ttl == "1h" {
-						return true
-					}
-				}
-				continue
-			}
-			if payloadNeedsExtendedCacheTTL(val) {
-				return true
-			}
-		}
-	case []any:
-		for _, item := range t {
-			if payloadNeedsExtendedCacheTTL(item) {
-				return true
-			}
-		}
-	case []map[string]any:
-		// Same reason as countCacheControl: the builder types messages,
-		// tools and content blocks as []map[string]any.
-		for _, item := range t {
-			if payloadNeedsExtendedCacheTTL(item) {
-				return true
+func scanAnthropicPayload(v any) anthroPayloadScan {
+	var s anthroPayloadScan
+	// Interleaved thinking is a top-level property of the payload root:
+	// extended thinking combined with tools.
+	if m, ok := v.(map[string]any); ok {
+		if _, hasThinking := m["thinking"]; hasThinking {
+			switch tools := m["tools"].(type) {
+			case []map[string]any:
+				// How the builder types tool definitions.
+				s.needsInterleaved = len(tools) > 0
+			case []any:
+				// How a tool list injected through Extra arrives after the
+				// JSON round-trip that normalizes Extra values.
+				s.needsInterleaved = len(tools) > 0
 			}
 		}
 	}
-	return false
+	var walk func(any)
+	walk = func(node any) {
+		switch t := node.(type) {
+		case map[string]any:
+			for k, val := range t {
+				if k == "cache_control" {
+					s.breakpoints++
+					if cc, ok := val.(map[string]any); ok {
+						if ttl, ok := cc["ttl"].(string); ok && ttl == "1h" {
+							s.needsExtendedTTL = true
+						}
+					}
+					continue
+				}
+				walk(val)
+			}
+		case []any:
+			for _, item := range t {
+				walk(item)
+			}
+		case []map[string]any:
+			// The Anthropic builder types messages, tools and content blocks
+			// as []map[string]any, not []any; without this case the walk
+			// stopped at the payload root and the guard always counted 0.
+			for _, item := range t {
+				walk(item)
+			}
+		}
+	}
+	walk(v)
+	return s
+}
+
+// payloadNeedsExtendedCacheTTL reports whether the *built payload* carries a
+// cache breakpoint asking for the 1-hour TTL, which Anthropic gates behind a
+// beta header. It delegates to the single-pass scan.
+func payloadNeedsExtendedCacheTTL(v any) bool {
+	return scanAnthropicPayload(v).needsExtendedTTL
 }
 
 // payloadNeedsInterleavedThinking reports whether the built payload enables
@@ -111,35 +143,20 @@ func payloadNeedsExtendedCacheTTL(v any) bool {
 // documents for the interleaved-thinking beta ("only supported for tools used
 // through the Messages API"). A request without tools gains nothing from the
 // header, and leaving it off keeps the request acceptable to gateways that
-// forward to platforms where the header is rejected.
+// forward to platforms where the header is rejected. It delegates to the
+// single-pass scan.
 func payloadNeedsInterleavedThinking(v any) bool {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return false
-	}
-	if _, ok := m["thinking"]; !ok {
-		return false
-	}
-	switch tools := m["tools"].(type) {
-	case []map[string]any:
-		// How the builder types tool definitions.
-		return len(tools) > 0
-	case []any:
-		// How a tool list injected through Extra arrives after the JSON
-		// round-trip that normalizes Extra values.
-		return len(tools) > 0
-	}
-	return false
+	return scanAnthropicPayload(v).needsInterleaved
 }
 
 // wantsInterleavedThinking resolves the tri-state WithInterleavedThinking
 // setting against the payload: an explicit choice wins, otherwise the payload
 // decides.
-func (p *anthropicProvider) wantsInterleavedThinking(payload map[string]any) bool {
+func (p *anthropicProvider) wantsInterleavedThinking(needsInterleaved bool) bool {
 	if v := p.c.settings.interleavedThinking; v != nil {
 		return *v
 	}
-	return payloadNeedsInterleavedThinking(payload)
+	return needsInterleaved
 }
 
 // betaHeaders returns the value for the anthropic-beta header, or "" when the
@@ -147,12 +164,12 @@ func (p *anthropicProvider) wantsInterleavedThinking(payload map[string]any) boo
 // individually because a second Set would overwrite the first: a request that
 // uses both a 1-hour cache TTL and interleaved thinking has to advertise both
 // betas or Anthropic rejects it for the one that went missing.
-func (p *anthropicProvider) betaHeaders(payload map[string]any) string {
+func (p *anthropicProvider) betaHeaders(scan anthroPayloadScan) string {
 	var betas []string
-	if payloadNeedsExtendedCacheTTL(payload) {
+	if scan.needsExtendedTTL {
 		betas = append(betas, extendedCacheTTLBeta)
 	}
-	if p.wantsInterleavedThinking(payload) {
+	if p.wantsInterleavedThinking(scan.needsInterleaved) {
 		betas = append(betas, interleavedThinkingBeta)
 	}
 	return strings.Join(betas, ",")
@@ -161,37 +178,10 @@ func (p *anthropicProvider) betaHeaders(payload map[string]any) string {
 // countCacheControl walks a built payload counting cache_control breakpoints
 // so the wire request can be checked against Anthropic's four-breakpoint
 // ceiling — which is enforced on what actually reaches the API, so an
-// empty-text block whose breakpoint was dropped is not counted.
+// empty-text block whose breakpoint was dropped is not counted. It delegates
+// to the single-pass scan.
 func countCacheControl(v any) int {
-	switch t := v.(type) {
-	case map[string]any:
-		n := 0
-		for k, val := range t {
-			if k == "cache_control" {
-				n++
-				continue
-			}
-			n += countCacheControl(val)
-		}
-		return n
-	case []any:
-		n := 0
-		for _, item := range t {
-			n += countCacheControl(item)
-		}
-		return n
-	case []map[string]any:
-		// The Anthropic builder types messages, tools and content blocks as
-		// []map[string]any, not []any; without this case the walk stopped at
-		// the payload root and the guard always counted 0.
-		n := 0
-		for _, item := range t {
-			n += countCacheControl(item)
-		}
-		return n
-	default:
-		return 0
-	}
+	return scanAnthropicPayload(v).breakpoints
 }
 
 // anthroPlan is the per-request resolution of max_tokens and thinking
@@ -256,10 +246,13 @@ func (pl *anthroPlan) rectify(msg string) bool {
 }
 
 // buildPayload renders the unified request into the Anthropic wire payload.
-func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anthroPlan) (map[string]any, error) {
+// It returns the payload together with a single-pass scan of it (extended
+// TTL / interleaved thinking / breakpoint count) so the caller derives the
+// beta headers without re-walking the tree (M3).
+func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anthroPlan) (map[string]any, anthroPayloadScan, error) {
 	system, msgs, err := p.encodeMessages(req)
 	if err != nil {
-		return nil, err
+		return nil, anthroPayloadScan{}, err
 	}
 	payload := map[string]any{
 		"model":      req.Model,
@@ -315,12 +308,13 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 		payload["stream"] = true
 	}
 	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, anthropicReservedPayloadKeys); err != nil {
-		return nil, err
+		return nil, anthroPayloadScan{}, err
 	}
-	if n := countCacheControl(payload); n > maxCacheBreakpoints {
-		return nil, fmt.Errorf("%w: anthropic allows at most %d cache breakpoints, request has %d", ErrInvalidRequest, maxCacheBreakpoints, n)
+	scan := scanAnthropicPayload(payload)
+	if scan.breakpoints > maxCacheBreakpoints {
+		return nil, anthroPayloadScan{}, fmt.Errorf("%w: anthropic allows at most %d cache breakpoints, request has %d", ErrInvalidRequest, maxCacheBreakpoints, scan.breakpoints)
 	}
-	return payload, nil
+	return payload, scan, nil
 }
 
 // encodeMessages maps unified messages onto Anthropic's shape: system
@@ -352,8 +346,20 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 	for _, m := range req.Messages {
 		switch m.Role {
 		case RoleSystem:
-			if t := m.text(); t != "" {
-				sysParts = append(sysParts, anthroSysPart{text: t, cc: firstCacheControl(m.Blocks)})
+			if firstCacheControl(m.Blocks) != nil {
+				// Preserve every text block as its own segment so each cache
+				// breakpoint survives (G2). The system then renders as an
+				// array of text blocks, which Anthropic supports; collapsing
+				// them into one string would silently drop all but the first
+				// breakpoint, violating the SDK's "breakpoints must not
+				// vanish silently" principle.
+				for _, b := range m.Blocks {
+					if b.Type == BlockText && b.Text != "" {
+						sysParts = append(sysParts, anthroSysPart{text: b.Text, cc: b.CacheControl})
+					}
+				}
+			} else if t := m.text(); t != "" {
+				sysParts = append(sysParts, anthroSysPart{text: t})
 			}
 		case RoleUser:
 			add("user", m.Blocks)
@@ -376,6 +382,7 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 	out := make([]map[string]any, 0, len(msgs))
 	for _, m := range msgs {
 		blocks := make([]map[string]any, 0, len(m.blocks))
+		hadThinking := false
 		for _, b := range m.blocks {
 			switch b.Type {
 			case BlockText:
@@ -416,6 +423,7 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 				if m.role != "assistant" {
 					continue
 				}
+				hadThinking = true
 				// Anthropic rejects replayed thinking blocks that lack a
 				// valid signature, so an unsigned block (e.g. one the caller
 				// hand-authored) is dropped rather than poisoning the turn.
@@ -451,6 +459,12 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 			}
 		}
 		if len(blocks) == 0 {
+			// An assistant turn that became empty because every thinking
+			// block was dropped (unsigned) must not vanish silently — the
+			// caller needs to know the signature is missing (G6).
+			if m.role == "assistant" && hadThinking {
+				return nil, nil, fmt.Errorf("%w: assistant turn has only unsigned thinking blocks, which anthropic cannot replay (missing signature)", ErrInvalidRequest)
+			}
 			continue
 		}
 		out = append(out, map[string]any{"role": m.role, "content": blocks})
@@ -612,7 +626,7 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 	url := joinEndpoint(p.c.settings.endpoint, "/messages")
 	pl := p.plan(req)
 	for {
-		payload, err := p.buildPayload(req, false, pl)
+		payload, scan, err := p.buildPayload(req, false, pl)
 		if err != nil {
 			return nil, err
 		}
@@ -620,14 +634,21 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 		// breakpoints and thinking configs contributed by Extra are seen by
 		// the beta switch too.
 		hdr := p.headers(false)
-		if beta := p.betaHeaders(payload); beta != "" {
+		if beta := p.betaHeaders(scan); beta != "" {
 			hdr.Set("anthropic-beta", beta)
 		}
+		retry := httpx.RetryIdempotent
+		if p.c.settings.quirks.NoIdempotencyKey {
+			retry = httpx.RetryDefault
+		} else {
+			hdr.Set("Idempotency-Key", newIdempotencyKey())
+		}
 		call := &httpx.Call{
-			Method: method,
-			URL:    url,
-			Header: hdr,
-			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+			Method:      method,
+			URL:         url,
+			Header:      hdr,
+			Body:        func() ([]byte, error) { return json.Marshal(payload) },
+			RetryPolicy: retry,
 		}
 		resp, err := p.c.http.Do(ctx, call)
 		if err != nil {
@@ -657,19 +678,26 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 	pl := p.plan(req)
 	var resp *http.Response
 	for {
-		payload, err := p.buildPayload(req, true, pl)
+		payload, scan, err := p.buildPayload(req, true, pl)
 		if err != nil {
 			return nil, err
 		}
 		hdr := p.headers(true)
-		if beta := p.betaHeaders(payload); beta != "" {
+		if beta := p.betaHeaders(scan); beta != "" {
 			hdr.Set("anthropic-beta", beta)
 		}
+		retry := httpx.RetryIdempotent
+		if p.c.settings.quirks.NoIdempotencyKey {
+			retry = httpx.RetryDefault
+		} else {
+			hdr.Set("Idempotency-Key", newIdempotencyKey())
+		}
 		call := &httpx.Call{
-			Method: method,
-			URL:    url,
-			Header: hdr,
-			Body:   func() ([]byte, error) { return json.Marshal(payload) },
+			Method:      method,
+			URL:         url,
+			Header:      hdr,
+			Body:        func() ([]byte, error) { return json.Marshal(payload) },
+			RetryPolicy: retry,
 		}
 		r, err := p.c.http.Do(ctx, call)
 		if err != nil {
@@ -803,6 +831,7 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 				} else {
 					apiErr = &APIError{StatusCode: 200, Type: "api_error", Message: "stream error event without details"}
 				}
+				apiErr.InBand = true
 				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
 				return nil, apiErr
 			case "message_start":
@@ -1060,6 +1089,7 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 		// An in-band 200 error still carries request context, so callers can
 		// log and retry it like a non-2xx failure.
 		apiErr := r.Error.apiError(200)
+		apiErr.InBand = true
 		attachRequest(apiErr, rc)
 		return nil, apiErr
 	}

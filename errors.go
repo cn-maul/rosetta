@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -76,7 +75,12 @@ type APIError struct {
 	// policy allows it (GET-like methods by default; non-idempotent POSTs
 	// like chat require an explicit policy).
 	Retryable bool
-	Raw       json.RawMessage // original response body (may be truncated)
+	// InBand marks an error that arrived inside a 200 response body or a
+	// stream event rather than as a non-2xx HTTP status. Such errors carry
+	// StatusCode=200 (the transport succeeded) but are real failures; callers
+	// that gate on StatusCode >= 400 must also check InBand (G11).
+	InBand bool
+	Raw    json.RawMessage // original response body (may be truncated)
 }
 
 func (e *APIError) Error() string {
@@ -85,14 +89,14 @@ func (e *APIError) Error() string {
 	// Type/Code/Message are taken verbatim from the provider body, which can
 	// echo the caller's key or prompt; mask credential patterns before the
 	// string reaches any log.
-	if t := maskSecrets(e.Type); t != "" {
+	if t := httpx.MaskSecrets(e.Type); t != "" {
 		b.WriteString(" (" + t)
-		if c := maskSecrets(e.Code); c != "" {
+		if c := httpx.MaskSecrets(e.Code); c != "" {
 			b.WriteString("/" + c)
 		}
 		b.WriteString(")")
 	}
-	if m := maskSecrets(e.Message); m != "" {
+	if m := httpx.MaskSecrets(e.Message); m != "" {
 		b.WriteString(": " + m)
 	}
 	return b.String()
@@ -205,7 +209,7 @@ func safeTruncateBody(body []byte) json.RawMessage {
 	}
 	// Mask key material on the full body, then truncate and degrade to a
 	// JSON string.
-	raw := truncateBody(secretRe.ReplaceAll(body, []byte("***")))
+	raw := truncateBody(httpx.MaskSecretBytes(body))
 	if !json.Valid(raw) { // short non-JSON body: degrade to a JSON string
 		s, _ := json.Marshal(string(raw))
 		return json.RawMessage(s)
@@ -213,21 +217,13 @@ func safeTruncateBody(body []byte) json.RawMessage {
 	return raw // truncateBody already degraded an oversized body to a string
 }
 
-// secretRe matches common credential shapes a provider might echo back into
-// an error body or message: OpenAI/Anthropic "sk-...", Google "AIza...",
-// AWS "AKIA...", GitHub "ghp_/gho_/ghs_/ghu_/ghr_...", Slack "xox...",
-// and JWT "eyJ<header>.<payload>.<sig>" tokens. Matches are masked before
-// anything reaches logs or error strings.
-var secretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}`)
-
-// maskSecrets replaces credential patterns in s with a fixed marker.
-func maskSecrets(s string) string { return secretRe.ReplaceAllString(s, "***") }
-
 // safeURL renders a request URL for an error string: displayEndpoint strips
-// userinfo/query/fragment, and maskSecrets catches path-embedded credentials
-// (e.g. a proxy routing key as …/proxy/sk-ant-…) that survive normalization
-// (audit C9).
-func safeURL(u string) string { return maskSecrets(displayEndpoint(u)) }
+// userinfo/query/fragment, and httpx.MaskSecrets catches path-embedded
+// credentials (e.g. a proxy routing key as …/proxy/sk-ant-…) that survive
+// normalization (audit C9). The credential regexp lives in httpx so the
+// transport's log redaction and this package's error redaction share one
+// definition.
+func safeURL(u string) string { return httpx.MaskSecrets(displayEndpoint(u)) }
 
 // redactJSON masks sensitive values in a valid-JSON body while keeping it
 // valid JSON: sensitive-keyed values become "[redacted]" and key-material
@@ -242,14 +238,14 @@ func redactJSON(raw json.RawMessage) json.RawMessage {
 	dec.UseNumber()
 	var v any
 	if err := dec.Decode(&v); err != nil {
-		return secretRe.ReplaceAll(raw, []byte("***"))
+		return httpx.MaskSecretBytes(raw)
 	}
 	redactValue(v)
 	out, err := json.Marshal(v)
 	if err != nil {
-		return secretRe.ReplaceAll(raw, []byte("***"))
+		return httpx.MaskSecretBytes(raw)
 	}
-	return secretRe.ReplaceAll(out, []byte("***"))
+	return httpx.MaskSecretBytes(out)
 }
 
 func redactValue(v any) {

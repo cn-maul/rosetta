@@ -148,7 +148,7 @@ func TestAnthropicSystemWireShape(t *testing.T) {
 
 	build := func(req *ChatRequest) map[string]any {
 		t.Helper()
-		payload, err := p.buildPayload(req, false, p.plan(req))
+		payload, _, err := p.buildPayload(req, false, p.plan(req))
 		if err != nil {
 			t.Fatalf("buildPayload: %v", err)
 		}
@@ -312,7 +312,7 @@ func TestAnthropicCacheBreakpointsReachEveryBlockKind(t *testing.T) {
 			}},
 		},
 	}
-	payload, err := p.buildPayload(req, false, p.plan(req))
+	payload, _, err := p.buildPayload(req, false, p.plan(req))
 	if err != nil {
 		t.Fatalf("buildPayload: %v", err)
 	}

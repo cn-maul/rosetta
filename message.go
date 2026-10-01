@@ -339,7 +339,14 @@ func validateImageURL(u string) error {
 		if payload == "" {
 			return fmt.Errorf("image data: URL has an empty payload")
 		}
-		if strings.Contains(head, ";base64") && !isBase64(payload) {
+		// Only the ;base64 form is accepted: URL-form data: URLs have no
+		// protocol that actually supports them, and the Anthropic encoder
+		// would reject them with a misleading error (G4). Tightening here
+		// surfaces the mismatch at validation time with a consistent message.
+		if !strings.Contains(head, ";base64") {
+			return fmt.Errorf("image data: URL must use the ;base64 form")
+		}
+		if !isBase64(payload) {
 			return fmt.Errorf("image data: URL payload is not valid base64")
 		}
 		return nil
@@ -362,7 +369,13 @@ func validateFileData(data string) error {
 		if payload == "" {
 			return fmt.Errorf("file data URL has an empty payload")
 		}
-		if strings.Contains(head, ";base64") && !isBase64(payload) {
+		// Only the ;base64 form is accepted: URL-form data: URLs have no
+		// protocol that actually supports them, and the Anthropic encoder
+		// would reject them with a misleading error (G4).
+		if !strings.Contains(head, ";base64") {
+			return fmt.Errorf("file data URL must use the ;base64 form")
+		}
+		if !isBase64(payload) {
 			return fmt.Errorf("file data URL payload is not valid base64")
 		}
 		return nil
@@ -376,14 +389,56 @@ func validateFileData(data string) error {
 	return nil
 }
 
-// isBase64 reports whether s is valid standard (padded or raw) base64.
+// isBase64 reports whether s is valid standard (padded or raw) base64. The
+// common case is validated by character set, length and padding rules alone
+// — a multi-MB PDF or audio payload is never fully decoded just to check it.
+// Only when the fast check fails does it fall back to a real decode, so a
+// subtle malformation the fast check misses is still caught.
 func isBase64(s string) bool {
 	if s == "" {
 		return false
+	}
+	if validBase64(s) {
+		return true
 	}
 	if _, err := base64.StdEncoding.DecodeString(s); err == nil {
 		return true
 	}
 	_, err := base64.RawStdEncoding.DecodeString(s)
 	return err == nil
+}
+
+// validBase64 reports whether s is well-formed base64 by character set,
+// length and padding rules alone, without decoding. It accepts both padded
+// and raw forms, matching the leniency of the standard decoder (which does
+// not validate the unused bits of the final group).
+func validBase64(s string) bool {
+	n := len(s)
+	pad := 0
+	for n > 0 && s[n-1] == '=' {
+		pad++
+		n--
+	}
+	if pad > 2 {
+		return false
+	}
+	// A single leftover character is never valid; with padding the total
+	// length must be a multiple of 4.
+	if n%4 == 1 {
+		return false
+	}
+	if pad > 0 && (n+pad)%4 != 0 {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if !isBase64Char(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// isBase64Char reports whether c is a base64 alphabet character.
+func isBase64Char(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '+' || c == '/'
 }

@@ -1,5 +1,43 @@
 # 更新日志
 
+## v0.6.0 (2026-10-01)
+
+第五轮审计（正确性）+ 性能优化调研的落地批次。**含调用方可见的行为变更**（见下节）——按 semver 视为 minor。
+
+### 行为变更（升级前必读）
+
+- **一元调用默认超时 60s**。`Chat` / `ListModels` / `Embed` / `Rerank` 在未显式设置 `WithTimeout` 时，现在有 60s 的默认总超时；底层传输层另加了 30s 的 `ResponseHeaderTimeout`（服务端"已建连但不回响应头"不再无限挂起）。`WithTimeout(0)` 关闭该默认上界。流式仍由调用方 ctx 管辖、不受影响。
+- **chat 现在自动发送 `Idempotency-Key` 并对 429/503 做传输层退避重试**。此前 chat POST 的 429/503 直接透传给调用方；现在会带上幂等键并按退避重试（默认最多 2 次）。对官方 OpenAI/Anthropic 端点更健壮；对不识别该头或绝不能重放的第三方网关，用 `WithQuirks(Quirks{NoIdempotencyKey: true})` 恢复旧行为（不发该头、429/503 立即报错）。
+- **OpenAI Chat 在 reasoning 请求上不再发送 `temperature`/`top_p`**（修复 G1）。官方 reasoning 模型（o 系列、gpt-5 系）会因这两个参数返回 400；现在只要 `reasoning_effort` 上 wire，采样参数即被丢弃（与 Responses/Anthropic 适配器对齐）。
+- **上下文 token 估算改为整体一次取整**（修复 M8）。此前逐块向上取整后累加，大量短文本块时系统性高估；现在按全部文本的 ASCII/非 ASCII 计数一次取整，估算整体略降、更接近真实。依赖严格上下文告警阈值的调用方可能看到告警减少。
+- **模型别名上 wire 前规范化。** 请求发出前把注册表别名解析为规范 ID 再发送（未知模型原样透传，不触发 `/models` 探测）；用量记账的 `UsageRecord.Model` / `Stats().ByModel` 同步按规范 ID 归并。直接检查 wire 或日志的调用方会看到 `model` 字段变为规范名；别名与全名混用的调用方，上游前缀缓存与用量统计不再把同一模型拆成两个 key。
+- **默认 Transport 不再继承环境代理。** 自建的 `*http.Transport` 未设置 `Proxy`，而此前的 `http.DefaultTransport` 会读 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`。默认现在直连——内网域名与 `http://` 端点的 API key 不再流经代理；需要环境代理的调用方显式传 `WithHTTPClient(&http.Client{Transport: http.DefaultTransport})`（或自带 `Proxy: http.ProxyFromEnvironment` 的 Transport）。
+
+### 新增
+
+- **`Quirks.NoIdempotencyKey`**：见上。
+- **自建默认 `*http.Transport`**（`MaxIdleConnsPerHost=64`、显式 h2），替代进程级共享的 `http.DefaultTransport`（其 `MaxIdleConnsPerHost=2`）。高并发下连接复用更好、尾延迟更低；`WithHTTPClient` 仍可完全覆盖。
+
+### 修复
+
+- **G2**：Anthropic system 段的多断点不再被静默折叠成一个，每个带 `CacheControl` 的 text 块各自成段。
+- **G3 / N1**：重试日志与协议探测失败日志不再裸打 URL，路径内嵌凭据会被脱敏；凭据正则收敛到 `internal/httpx` 单一出处，避免两处漂移。
+- **重试睡眠与 deadline 交互**：退避期间调用方 deadline 到期时，返回的最后一个响应 body 不再是被关闭的（修复 M4 引入的闭包 body 回归）。
+- **sticky 降级锁**改为 RWMutex；**DetectClient** 不再重复构建 settings；**Anthropic payload 单趟扫描**替代三次整树遍历；SSE 读行改 `ReadSlice` 并复用事件缓冲；`Partial()` 内容缓存；Embed/Rerank 的 wire 计数仅在 `Extra` 实际覆盖字段时执行；base64 校验改字符集+长度判定（大载荷不再整份解码）；`Extra` 序列化在 `validate()` 与估算间复用；被重试丢弃的响应 drain 上限 8KiB → 64KiB。均为内部性能项，对外行为不变。
+- **跨主机重定向拒绝改为永久错误**：不再先 sleep 完退避序列（约 1.2s）才失败，`Do` 立即返回。
+- **G4**：`data:` URL 校验层与编码层一致——校验层现在也只接受 `;base64` 形态，URL 形式的图片/文件在 `validate()` 阶段即以一致口径报错，不再等 Anthropic 编码时给出误导性错误。
+- **G5**：一元响应里 refusal 与 content 并存时不再丢弃 refusal（与流式路径对齐）。
+- **G6**：只有 thinking / redacted-thinking 块的 assistant 回放不再退化成空 content 消息或静默消失，而是在编码阶段显式报 `ErrInvalidRequest` 并说明原因（不可回放/缺签名）。
+- **G7**：未知模型的负缓存（30s TTL）——串行批量校验同一未知 id 不再对 `/models` 打出 1:1 放大流量。
+- **G8**：`StopRefusal` 映射对齐——OpenAI chat 的 `finish_reason:"refusal"` 与 Responses 的 `incomplete_details.reason:"refusal"` 现在都映射到 `StopRefusal`（此前落到 `StopOther`）。
+- **G9**：调用方主动 `Close()` 的流不再被计入 `UsageMissing`，与"provider 未报 usage"区分开，统计口径更准。
+- **G10**：`ErrNoEndpoint` 保留为防御性断言并加注释说明其不可达性（`buildSettings` 对已知协议必然填默认端点）。
+- **G11**：in-band 错误（200 body / 流事件内的 `error`）新增 `APIError.InBand` 标记，同时保留 `StatusCode=200`（传输层确实成功）；按 `StatusCode >= 400` 判定失败的调用方应同时检查 `InBand`。
+
+### 工程
+
+- **清理审计工作产物**：历轮审计报告与证据文件（复现脚本、race 证据、测试基线）移出仓库，各轮修复的结论已并入本更新日志的对应版本条目；仓库只保留面向使用者的文档（基础指南、流式、模型体系、协议与兼容、用量统计）。
+
 ## v0.5.1 (2026-09-20)
 
 修复 v0.5.0 引入的错误消息文案回归。只影响人读的字符串，`errors.Is` 匹配一直正常；升级无需改代码。
@@ -129,7 +167,7 @@
 - 流式响应在 EOF 缺终止事件时 `Err()` 返回匹配 `ErrStreamTruncated` 的错误（此前返回 nil）。
 - Embedding / Rerank 对空结果、数量不匹配、非法 index/score 的响应改为报错（此前按原样返回）。
 
-### 修复（2026-09-13 第二轮审计，报告：docs/audit-2026-09-13.md）
+### 修复（2026-09-13 第二轮审计）
 
 针对审计报告的 13 项主要发现与边界项的逐条修复，新增 `audit_report_fixes_test.go` 回归测试（16 例）。
 

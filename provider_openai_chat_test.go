@@ -59,8 +59,13 @@ func TestOpenAIChatBuildPayload(t *testing.T) {
 	if pl["model"] != "gpt-4o" || pl["max_completion_tokens"] != 100 {
 		t.Fatalf("core fields wrong: %v %v", pl["model"], pl["max_completion_tokens"])
 	}
-	if pl["temperature"] != 0.7 || pl["top_p"] != 0.9 {
-		t.Fatalf("sampling wrong: %v %v", pl["temperature"], pl["top_p"])
+	// G1: a reasoning request must drop sampling params (reasoning-capable
+	// models reject temperature/top_p with a 400).
+	if _, has := pl["temperature"]; has {
+		t.Fatal("temperature must be dropped for a reasoning request")
+	}
+	if _, has := pl["top_p"]; has {
+		t.Fatal("top_p must be dropped for a reasoning request")
 	}
 	if pl["reasoning_effort"] != "high" {
 		t.Fatalf("reasoning_effort = %v", pl["reasoning_effort"])

@@ -93,25 +93,29 @@ type streamCore struct {
 	cancel context.CancelFunc
 	closer io.Closer
 
-	mu       sync.Mutex
-	done     bool
-	released bool
-	closeErr error
-	err      error
-	cur      *Event
-	partial  ChatResponse
-	usage    Usage
+	mu              sync.Mutex
+	done            bool
+	released        bool
+	abortedByCaller bool
+	closeErr        error
+	err             error
+	cur             *Event
+	partial         ChatResponse
+	usage           Usage
 
 	// Accumulation uses per-block builders appended amortized, not string
 	// += (which is O(n²) per delta) — audit B8. Blocks are keyed by provider
 	// content-block index so out-of-order emitters merge into the right block
-	// (audit C17). Content is materialized from these on read.
-	acc      []*accBlock
-	textPos  map[int]int
-	thinkPos map[int]int
-	toolPos  map[int]int
-	accBytes int
-	overflow bool
+	// (audit C17). Content is materialized from these on read and cached so
+	// repeated Partial() calls do not rebuild it every time (M10).
+	acc          []*accBlock
+	textPos      map[int]int
+	thinkPos     map[int]int
+	toolPos      map[int]int
+	accBytes     int
+	overflow     bool
+	contentCache []Block
+	contentDirty bool
 }
 
 // accBlock accumulates one output block. Exactly one of the builders is
@@ -190,6 +194,24 @@ func (s *streamCore) attachCloser(c io.Closer) {
 		return
 	}
 	s.closer = c
+}
+
+// attachOnEnd registers the owner callback under the lock, so the write is
+// synchronized with takeOnEnd's locked read rather than relying on an
+// implicit ordering argument (M10). If the stream already terminated, the
+// callback fires immediately with the terminal values, outside the lock.
+func (s *streamCore) attachOnEnd(onEnd func(Usage, error)) {
+	s.mu.Lock()
+	if s.released {
+		usage, err := s.usage, s.err
+		s.mu.Unlock()
+		if onEnd != nil {
+			onEnd(usage, err)
+		}
+		return
+	}
+	s.onEnd = onEnd
+	s.mu.Unlock()
 }
 
 func (s *streamCore) Next() bool {
@@ -274,7 +296,15 @@ func (s *streamCore) Partial() *ChatResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cp := s.partial
-	cp.Content = s.buildContent()
+	// Rebuild the content only when the accumulator changed since the last
+	// call; otherwise reuse the cache. A shallow copy of the cached slice is
+	// returned so the caller cannot corrupt the cache, while avoiding the
+	// per-block string allocations of buildContent() on every call (M10).
+	if s.contentDirty || s.contentCache == nil {
+		s.contentCache = s.buildContent()
+		s.contentDirty = false
+	}
+	cp.Content = append([]Block(nil), s.contentCache...)
 	return &cp
 }
 
@@ -297,6 +327,7 @@ func (s *streamCore) Collect() (*ChatResponse, error) {
 func (s *streamCore) Close() error {
 	s.mu.Lock()
 	s.done = true
+	s.abortedByCaller = true
 	s.releaseLocked()
 	closeErr := s.closeErr
 	s.mu.Unlock()
@@ -307,6 +338,15 @@ func (s *streamCore) Close() error {
 		call(usage, err)
 	}
 	return closeErr
+}
+
+// aborted reports whether the stream was terminated by a caller Close()
+// rather than by a clean end or an error. The owner callback uses it to
+// avoid counting a caller-abandoned stream as a missing-usage response (G9).
+func (s *streamCore) aborted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.abortedByCaller
 }
 
 // releaseLocked finalizes the stream exactly once: cancels the request
@@ -363,6 +403,7 @@ func (s *streamCore) apply(ev *Event) {
 	case EventTextDelta:
 		if b := s.blockFor(&s.textPos, ev.BlockIndex, BlockText, len(ev.Text)); b != nil {
 			b.text.WriteString(ev.Text)
+			s.contentDirty = true
 		}
 	case EventThinkingDelta:
 		if b := s.blockFor(&s.thinkPos, ev.BlockIndex, BlockThinking, len(ev.Text)); b != nil {
@@ -370,6 +411,7 @@ func (s *streamCore) apply(ev *Event) {
 			if ev.Signature != "" {
 				b.signature = ev.Signature
 			}
+			s.contentDirty = true
 		}
 	case EventToolCall:
 		if b := s.blockFor(&s.toolPos, ev.ToolIndex, BlockToolCall, len(ev.ArgumentsDelta)); b != nil {
@@ -380,6 +422,7 @@ func (s *streamCore) apply(ev *Event) {
 				b.toolName = ev.ToolName
 			}
 			b.args.WriteString(ev.ArgumentsDelta)
+			s.contentDirty = true
 		}
 	case EventMessageEnd:
 		if ev.StopReason != "" {

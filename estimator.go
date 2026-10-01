@@ -51,27 +51,40 @@ func EstimateTokens(text string) int {
 // per-message overhead, flat per-block multimedia estimates, the tool
 // definitions offered to the model, and a serialized-length fallback for
 // Extra (which reaches the payload after every typed field is rendered).
+//
+// Text tokens are accumulated as raw rune counts and rounded once at the
+// end, rather than calling EstimateTokens per block: rounding up each small
+// block and summing would systematically overestimate a prompt made of many
+// short blocks (M8).
 func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 	est = est.resolve()
 	total := 0
+	ascii, other := 0, 0
+	addText := func(s string) {
+		a, o := tokenCounts(s)
+		ascii += a
+		other += o
+	}
 	if r.System != "" {
-		total += EstimateTokens(r.System) + 4
+		addText(r.System)
+		total += 4
 	}
 	for _, m := range r.Messages {
 		total += 4
 		for _, b := range m.Blocks {
 			switch b.Type {
 			case BlockText:
-				total += EstimateTokens(b.Text)
+				addText(b.Text)
 			case BlockThinking:
 				// The signature is replayed verbatim on every turn, so it
 				// occupies real prompt tokens; ignoring it undercounts a
 				// multi-turn extended-thinking conversation (audit B15).
-				total += EstimateTokens(b.Thinking) + EstimateTokens(b.Signature)
+				addText(b.Thinking)
+				addText(b.Signature)
 			case BlockRedactedThinking:
 				// Redacted reasoning rides in the Thinking field as an opaque
 				// base64 payload that is also replayed unchanged.
-				total += EstimateTokens(b.Thinking)
+				addText(b.Thinking)
 			case BlockImage:
 				total += est.Image
 			case BlockAudio:
@@ -83,16 +96,19 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 				// real PDF cost varies by page count and content.
 				total += est.File
 			case BlockToolCall:
-				total += EstimateTokens(b.Arguments) + 16
+				addText(b.Arguments)
+				total += 16
 			case BlockToolResult:
-				total += EstimateTokens(b.Content)
+				addText(b.Content)
 			}
 		}
 	}
 	for _, t := range r.Tools {
 		// Per-tool overhead plus the name, description and schema text.
-		total += 24 + EstimateTokens(t.Name) + EstimateTokens(t.Description)
-		total += EstimateTokens(string(t.Parameters))
+		total += 24
+		addText(t.Name)
+		addText(t.Description)
+		addText(string(t.Parameters))
 	}
 	if len(r.Extra) > 0 {
 		// Extra is the documented escape hatch for provider-specific fields
@@ -101,10 +117,32 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 		// catalog) that the walk above never sees. Falling back to the
 		// serialized length keeps the gate from being bypassed entirely;
 		// it over-counts structure and keys, which suits an estimate that
-		// must err on the high side.
-		if b, err := json.Marshal(r.Extra); err == nil {
-			total += EstimateTokens(string(b))
+		// must err on the high side. The serialization is reused from
+		// validate() when available so a large Extra is not re-marshaled
+		// (M7).
+		b := r.extraJSON
+		if b == nil {
+			if b2, err := json.Marshal(r.Extra); err == nil {
+				b = b2
+			}
+		}
+		if b != nil {
+			addText(string(b))
 		}
 	}
+	total += (ascii+3)/4 + other
 	return total
+}
+
+// tokenCounts returns the raw ASCII and non-ASCII rune counts of text,
+// without the per-block ceiling that EstimateTokens applies.
+func tokenCounts(text string) (ascii, other int) {
+	for _, r := range text {
+		if r < 0x80 {
+			ascii++
+		} else {
+			other++
+		}
+	}
+	return
 }

@@ -25,7 +25,7 @@
 | `StopLength` | length | incomplete(max_output_tokens) | max_tokens |
 | `StopToolUse` | tool_calls / function_call | — | tool_use |
 | `StopContentFilter` | content_filter | incomplete(content_filter) | — |
-| `StopRefusal` | — | — | refusal |
+| `StopRefusal` | refusal | incomplete(refusal) | refusal |
 | `StopOther` | 其余值 | 其余状态 | 其余值 |
 
 补充语义：非流式 200 响应省略终止原因时视为 `StopEnd`（一次性响应必然完整）；流式在未收到任何终止信号就 EOF 时合成 `StopOther`（截断信号，见[流式响应](streaming.md#中断与收尾语义)）。
@@ -78,7 +78,7 @@ req := &rosetta.ChatRequest{
 
 - `EphemeralCache()` = 默认 5 分钟（每次命中续期）；`ExtendedCache()` = 1 小时扩展缓存。非法 TTL 在本地 `ErrInvalidRequest` 拒绝。
 - 断点可打在 text / image / document / tool_result / tool_use 块与工具定义上；打在 Anthropic 不支持的位置（如 thinking 块）会本地报错，而非静默丢弃。
-- system 断点用一条带 `CacheControl` 的 `RoleSystem` 消息表达（`ChatRequest.System` 是纯字符串、无法携带断点）。有断点时适配器把 `system` 渲染成 Anthropic 的 text-block 数组；无断点时仍是原来的字符串，**wire 字节不变**，不影响既有调用的命中。
+- system 断点用一条带 `CacheControl` 的 `RoleSystem` 消息表达（`ChatRequest.System` 是纯字符串、无法携带断点）。有断点时适配器把 `system` 渲染成 Anthropic 的 text-block 数组；消息内**每个**带 `CacheControl` 的 text 块各自成为一个数组段、断点独立生效（v0.6.0 起，不再折叠到第一个）；无断点时仍是原来的字符串，**wire 字节不变**，不影响既有调用的命中。
 - Anthropic 限制：每请求最多 4 个断点，被缓存前缀需 ≥1024 token（Haiku 类 2048），过短的前缀上游不会缓存。
 - 用量回报：命中量见 `Usage.CachedInputTokens`（`cache_read_input_tokens`），本次写入量见 `Usage.CachedCreationTokens`（`cache_creation_input_tokens`），两者都计入 `Stats()`。**缓存量已经折进 `Usage.InputTokens` 与 `TotalTokens`**（与 OpenAI 的 `prompt_tokens` 口径一致）：`CachedInputTokens` 是 `InputTokens` 的子集，`CachedCreationTokens` 也已包含在 `InputTokens` 内，这两个字段只用于展示缓存明细，**不要再加进输入量**。线格式上 Anthropic 的 `input_tokens` 只计未缓存部分，折算是适配器做的（见 `docs/usage-stats.md`）。
 
@@ -111,8 +111,10 @@ rosetta.WithInterleavedThinking(true)
 
 ```go
 rosetta.WithQuirks(rosetta.Quirks{
-	LegacyMaxTokens: true, // 只认 max_tokens
-	NoStreamUsage:   true, // 会拒绝 stream_options.include_usage
+	LegacyMaxTokens:  true, // 只认 max_tokens
+	NoStreamUsage:    true, // 会拒绝 stream_options.include_usage
+	NoIdempotencyKey: true, // 拒绝 Idempotency-Key 头，或绝不能重放 chat 请求：
+	                      // 恢复 v0.5.x 行为——不发该头，429/503 立即报错
 })
 ```
 
@@ -128,7 +130,9 @@ rosetta.WithQuirks(rosetta.Quirks{
 ## 重试策略
 
 - 触发条件：网络层错误（DNS/连接/TLS/读失败）与状态码 408 / 429 / 500 / 502 / 503 / 504 / 529。
-- 退避：`400ms × 2^n`（±20% 抖动，上限 8s）；`Retry-After` 头（秒数或 HTTP 日期）优先且只增不减。
-- 每次重试重建请求体（Body 函数重发），Header 逐次克隆。
+- 退避：`400ms × 2^n`（±20% 抖动，上限 8s）；`Retry-After` 头（秒数或 HTTP 日期）优先且只增不减。退避期间调用方 deadline 到期时，最后一次响应（若有）原样带回且 body 仍可读——调用方能看到 provider 的真实错误（如 429 body），而不是裸的 `context deadline exceeded`。
+- **chat POST（三协议）v0.6.0 起默认按幂等策略重试**：请求携带每逻辑请求随机生成的 `Idempotency-Key`（传输层重试复用同一 key，provider 可据此去重），429/503 走同样的退避。不识别该头或绝不能重放请求的网关用 `Quirks.NoIdempotencyKey` 恢复 v0.5.x 行为（不发头、429/503 立即报错）。
+- 每次重试重建请求体（Body 函数重发），Header 逐次克隆；重试日志对 URL 脱敏（userinfo/query/fragment 剥离、路径内嵌凭据掩码），与错误字符串共用同一套凭据正则。
 - 流式请求仅在拿到 200 之前重试（状态码阶段）；已经开始消费响应体后的一切失败都通过 `Stream.Err()` / `Partial()` 交给调用方。
+- 跨主机重定向被默认守卫拒绝时是**永久错误**，立即返回、不消耗退避序列（每次重试的结果都相同，退避纯属浪费）。
 - 4xx（除 408/429）不重试——那是请求本身的问题；Anthropic thinking 预算类 400 是唯一例外，走[响应式整流](guide.md#thinking-统一配置)。

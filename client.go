@@ -3,6 +3,7 @@ package rosetta
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -28,6 +29,11 @@ type Client struct {
 	modelsRefreshing bool
 	modelsDone       chan struct{}
 	modelsErr        error
+	// unknownMu guards the short-TTL negative cache of model ids that were
+	// not found even after a remote refresh, so a serial batch of lookups
+	// for the same unknown id does not hammer /models 1:1 (G7).
+	unknownMu sync.Mutex
+	unknown   map[string]time.Time
 }
 
 // buildSettings applies options and resolves protocol/endpoint defaults.
@@ -75,6 +81,17 @@ func NewClient(opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newClientFromSettings(st)
+}
+
+// newClientFromSettings builds a Client from already-resolved settings. It
+// is shared by NewClient and DetectClient so protocol detection does not
+// rebuild settings a second time (M9).
+func newClientFromSettings(st *settings) (*Client, error) {
+	// Defensive assertion: buildSettings fills a default endpoint for every
+	// known protocol and rejects unknown ones, so this is unreachable today.
+	// Kept so a future protocol that forgets a default fails loudly rather
+	// than sending requests to an empty URL (G10).
 	if st.endpoint == "" {
 		return nil, ErrNoEndpoint
 	}
@@ -185,13 +202,15 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, erro
 		return nil, fmt.Errorf("%w: provider returned an unmanaged stream", ErrNotSupported)
 	}
 	sc.attachCancel(cancel)
-	sc.onEnd = func(u Usage, err error) {
+	sc.attachOnEnd(func(u Usage, err error) {
 		// sc.model() reads under the stream mutex: the callback fires
 		// outside the lock, so touching sc.partial directly would be an
 		// unsynchronized read whose safety rests only on an implicit
-		// ordering argument (the model is what identifies the record).
-		c.record(sc.model(), u, err == nil && u.IsZero())
-	}
+		// ordering argument (the model is what identifies the record). A
+		// caller-abandoned stream (Close before usage) is not a
+		// missing-usage response, so it is not counted as UsageMissing (G9).
+		c.record(sc.model(), u, err == nil && u.IsZero() && !sc.aborted())
+	})
 	return stream, nil
 }
 
@@ -254,11 +273,20 @@ func (c *Client) refreshModels(ctx context.Context) error {
 	return err
 }
 
+// unknownModelCacheTTL bounds how long a "not found after refresh" model id
+// is remembered before the next lookup retries remote discovery. Short
+// enough that a model added upstream is picked up promptly, long enough to
+// absorb a serial batch of lookups for the same unknown id (G7).
+const unknownModelCacheTTL = 30 * time.Second
+
 // ModelInfo returns merged metadata for one model id (aliases accepted).
 // If the model is unknown to the manual layer, a best-effort remote
-// discovery is attempted before failing with ErrUnknownModel.
+// discovery is attempted before failing with ErrUnknownModel. A short-TTL
+// negative cache skips the /models round trip for ids that were already
+// confirmed unknown, so a serial batch of lookups does not amplify traffic
+// 1:1 (G7).
 func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
-	if _, ok := c.registry.Lookup(id); !ok {
+	if _, ok := c.registry.Lookup(id); !ok && !c.unknownCached(id) {
 		if c.settings.timeout > 0 {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, c.settings.timeout)
@@ -270,6 +298,11 @@ func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
 			c.settings.logger.Debug("rosetta: remote model discovery failed",
 				"model", id, "err", err.Error())
 		}
+		// After refresh, if the id is still unknown, remember it so the next
+		// lookup within the TTL skips the refresh.
+		if _, ok := c.registry.Lookup(id); !ok {
+			c.rememberUnknown(id)
+		}
 	}
 	mi, ok := c.registry.Lookup(id)
 	if !ok {
@@ -278,8 +311,45 @@ func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
 	return mi, nil
 }
 
-// prepare runs registry-backed request gating before dispatch.
+// unknownCached reports whether id has a live negative-cache entry.
+func (c *Client) unknownCached(id string) bool {
+	c.unknownMu.Lock()
+	defer c.unknownMu.Unlock()
+	exp, ok := c.unknown[id]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(c.unknown, id)
+		return false
+	}
+	return true
+}
+
+// rememberUnknown records a negative-cache entry for id, expiring after
+// unknownModelCacheTTL.
+func (c *Client) rememberUnknown(id string) {
+	c.unknownMu.Lock()
+	defer c.unknownMu.Unlock()
+	if c.unknown == nil {
+		c.unknown = make(map[string]time.Time)
+	}
+	c.unknown[id] = time.Now().Add(unknownModelCacheTTL)
+}
+
+// prepare runs registry-backed request gating before dispatch. It first
+// normalizes an alias to its canonical model id so the wire request always
+// carries the canonical name — an alias and its full name would otherwise
+// each hit the upstream cache separately (upstreams key prefix caches by
+// model), guaranteeing a miss for one of them. Unknown models and models
+// already canonical pass through unchanged, so no /models probe is
+// triggered (G7).
 func (c *Client) prepare(req *ChatRequest) (*ChatRequest, error) {
+	if mi, ok := c.registry.Lookup(req.Model); ok && mi.ID != "" && mi.ID != req.Model {
+		cp := *req
+		cp.Model = mi.ID
+		req = &cp
+	}
 	req, err := c.gateThinking(req)
 	if err != nil {
 		return nil, err
@@ -364,10 +434,16 @@ func (c *Client) Stats() UsageSnapshot {
 	return c.settings.tracker.Snapshot()
 }
 
-// record feeds one usage observation to the tracker, if any.
+// record feeds one usage observation to the tracker, if any. The model id
+// is normalized to its canonical form first so an alias request and its
+// full-name twin are accounted under one key instead of being split across
+// two (M2).
 func (c *Client) record(model string, u Usage, missing bool) {
 	if c.settings.tracker == nil {
 		return
+	}
+	if mi, ok := c.registry.Lookup(model); ok && mi.ID != "" {
+		model = mi.ID
 	}
 	c.settings.tracker.Record(context.Background(), UsageRecord{
 		Time:         time.Now(),
@@ -390,4 +466,12 @@ func (c *Client) effectiveMaxOutput(req *ChatRequest) int {
 		return mi.MaxOutputTokens
 	}
 	return c.settings.defaultMaxOutput
+}
+
+// newIdempotencyKey returns a fresh random key for an Idempotency-Key
+// header, unique per logical request so a transport-layer retry of the same
+// request can be deduplicated by the provider (M1). It is not used for
+// security, only for uniqueness, so math/rand is sufficient.
+func newIdempotencyKey() string {
+	return fmt.Sprintf("rosetta-%016x-%016x", rand.Uint64(), rand.Uint64())
 }

@@ -213,7 +213,7 @@ func TestAuditFixAnthropicTextDocument(t *testing.T) {
 		Role:   RoleUser,
 		Blocks: []Block{FileContent("a.txt", "text/plain", "SGVsbG8=")},
 	}}}
-	pl, err := p.buildPayload(req, false, p.plan(req))
+	pl, _, err := p.buildPayload(req, false, p.plan(req))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestAuditFixAnthropicTextDocument(t *testing.T) {
 		Role:   RoleUser,
 		Blocks: []Block{FileContent("a.csv", "text/csv", "QUJD")},
 	}}}
-	if _, err := p.buildPayload(bad, false, p.plan(bad)); !errors.Is(err, ErrInvalidRequest) {
+	if _, _, err := p.buildPayload(bad, false, p.plan(bad)); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("unsupported media must be rejected, got %v", err)
 	}
 }

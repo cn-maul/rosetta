@@ -65,10 +65,10 @@ resp, err := stream.Collect()
 
 ## 中断与收尾语义
 
-- **连接中断 / 服务端中途断开**：`Next()` 返回 false，`Err()` 非 nil（`*APIError` 或 `*TransportError`），`Partial()` 保留已收到的内容（时点快照，深拷贝）——长回答场景可以降级展示半截结果。
+- **连接中断 / 服务端中途断开**：`Next()` 返回 false，`Err()` 非 nil（`*APIError` 或 `*TransportError`），`Partial()` 保留已收到的内容（时点快照，深拷贝）——长回答场景可以降级展示半截结果。流内 `error` / `response.failed` 事件构造的 `APIError` 带 `InBand=true`、`StatusCode=200`（传输层确实成功），按状态码过滤失败的调用方应同时检查 `InBand`。
 - **服务端没发终止事件就关闭连接（流截断）**：无论 EOF 还是真实 HTTP 断流（`unexpected EOF`，chunked 响应在终止零块前被掐断），SDK 都会先合成结束事件（交付已收到的 usage，`StopReason` 为 `StopOther`），随后 `Err()` 返回匹配 `ErrStreamTruncated` 的错误。调用方从此能区分"干净结束"（`Err() == nil`）与"连接被掐断"（`errors.Is(err, rosetta.ErrStreamTruncated)`），而不是把截断误当成功。
 - **主动放弃**：`Close()` 取消底层请求上下文、释放连接；调用方 ctx 取消同样会中断流（`ChatStream` 的流生命周期由调用方 ctx 约束，`WithTimeout` 不作用于流）。
-- **用量记账**：流终止时（无论正常、出错还是中途 Close）记录一次，见[用量统计](usage-stats.md)。记账回调在流锁之外执行——自定义 tracker 可以安全地同步读取 `Partial()` / `Err()` / `Usage()` 甚至 `Close()` 流，不会死锁。
+- **用量记账**：流终止时（无论正常、出错还是中途 Close）记录一次，见[用量统计](usage-stats.md)。记账回调在流锁之外执行——自定义 tracker 可以安全地同步读取 `Partial()` / `Err()` / `Usage()` 甚至 `Close()` 流，不会死锁。调用方主动 `Close()` 的流不计入 `UsageMissing`（那是主动放弃，不是"provider 未报用量"）。
 
 ## 工具调用流
 

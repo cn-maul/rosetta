@@ -315,3 +315,38 @@ func TestDoBudgetExhaustionKeepsBodyReadable(t *testing.T) {
 		}
 	})
 }
+
+// A context deadline expiring during the backoff sleep must hand back the
+// last response with its body still open (not a drained/closed body that
+// reads as a confusing transport error), so the caller can parse the real
+// provider error. Regression for the drain-before-sleep ordering.
+func TestDoContextDeadlineDuringBackoffKeepsBodyReadable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		srv := startTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, "deadline-503-body")
+		}))
+		c := New()
+		c.HTTP = srv.Client()
+		c.MaxRetries = 50
+		c.Base = time.Minute // long enough that the 1s deadline fires mid-backoff
+		c.Cap = time.Minute
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		resp, err := c.Do(ctx, &Call{Method: http.MethodGet, URL: srv.URL})
+		if err != nil {
+			t.Fatalf("err = %v, want nil (response returned)", err)
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("resp = %+v", resp)
+		}
+		b, rerr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if rerr != nil {
+			t.Fatalf("reading returned body failed (deadline-during-backoff regression): %v", rerr)
+		}
+		if string(b) != "deadline-503-body" {
+			t.Fatalf("body = %q", b)
+		}
+	})
+}

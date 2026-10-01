@@ -72,7 +72,7 @@ func TestAnthropicBuildPayload(t *testing.T) {
 		StopSequences: []string{"END"},
 		Tools:         []ToolDefinition{{Name: "fn", Description: "d"}},
 	}
-	pl, err := p.buildPayload(req, false, p.plan(req))
+	pl, _, err := p.buildPayload(req, false, p.plan(req))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestAnthropicBuildPayload(t *testing.T) {
 
 	// Thinking mode: budget present, sampling params dropped.
 	req.Thinking = &ThinkingConfig{Effort: EffortHigh}
-	pl, err = p.buildPayload(req, true, p.plan(req))
+	pl, _, err = p.buildPayload(req, true, p.plan(req))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestAnthropicBuildPayload(t *testing.T) {
 
 	// System is lifted to the top level.
 	req = &ChatRequest{System: "be nice", Messages: []Message{System("also this"), User("hi")}}
-	pl, err = p.buildPayload(req, false, p.plan(req))
+	pl, _, err = p.buildPayload(req, false, p.plan(req))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,11 +399,11 @@ func TestAnthropicCacheBreakpointGuardFires(t *testing.T) {
 	c := newTestClient(t, WithProtocol(ProtoAnthropic))
 	p := c.provider.(*anthropicProvider)
 
-	if _, err := p.buildPayload(cacheBlocks(4), false, p.plan(cacheBlocks(4))); err != nil {
+	if _, _, err := p.buildPayload(cacheBlocks(4), false, p.plan(cacheBlocks(4))); err != nil {
 		t.Fatalf("4 breakpoints must be allowed: %v", err)
 	}
 	req := cacheBlocks(5)
-	_, err := p.buildPayload(req, false, p.plan(req))
+	_, _, err := p.buildPayload(req, false, p.plan(req))
 	if !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("5 breakpoints must be rejected, got %v", err)
 	}
@@ -421,7 +421,7 @@ func TestAnthropicCacheBreakpointGuardAcrossSections(t *testing.T) {
 		{Name: "b", CacheControl: EphemeralCache()},
 	}
 	// 3 user + 2 tools = 5 > 4.
-	if _, err := p.buildPayload(req, false, p.plan(req)); !errors.Is(err, ErrInvalidRequest) {
+	if _, _, err := p.buildPayload(req, false, p.plan(req)); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("cross-section breakpoints must be rejected, got %v", err)
 	}
 }

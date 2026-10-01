@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -53,10 +55,26 @@ type Client struct {
 	Logger     *slog.Logger
 }
 
+// newTransport returns the SDK-owned default *http.Transport. It replaces
+// http.DefaultTransport (MaxIdleConnsPerHost=2), which under concurrency
+// >2 closes connections after each request and re-handshakes on the next
+// wave, and lets every Client in the process contend for one shared 100/2
+// pool. The tuned values keep idle connections warm for reuse and bound the
+// time a server may stall before sending response headers.
+func newTransport() *http.Transport {
+	return &http.Transport{
+		MaxIdleConns:          128,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+}
+
 // New returns a Client with production defaults.
 func New() *Client {
 	return &Client{
-		HTTP:       &http.Client{CheckRedirect: CrossHostSafeRedirect},
+		HTTP:       &http.Client{Transport: newTransport(), CheckRedirect: CrossHostSafeRedirect},
 		MaxRetries: 2,
 		Base:       400 * time.Millisecond,
 		Cap:        8 * time.Second,
@@ -78,7 +96,10 @@ func CrossHostSafeRedirect(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	if len(via) > 0 && !strings.EqualFold(req.URL.Hostname(), via[0].URL.Hostname()) {
-		return fmt.Errorf("httpx: refusing cross-host redirect %s -> %s", via[0].URL.Hostname(), req.URL.Hostname())
+		// Marked permanent so Do returns immediately instead of burning a
+		// retry (and its backoff sleep) on a refusal that will recur
+		// identically on every attempt.
+		return fmt.Errorf("%w: refusing cross-host redirect %s -> %s", ErrPermanent, via[0].URL.Hostname(), req.URL.Hostname())
 	}
 	return nil
 }
@@ -118,18 +139,31 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 			return resp, err
 		}
 		slept += wait
-		if resp != nil {
-			drain(resp) // we are retrying: this attempt's body is discarded
-		}
-		c.log("retrying request", "url", call.URL, "attempt", attempt+1, "wait", wait.String())
+		c.log("retrying request", "url", safeURL(call.URL), "attempt", attempt+1, "wait", wait.String())
 		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C
 			}
+			// The caller's deadline expired during backoff. Return the last
+			// response with its body still open so the caller parses the
+			// actual provider error — e.g. a 429 body — instead of a generic
+			// context deadline that hides what the endpoint said. Only when
+			// there is no response to hand back (a pure transport failure) do
+			// we surface the context error. (The body is drained only in the
+			// timer branch below, so it is still readable here.)
+			if resp != nil {
+				return resp, err
+			}
 			return nil, ctx.Err()
 		case <-timer.C:
+			// We are actually retrying: discard this attempt's body so its
+			// connection can be reused. Done after the sleep, not before, so
+			// the body is still open if ctx.Done wins the race above.
+			if resp != nil {
+				drain(resp)
+			}
 		}
 	}
 }
@@ -202,6 +236,35 @@ func (c *Client) log(msg string, args ...any) {
 	}
 }
 
+// safeURL renders a request URL for a log line with userinfo, query and
+// fragment stripped, and path-embedded credential patterns masked.
+func safeURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return MaskSecrets(raw)
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return MaskSecrets(u.String())
+}
+
+// secretRe is the single source of truth for credential shapes a provider,
+// a URL path or an error body might carry (API keys, JWTs, GitHub/OAuth
+// tokens). It lives here so the rosetta package's error redaction and this
+// transport's log redaction can never drift apart (they share this one
+// regexp through MaskSecrets / MaskSecretBytes).
+var secretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}`)
+
+// MaskSecrets replaces credential patterns in s with a fixed marker. It is
+// shared by the transport's own log redaction and the rosetta package's
+// error/body redaction.
+func MaskSecrets(s string) string { return secretRe.ReplaceAllString(s, "***") }
+
+// MaskSecretBytes is MaskSecrets for a raw []byte (used by rosetta's JSON
+// body redaction, which works on bytes before re-marshaling).
+func MaskSecretBytes(b []byte) []byte { return secretRe.ReplaceAll(b, []byte("***")) }
+
 // RetryableStatus reports whether an HTTP status code is worth retrying.
 // It is the single source of truth shared with the SDK's error typing.
 func RetryableStatus(code int) bool {
@@ -265,7 +328,17 @@ func ReadBody(r io.Reader, limit int64) ([]byte, error) {
 	return b, nil
 }
 
+// drain discards a response body being retried so the connection can be
+// reused. It reads up to drainLimit bytes before closing: reading only a
+// token amount (e.g. 8KiB) would leave larger error pages unread, forcing
+// the connection closed instead of returned to the idle pool.
 func drain(resp *http.Response) {
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+	io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
 	resp.Body.Close()
 }
+
+// drainLimit bounds how much of a discarded body is read for connection
+// reuse. It is a compromise: large enough to reuse connections after
+// typical error pages, small enough to bound the cost of a hostile or
+// runaway body.
+const drainLimit = 64 << 10

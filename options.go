@@ -21,6 +21,13 @@ type Quirks struct {
 	// reject the field. Without it, usage still arrives when the vendor
 	// sends a usage chunk unprompted; otherwise stream usage is missing.
 	NoStreamUsage bool
+	// NoIdempotencyKey disables the Idempotency-Key header and the
+	// transport-level retry of chat POSTs (429/503) that this SDK enables by
+	// default. Set it for OpenAI-compatible gateways that reject or
+	// mishandle the header, or that must never receive a replayed request.
+	// Chat then reverts to the pre-v0.6.0 behavior: a 429/503 surfaces to
+	// the caller immediately.
+	NoIdempotencyKey bool
 }
 
 // settings carries all client configuration.
@@ -53,10 +60,18 @@ type settings struct {
 	manualModels        []ModelInfo
 }
 
+// defaultUnaryTimeout bounds unary calls (Chat, ListModels, Embed, Rerank)
+// when the caller does not set WithTimeout. A server that accepts the
+// connection but never responds would otherwise hang the call forever. It
+// is generous enough to leave room for the default retry backoff budget.
+// WithTimeout(0) still disables the bound.
+const defaultUnaryTimeout = 60 * time.Second
+
 func defaultSettings() *settings {
 	return &settings{
 		maxRetries:      2,
 		thinkingRectify: true,
+		timeout:         defaultUnaryTimeout,
 		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 }
@@ -126,8 +141,10 @@ func WithHTTPClient(c *http.Client) Option {
 	return func(s *settings) { s.httpClient = c }
 }
 
-// WithTimeout bounds unary calls (Chat, ListModels). It deliberately does
-// not limit streams, whose lifetime is governed by the caller's context.
+// WithTimeout bounds unary calls (Chat, ListModels, Embed, Rerank). It
+// deliberately does not limit streams, whose lifetime is governed by the
+// caller's context. When unset, a default of 60s applies; pass WithTimeout(0)
+// to disable the bound entirely.
 func WithTimeout(d time.Duration) Option {
 	return func(s *settings) { s.timeout = d }
 }

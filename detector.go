@@ -3,6 +3,7 @@ package rosetta
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -87,7 +88,12 @@ func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client
 			if ctx.Err() != nil {
 				return "", false, ctx.Err()
 			}
-			logger.Warn("rosetta: protocol probe transport failure", "auth", auth, "err", err.Error())
+			// err is a *url.Error whose Error() embeds the full probe URL,
+			// which can carry a path-embedded credential. Log the redacted
+			// endpoint and only the underlying cause, never the URL itself
+			// (N1).
+			logger.Warn("rosetta: protocol probe transport failure",
+				"auth", auth, "endpoint", displayEndpoint(endpoint), "err", probeCause(err))
 			continue
 		}
 		if status != http.StatusOK {
@@ -155,6 +161,16 @@ func classifyCatalog(r io.Reader) (Protocol, bool) {
 	return "", false
 }
 
+// probeCause returns the underlying cause of a probe transport failure
+// without the URL that a *url.Error embeds in its Error() string. The URL
+// can carry a path-embedded credential, so it must never reach a log.
+func probeCause(err error) string {
+	if u := errors.Unwrap(err); u != nil {
+		return u.Error()
+	}
+	return err.Error()
+}
+
 // DetectClient builds a Client with automatic protocol detection: the
 // endpoint is classified via the /models probe and the result is pinned as
 // the client's protocol. Other options behave exactly as in NewClient;
@@ -164,13 +180,16 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Defensive assertion: buildSettings fills a default endpoint for every
+	// known protocol and rejects unknown ones, so this is unreachable today
+	// (G10). Kept so a future protocol that forgets a default fails loudly.
 	if st.endpoint == "" {
 		return nil, ErrNoEndpoint
 	}
 	// An explicit WithProtocol wins: do not probe, and do not let a probe
 	// result override the caller's pinned protocol (B12).
 	if st.protocolSet {
-		return NewClient(opts...)
+		return newClientFromSettings(st)
 	}
 	hc := st.httpClient
 	if hc == nil {
@@ -195,8 +214,10 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rosetta: detecting protocol for %s: %w", displayEndpoint(st.endpoint), err)
 	}
-	// Force a copy so the appended option cannot leak into the caller's
-	// backing array.
-	opts = append(opts[:len(opts):len(opts)], WithProtocol(proto))
-	return NewClient(opts...)
+	// Pin the detected protocol on the already-built settings and construct
+	// the client from them, avoiding a second buildSettings pass (M9). st is
+	// a fresh copy from buildSettings, so mutating it never touches the
+	// caller's options.
+	st.protocol = proto
+	return newClientFromSettings(st)
 }

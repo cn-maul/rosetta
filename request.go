@@ -159,6 +159,11 @@ type ChatRequest struct {
 	// fields are rejected with ErrInvalidRequest unless
 	// WithExtraOverrides(true) is set.
 	Extra map[string]any
+
+	// extraJSON caches the serialization of Extra computed during
+	// validate(), so the token estimator does not re-marshal a large Extra
+	// on every request (M7). It is unexported and never serialized.
+	extraJSON []byte
 }
 
 // Reserved-key sets are per protocol, matching exactly the top-level fields
@@ -345,9 +350,13 @@ func (r *ChatRequest) validate() error {
 		// A non-serializable Extra (NaN, a channel, a self-referencing map)
 		// fails later inside json.Marshal and surfaces as a TransportError
 		// naming a full URL, so probe it here where it is an ErrInvalidRequest.
-		if _, err := json.Marshal(r.Extra); err != nil {
+		// The serialization is cached so the token estimator does not
+		// re-marshal it (M7).
+		b, err := json.Marshal(r.Extra)
+		if err != nil {
 			return fmt.Errorf("%w: Extra is not JSON-serializable: %v", ErrInvalidRequest, err)
 		}
+		r.extraJSON = b
 	}
 	return nil
 }
