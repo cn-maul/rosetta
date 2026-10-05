@@ -149,7 +149,7 @@
 - **`APIError.Raw` 敏感内容脱敏**：错误体存入 `Raw` 前做保守脱敏——敏感键（api_key/token/password/authorization/secret/credential 等）的字符串值替换为 `[redacted]`，OpenAI 风格的 `sk-…` 密钥材料在 JSON 与非 JSON 错误体（网关 HTML 等）中统一掩码；Raw 保持合法 JSON 且保留非敏感字段用于诊断。
 - **Responses 协议兼容降级重试**：对齐 Chat 的 sticky probe——第三方网关以 400 + 关键词拒绝 `reasoning` 或 `max_output_tokens` 时，去掉该可选字段重发一次并按客户端记忆降级；非 invalid_request 错误与无关 400 不会触发降级（此前 Responses 请求遇可选字段被拒直接失败）。
 - **Anthropic 认证头收敛**：默认只发送 `x-api-key`；需要 Bearer 的兼容网关用新选项 `WithAnthropicBearerAuth(true)` 显式开启，凭证不再默认复制到第二个认证通道。
-- 文档同步：`PLAN.md` 待确认事项的 Go 最低版本定为 1.27+；`APIError.Retryable` 语义在指南中明确。
+- 文档同步：Go 最低版本定为 1.27+；`APIError.Retryable` 语义在指南中明确。
 
 ### 加固（2026-09-13 审计·第三阶段）
 
@@ -241,7 +241,7 @@
 
 ## v0.3.0 (2026-09-06)
 
-Go 1.27 现代化 + 正确性加固。详见 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)。
+Go 1.27 现代化 + 正确性加固。
 
 ### 破坏性变更
 
