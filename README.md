@@ -1,4 +1,7 @@
 # Rosetta
+[![CI](https://github.com/cn-maul/rosetta/actions/workflows/ci.yml/badge.svg)](https://github.com/cn-maul/rosetta/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/cn-maul/rosetta.svg)](https://pkg.go.dev/github.com/cn-maul/rosetta)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 统一接入 LLM API 的 Go SDK：同一套 API 说三种协议——**OpenAI Chat Completions**、**OpenAI Responses**、**Anthropic Messages**，以及兼容这些协议的第三方服务（DeepSeek、Moonshot、Qwen、GLM、OpenRouter、vLLM、Ollama 等）。协议差异（认证方式、system 位置、thinking 参数、流式事件、usage 字段）全部由 SDK 吸收。对话之外还覆盖同一套客户端下的 **Embeddings**（OpenAI 格式）与 **Rerank**（Cohere 格式），支持图文/音频/文档多模态输入。零第三方依赖。
 

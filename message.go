@@ -230,12 +230,12 @@ func (m Message) validate() error {
 	for i, b := range m.Blocks {
 		if b.Type == BlockText && b.Text == "" {
 			if b.CacheControl != nil {
-				return fmt.Errorf("Blocks[%d]: empty text block cannot carry a cache breakpoint (it is dropped before the wire, so the marking would be lost)", i)
+				return fmt.Errorf("blocks[%d]: empty text block cannot carry a cache breakpoint (it is dropped before the wire, so the marking would be lost)", i)
 			}
 			continue
 		}
 		if err := b.validate(); err != nil {
-			return fmt.Errorf("Blocks[%d] (%s): %w", i, b.Type, err)
+			return fmt.Errorf("blocks[%d] (%s): %w", i, b.Type, err)
 		}
 	}
 	return nil
