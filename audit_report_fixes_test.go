@@ -311,7 +311,7 @@ func TestAuditFixRerankWireValidation(t *testing.T) {
 
 // B6: DisableThinking normalizes a standalone manual entry.
 func TestAuditFixDisableThinkingStandalone(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	if err := r.SetManual([]ModelInfo{{ID: "m", SupportsThinking: true, DisableThinking: true}}); err != nil {
 		t.Fatal(err)
 	}

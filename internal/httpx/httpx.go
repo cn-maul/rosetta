@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -55,6 +56,17 @@ type Client struct {
 	Logger     *slog.Logger
 }
 
+// Connection lifecycle bounds for the SDK-owned transport. http.DefaultTransport
+// sets these; a hand-built *http.Transport does NOT inherit them, so omitting
+// them would silently restore an unbounded dial/TLS-handshake wait. That is
+// reachable from stream callers, which carry no SDK-side timeout (only the
+// caller's ctx), so a blackholed SYN or a stalled TLS handshake would hang
+// Next() forever (v0.5.x gave up after 30s/10s).
+const (
+	dialTimeout         = 30 * time.Second
+	tlsHandshakeTimeout = 10 * time.Second
+)
+
 // newTransport returns the SDK-owned default *http.Transport. It replaces
 // http.DefaultTransport (MaxIdleConnsPerHost=2), which under concurrency
 // >2 closes connections after each request and re-handshakes on the next
@@ -63,6 +75,11 @@ type Client struct {
 // time a server may stall before sending response headers.
 func newTransport() *http.Transport {
 	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   64,
 		IdleConnTimeout:       90 * time.Second,

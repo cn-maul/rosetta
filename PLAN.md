@@ -7,6 +7,8 @@
 | 状态 | 待评审 |
 | SDK 名称 | Rosetta（module path：`github.com/cn-maul/rosetta`） |
 
+
+> **状态说明（2026-10）**：本文是项目最初的架构计划草案（v0.1），保留以记录设计取舍。**其 API 片段早于实现，已不再保证与发布版一致**——例如流式接口的真实形状是 `Stream.Next() bool` + `Err()/Event()/Partial() (*ChatResponse, error)`（非 `StreamReader.Next() (Event, error)`），`ToolDefinition`（非 `ToolDef`）、`EffortUnset`（非 `EffortNone`）等。以 [docs/](docs/) 与 godoc 为准。
 ---
 
 ## 1. 背景与目标
@@ -89,7 +91,7 @@ type Provider interface {
     Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
 
     // 流式对话：返回统一事件流
-    StreamChat(ctx context.Context, req *ChatRequest) (StreamReader, error)
+    StreamChat(ctx context.Context, req *ChatRequest) (Stream, error)
 
     // 模型列表自动发现（协议不支持时返回 ErrModelListUnsupported）
     ListModels(ctx context.Context) ([]ModelInfo, error)
@@ -135,7 +137,7 @@ client, err := rosetta.NewClient(
 client, err := rosetta.NewClient(
     rosetta.WithEndpoint("https://api.openai.com/v1"),
     rosetta.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
-    rosetta.WithProtocol(rosetta.ProtoOpenAIChat),      // 缺省 ProtoAuto；可强制 ProtoOpenAIResponses 等
+    rosetta.WithProtocol(rosetta.ProtoOpenAIChat),      // 缺省由 DetectProtocol 探测后固定；可强制其他协议
     rosetta.WithHTTPClient(&http.Client{}),             // 自定义传输（代理/ tracing）
     rosetta.WithTimeout(2*time.Minute),                 // 单请求超时（流式为 idle 超时语义）
     rosetta.WithMaxRetries(2),                          // 429/5xx 自动重试，默认 2
@@ -186,7 +188,7 @@ resp, err := client.Chat(ctx, &rosetta.ChatRequest{
     MaxOutputTokens: 1024,              // 0 = 从注册表取该模型 MaxOutputTokens，再兜底默认值
     Temperature: rosetta.Float(0.7),     // 指针三态：nil=不下发
     Thinking: &rosetta.ThinkingConfig{Effort: rosetta.EffortHigh},
-    Tools: []rosetta.ToolDef{ weatherTool },
+    Tools: []rosetta.ToolDefinition{ weatherTool },
     Extra: map[string]any{              // 原生逃生口：直接合并进协议顶层字段
         "top_k": 40,
     },
@@ -205,10 +207,9 @@ fmt.Println(resp.Usage)      // 统一用量
 stream, err := client.ChatStream(ctx, req)   // req 复用 ChatRequest
 defer stream.Close()
 
-for {
-    ev, err := stream.Next()                 // 正常结束返回 io.EOF
-    if errors.Is(err, io.EOF) { break }
-    if err != nil { return err }             // 中途协议/网络错误
+for stream.Next() {
+    ev := stream.Event()                     // 事件有效仅在 Next 返回 true 后
+    // 正常结束/错误：Next 返回 false，用 stream.Err() 判定
     switch ev.Type {
     case rosetta.EventTextDelta:
         fmt.Print(ev.Text)
@@ -373,7 +374,7 @@ type APIError struct {
 rosetta.WithQuirks(rosetta.Quirks{LegacyMaxTokens: true, NoStreamUsage: true}) // 手动兜底
 ```
 
-### 4.6 协议自动探测（`ProtoAuto`）
+### 4.6 协议自动探测（`DetectProtocol` / `DetectClient`）
 
 按序执行，命中即止：
 
@@ -416,9 +417,8 @@ type ModelInfo struct {
 
 ```go
 type ThinkingConfig struct {
-    Effort          Effort // EffortNone(关) / EffortLow / EffortMedium / EffortHigh
-    BudgetTokens    int    // 精确预算；>0 时优先生效（Anthropic 直接用，OpenAI 映射到最近档位）
-    IncludeThoughts bool   // 是否要求返回思考内容（OpenAI: reasoning.summary；Anthropic 默认返回）
+    Effort       Effort // EffortUnset(用默认) / EffortLow / EffortMedium / EffortHigh
+    BudgetTokens int    // 精确预算；>0 时优先生效（Anthropic 直接用，OpenAI 映射到最近档位）
 }
 ```
 
@@ -430,7 +430,7 @@ type ThinkingConfig struct {
 | EffortMedium | `"medium"` | `"medium"` | `budget_tokens≈8192` |
 | EffortHigh | `"high"` | `"high"` | `budget_tokens≈32768`（自动 clamp 到 `< max_tokens` 且 `≥1024`） |
 | BudgetTokens=N | 就近映射到档位 | 就近映射到档位 | 原值 |
-| EffortNone | 不下发字段 | 不下发字段 | 不下发 `thinking` |
+| EffortUnset | 不下发字段 | 不下发字段 | 不下发 `thinking` |
 
 - 模型不支持 thinking 但请求开启 → 默认返回本地错误 `ErrThinkingUnsupported`（携带模型 ID），`WithThinkingFallback(true)` 可改为静默忽略。
 - 思考内容统一落在 `Block{Type:"thinking"}` / `EventThinkingDelta`，与正文严格分离。
@@ -462,7 +462,7 @@ type ThinkingConfig struct {
 - `bufio.Reader` 自定义读取（Scanner 默认 64KB 上限不够，长 JSON delta 会截断）——动态增长缓冲，单事件上限可配（默认 8MB）。
 - **取消与超时**：`ctx` 贯穿；请求 header 发出后即响应取消；空闲超时（连续 N 秒无字节，默认 60s，可配）判为错误并断开。
 - **断流语义**：收到 `error` 事件（Anthropic）或连接中断 → 返回 `*APIError`（已收到的增量事件不丢，调用方可用 `stream.Partial()` 取已聚合的部分文本）。
-- `StreamReader` 接口：`Next() (Event, error)` / `Collect() (*ChatResponse, error)` / `Partial() string` / `Usage() Usage` / `Close() error`。
+- `Stream` 接口：`Next() bool` / `Event() *Event` / `Err() error` / `Usage() Usage` / `Partial() *ChatResponse` / `Collect() (*ChatResponse, error)` / `Close() error`。
 
 ### 5.5 HTTP 层、超时与重试
 

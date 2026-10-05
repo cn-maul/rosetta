@@ -7,7 +7,7 @@ import (
 )
 
 func TestRegistryManualOverridesRemote(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	r.SetRemote([]ModelInfo{
 		{ID: "m1", DisplayName: "remote", ContextWindow: 8192, SupportsThinking: true},
 	})
@@ -33,7 +33,7 @@ func TestRegistryManualOverridesRemote(t *testing.T) {
 }
 
 func TestRegistryRemoteOnly(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	r.SetRemote([]ModelInfo{{ID: "m1"}})
 	mi, ok := r.Lookup("m1")
 	if !ok {
@@ -45,7 +45,7 @@ func TestRegistryRemoteOnly(t *testing.T) {
 }
 
 func TestRegistryAliases(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	r.SetManual([]ModelInfo{{ID: "claude-sonnet-4-5", Aliases: []string{"sonnet", ""}}})
 	if _, ok := r.Lookup("sonnet"); !ok {
 		t.Fatal("alias sonnet not resolved")
@@ -56,7 +56,7 @@ func TestRegistryAliases(t *testing.T) {
 }
 
 func TestRegistryAliasConflicts(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	if err := r.SetManual([]ModelInfo{{ID: "m1", Aliases: []string{"shared"}}, {ID: "m2", Aliases: []string{"shared"}}}); err == nil {
 		t.Fatal("duplicate alias must error")
 	}
@@ -79,7 +79,7 @@ func TestRegistryAliasConflicts(t *testing.T) {
 }
 
 func TestRegistryListSorted(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	r.SetManual([]ModelInfo{{ID: "b"}, {ID: "a"}})
 	list := r.List()
 	if len(list) != 2 || list[0].ID != "a" || list[1].ID != "b" {
@@ -88,7 +88,7 @@ func TestRegistryListSorted(t *testing.T) {
 }
 
 func TestRegistryEmptyIDSkipped(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	r.SetManual([]ModelInfo{{ID: ""}, {ID: "ok"}})
 	if len(r.List()) != 1 {
 		t.Fatalf("empty id must be skipped")
@@ -101,7 +101,7 @@ func TestRegistryLoadFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := newRegistry()
+	r := NewRegistry()
 	if err := r.LoadFile(path); err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestRegistryLoadFile(t *testing.T) {
 }
 
 func TestRegistryLoadFileErrors(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	if err := r.LoadFile(filepath.Join(t.TempDir(), "missing.json")); err == nil {
 		t.Fatal("missing file must error")
 	}

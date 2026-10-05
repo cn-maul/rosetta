@@ -31,7 +31,11 @@ type Registry struct {
 	resolved map[string]ModelInfo
 }
 
-func newRegistry() *Registry {
+// NewRegistry returns an empty registry. Clients build one internally; it is
+// exported so callers who manage model metadata outside a Client (e.g. to
+// resolve aliases or inspect a merged catalog) can use the same type. The
+// zero value is not usable — the maps are allocated here.
+func NewRegistry() *Registry {
 	r := &Registry{
 		remote: map[string]ModelInfo{},
 		manual: map[string]ModelInfo{},

@@ -269,6 +269,26 @@ func TestNewInstallsRedirectGuard(t *testing.T) {
 	}
 }
 
+// The SDK-owned transport replaces http.DefaultTransport, which means it does
+// NOT inherit that transport's dial or TLS-handshake timeouts. Omitting them
+// restores an unbounded connect wait, reachable from stream callers that have
+// no SDK-side timeout (only the caller's ctx). Guard both here.
+func TestNewTransportBoundsDialAndTLS(t *testing.T) {
+	tr, ok := New().HTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("New() transport is %T, want *http.Transport", New().HTTP.Transport)
+	}
+	if tr.DialContext == nil {
+		t.Fatal("transport must set DialContext so a blackholed connect cannot hang forever")
+	}
+	if tr.TLSHandshakeTimeout <= 0 {
+		t.Fatalf("TLSHandshakeTimeout = %v, want > 0", tr.TLSHandshakeTimeout)
+	}
+	if tr.ResponseHeaderTimeout <= 0 {
+		t.Fatalf("ResponseHeaderTimeout = %v, want > 0", tr.ResponseHeaderTimeout)
+	}
+}
+
 func TestCrossHostSafeRedirect(t *testing.T) {
 	req := func(hostport string) *http.Request {
 		return httptest.NewRequest(http.MethodGet, "http://"+hostport+"/x", nil)

@@ -115,7 +115,7 @@ func newClientFromSettings(st *settings) (*Client, error) {
 	}
 	hx.Logger = st.logger
 
-	c := &Client{settings: st, http: hx, registry: newRegistry()}
+	c := &Client{settings: st, http: hx, registry: NewRegistry()}
 	if st.modelsFile != "" {
 		infos, err := parseModelsFile(st.modelsFile)
 		if err != nil {
@@ -147,16 +147,39 @@ func (c *Client) Protocol() Protocol { return c.settings.protocol }
 // Endpoint returns the configured API base URL.
 func (c *Client) Endpoint() string { return c.settings.endpoint }
 
+// validated returns a client-owned copy of req that has passed validation,
+// leaving the caller's struct untouched. validate() caches the serialized
+// Extra in an unexported field; writing that into the caller's struct would
+// mutate a request the docs let callers share across goroutines (a data race
+// on concurrent reuse) and surprise anyone comparing the request before and
+// after a call. The shallow copy is sufficient: the cache field is the only
+// thing validate() writes, and the copy carries sliced Values by reference
+// exactly as the original does.
+//
+// Only ChatRequest carries such a field, so the copy is applied here rather
+// than in the auxiliary families.
+func (c *Client) validated(req *ChatRequest) (*ChatRequest, error) {
+	cp := new(ChatRequest)
+	if req != nil {
+		*cp = *req
+	}
+	if err := cp.validate(); err != nil {
+		return nil, err
+	}
+	return cp, nil
+}
+
 // Chat performs a non-streaming completion. Usage, when returned by the
 // provider, is recorded into the configured tracker. Before dispatch the
 // request passes through the model registry: thinking configs are gated
 // on the model's declared capability, and prompt size is checked against
 // the context window (warning by default, error in strict mode).
 func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
-	if err := req.validate(); err != nil {
+	req, err := c.validated(req)
+	if err != nil {
 		return nil, err
 	}
-	req, err := c.prepare(req)
+	req, err = c.prepare(req)
 	if err != nil {
 		return nil, err
 	}
@@ -178,10 +201,11 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, err
 // terminates. Note that the caller's ctx bounds the whole stream, while
 // WithTimeout applies only to unary calls.
 func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, error) {
-	if err := req.validate(); err != nil {
+	req, err := c.validated(req)
+	if err != nil {
 		return nil, err
 	}
-	req, err := c.prepare(req)
+	req, err = c.prepare(req)
 	if err != nil {
 		return nil, err
 	}

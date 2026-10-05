@@ -198,7 +198,7 @@ func TestAuditManualLayerFieldMerge(t *testing.T) {
 // C23: a remote DisableThinking claim must not revoke a manual
 // SupportsThinking declaration.
 func TestAuditManualThinkingNotRevokedByRemote(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	if err := r.SetManual([]ModelInfo{{ID: "m", SupportsThinking: true}}); err != nil {
 		t.Fatal(err)
 	}

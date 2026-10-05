@@ -23,7 +23,7 @@ import (
 // Mutating the caller's input slice (or a returned ModelInfo) must never
 // change registry state behind its lock.
 func TestRegistryAliasesAreSnapshots(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	infos := []ModelInfo{{ID: "m1", Aliases: []string{"alias-a"}}}
 	if err := r.SetManual(infos); err != nil {
 		t.Fatal(err)
@@ -350,7 +350,7 @@ func TestMultimediaEstimatesOverride(t *testing.T) {
 }
 
 func TestDisableThinkingRevocation(t *testing.T) {
-	r := newRegistry()
+	r := NewRegistry()
 	if err := r.SetRemote([]ModelInfo{{ID: "m1", SupportsThinking: true, Known: true}}); err != nil {
 		t.Fatal(err)
 	}
