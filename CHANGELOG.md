@@ -1,5 +1,26 @@
 # 更新日志
 
+## v1.0.0 (2026-10-05)
+
+首个稳定版本，公共 API 自本版起冻结。**相对 v0.6.0 无任何代码或行为变更**——`rosetta.Version` 由 `"0.6.0"` 改为 `"1.0.0"`，变更日志仅新增本条目；本版的意义是宣告 semver 稳定契约生效。
+
+自 v0.1.0 以来，本 SDK 历经六轮审计与加固（前缀、幂等、流量、并发）、五轮审计报告逐条修复、多个官方特性对齐（交错思考、扩展缓存、Responses 归并、refusal 映射）、多模态输入扩展与 Embeddings / Rerank 辅助 API 的落地，最终收敛到稳定接口。本版起：
+
+- **1.0.0 之后**：破坏性变更（移除/改名公开符号、改变 wire 行为）必须走新 major 版本；新增能力走 minor，纯修复走 patch。0.x 时期"minor 也允许破坏"的宽松不再适用。
+- **既有调用方**：从任意 `v0.6.0` 升级到 `v1.0.0` 无需改动代码。
+- **语义说明**：`go get` 会解析到本版；`pkg.go.dev` 徽章展示的即本版。
+
+### 冻结时点记录（供后续 major 参考）
+
+公开 API 的契约集中体现在：`Client`（`NewClient` / `DetectClient` 与 `Chat` / `StreamChat` / `ListModels` / `ModelInfo` / `Embed` / `Rerank` / `Stats`）、`protocols` 常量、`ChatRequest` / `EmbeddingRequest` / `RerankRequest` 与消息块类型、`Options`（`With*`）、哨兵错误集（`Err*`）与 `APIError` / `TransportError` 字段、`Quirks` 逃生开关、`Usage` 与 `UsageTracker` 口径、`EstimateTokens` 语义。后续若改动上述任一项，按 semver 一律视为破坏性。
+
+### 质量基线（冻结时点）
+
+- 主包语句覆盖率 89.3%，`internal/*` 各包 80%+；CI 门禁 75%。
+- `go test ./... -race` 全绿；`go vet` / `staticcheck` 无告警。
+- 三协议（OpenAI Chat / Responses / Anthropic）端到端测试均为确定性实现（`synctest` + `httptest`），无真实网络等待。
+- 零第三方依赖；要求 Go 1.27+。
+
 ## v0.6.0 (2026-10-01)
 
 第五轮审计（正确性）+ 性能优化调研的落地批次。**含调用方可见的行为变更**（见下节）——按 semver 视为 minor。
