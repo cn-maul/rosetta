@@ -81,20 +81,13 @@
 
 ### 2.2 核心抽象
 
-**统一契约 `Provider` 接口**（`provider/provider.go`）——所有协议适配器实现同一接口，`Client` 只面向该接口编程：
+**统一契约 `protocolProvider` 接口**（定义在 `client.go`，非导出）——所有协议适配器实现同一接口，`Client` 只面向该接口编程：
 
 ```go
-type Provider interface {
-    Protocol() Protocol // openai_chat | openai_responses | anthropic
-
-    // 非流式对话：入参已是统一模型，出参从协议原始响应映射回统一模型
-    Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)
-
-    // 流式对话：返回统一事件流
-    StreamChat(ctx context.Context, req *ChatRequest) (Stream, error)
-
-    // 模型列表自动发现（协议不支持时返回 ErrModelListUnsupported）
-    ListModels(ctx context.Context) ([]ModelInfo, error)
+type protocolProvider interface {
+    Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error)  // 非流式
+    StreamChat(ctx context.Context, req *ChatRequest) (Stream, error)   // 流式：返回统一事件流
+    ListModels(ctx context.Context) ([]ModelInfo, error)                // 模型列表发现
 }
 ```
 
@@ -116,7 +109,7 @@ type Provider interface {
 | 依赖策略 | 零第三方依赖 | SDK 常被引入多层依赖树，`go.sum` 污染是常见痛点；SSE 解析自研约 200 行 |
 | 错误透出 | 统一 `*APIError` + `Raw json.RawMessage` 逃生口 | 统一层管 90% 场景；协议新字段未跟上时调用方可读 Raw 兜底 |
 | 第三方脏数据 | 宽松解码（`internal/jsonx`） | 兼容服务常见问题：usage 缺失、字段类型漂移（数字/字符串互换）、流式不含 usage——不因缺字段报错 |
-| 模型知识库 | 内嵌 JSON + 三级合并 | 远端 `/models` 不含上下文长度等能力信息，必须内置知识库补齐 |
+| 模型元数据 | 手动声明 + 远端 `/models` 两级合并（无内置知识库） | 远端 `/models` 不含上下文长度等能力信息，但也**不猜测**——能力只认调用方显式声明（`Known=false` 不推断），避免对自定义模型给出错误能力判断 |
 
 ---
 
@@ -197,7 +190,7 @@ if err != nil {
     var apiErr *rosetta.APIError
     if errors.As(err, &apiErr) && apiErr.Retryable { ... }
 }
-fmt.Println(resp.Text)       // 便捷字段：拼接所有 text 块
+fmt.Println(resp.Text())     // 便捷方法：拼接所有 text 块
 fmt.Println(resp.Usage)      // 统一用量
 ```
 
@@ -255,11 +248,11 @@ models, err := client.ListModels(ctx)
 // → []rosetta.ModelInfo{ID, DisplayName, ContextWindow, MaxOutputTokens,
 //                        SupportsThinking, ...}
 
-// 查询单模型能力（合并 内置知识库 + 远端发现 + 手动配置 后的视图）
-info, ok, err := client.ModelInfo(ctx, "deepseek-chat")
+// 查询单模型能力（合并 远端发现 + 手动配置 后的视图；别名可解析）
+info, err := client.ModelInfo(ctx, "deepseek-chat")
 fmt.Println(info.ContextWindow, info.MaxOutputTokens, info.SupportsThinking)
 
-// 客户端创建后即拉取一次并缓存；可手动刷新（带 TTL 缓存选项）
+// ListModels 每次调用都拉取远端；RefreshModels 是它的语义别名
 err = client.RefreshModels(ctx)
 ```
 
@@ -290,14 +283,14 @@ err = client.RefreshModels(ctx)
 ```go
 // 单次：resp.Usage / 事件流 EventMessageEnd.Usage
 // 累计：客户端内置线程安全统计器
-snap := client.Stats().Snapshot()
+snap := client.Stats() // UsageSnapshot 快照（不是 Stats().Snapshot()）
 fmt.Println(snap.TotalRequests, snap.TotalTokens)
 fmt.Println(snap.ByModel["gpt-4o"].OutputTokens)
 fmt.Println(snap.ByProtocol[rosetta.ProtoAnthropic].InputTokens)
 
 // 自定义持久化：实现接口注入（SQLite / Prometheus / OTel 等由使用方落地）
 type UsageTracker interface {
-    Record(UsageRecord)             // 每次请求结束时回调（含 model/protocol/时间戳）
+    Record(ctx context.Context, r UsageRecord) // 每次请求结束时回调（含 model/protocol/时间戳）
     Snapshot() UsageSnapshot
 }
 ```
@@ -306,13 +299,16 @@ type UsageTracker interface {
 
 ```go
 type APIError struct {
-    StatusCode int            // HTTP 状态码（网络错误为 0）
+    StatusCode int            // HTTP 状态码；in-band 错误保持 200
     Code       string         // 协议错误码：openai "insufficient_quota" / anthropic "overloaded_error"
     Type       string         // openai error.type / anthropic error.type
+    Param      string         // 被拒的请求参数（provider 指明时）
     Message    string
-    Retryable  bool           // SDK 判定：429、5xx、部分 4xx(overloaded) 为可重试
+    RequestID  string         // X-Request-Id / request-id
     Method     string
     URL        string
+    Retryable  bool           // SDK 判定：408/429/5xx/529 为可重试
+    InBand     bool           // 错误在 200 body / 流事件内，而非非 2xx 状态
     Raw        json.RawMessage
 }
 // 本地校验错误（非服务端）为普通 error：ErrNoAPIKey、ErrNoEndpoint、ErrUnknownModel、ErrContextTooLong ...
@@ -389,23 +385,25 @@ rosetta.WithQuirks(rosetta.Quirks{LegacyMaxTokens: true, NoStreamUsage: true}) /
 
 ## 5. 功能模块详细设计
 
-### 5.1 模型注册表（发现 / 手动 / 内置，三级合并）
+### 5.1 模型注册表（发现 / 手动，两级合并）
 
 ```go
 type ModelInfo struct {
-    ID               string
-    DisplayName      string
-    ContextWindow    int    // 上下文窗口长度（tokens）
-    MaxOutputTokens  int    // 最大输出限制（tokens）
-    SupportsThinking bool   // 是否支持 thinking/reasoning
-    ThinkingStyle    string // "effort"(OpenAI) | "budget"(Anthropic) | ""
-    Known            bool   // 是否来自内置知识库/手动配置（区别于远端裸发现）
-    Aliases          []string
+    ID               string   `json:"id"`
+    DisplayName      string   `json:"display_name,omitempty"`
+    Type             string   `json:"type,omitempty"` // "chat" / "embedding" / "rerank"
+    ContextWindow    int      `json:"context_window,omitempty"`
+    MaxOutputTokens  int      `json:"max_output_tokens,omitempty"`
+    SupportsThinking bool     `json:"supports_thinking,omitempty"`
+    DisableThinking  bool     `json:"disable_thinking,omitempty"` // 显式撤销下层 thinking 声明
+    Known            bool     `json:"known,omitempty"`            // 手动配置为 true；/models 裸发现为 false
+    Protocol         Protocol `json:"protocol,omitempty"`
+    Aliases          []string `json:"aliases,omitempty"`
 }
 ```
 
-- **来源与合并优先级**：手动配置（Go API / JSON 文件）> 远端自动发现 > 内置知识库。同 ID 字段级合并（手动配的 `context_window` 覆盖内置，其余继承）。
-- **内置知识库**：`registry_data/models.json` 以 `go:embed` 打包，覆盖主流模型（GPT-4o/4.1/5.x、o3/o4-mini、Claude 4.x 系、DeepSeek V3/R1、Qwen3、GLM 等）的 `context_window / max_output_tokens / thinking` 能力；随版本发布更新。查不到的模型 `Known=false`，用保守默认值（上下文 128k / 输出 4096）。
+- **来源与合并优先级**（实际落地为**两级**）：手动配置（Go API / JSON 文件）> 远端自动发现（`GET /models`）。同 ID 字段级合并，上层只覆盖非零字段、其余继承。
+- **不内置模型知识库**：SDK 不打包任何厂商预设或模型知识库——一切以调用方声明和服务商自己的 `/models` 为准（原则：自定义模型不猜测）。仅靠 `/models` 发现的条目 `Known=false`、不推断能力；`ContextWindow` / `MaxOutputTokens` / `SupportsThinking` 只对手动声明生效（见 §10 待确认事项第 4、5 条的历史决策）。
 - **服务点**：
   - `Chat` 时自动补全 `MaxOutputTokens`（Anthropic 必填）；
   - 发送前粗校验 prompt 是否超出 `ContextWindow`（见 5.6）；
@@ -449,32 +447,32 @@ type ThinkingConfig struct {
 
 内存统计器（默认开启）：
 
-- 数据结构：分片互斥（或原子计数）按 `model × protocol × 时间桶` 聚合；`Snapshot()` 返回深拷贝，O(模型数)。
-- 查询维度：总量、按模型、按协议、请求次数、错误次数、`usage_missing` 次数。
-- `UsageTracker` 为接口：v1 提供 `MemoryUsageTracker`；持久化（SQLite/OTel/Prometheus）由使用方实现接口注入，SDK 不内置存储。
-- 记录点：非流式在响应返回时；流式在 `MessageEnd`（或流关闭）时；重试成功只计最终一次，重试失败计 `retries` 字段。
+- 数据结构：`MemoryUsageTracker` 用单互斥锁按 `model × protocol` 聚合增量；`Snapshot()` 返回深拷贝（含 ByModel / ByProtocol 两个 map）。
+- 查询维度：总量、按模型、按协议、请求次数、各 token 维度、`UsageMissing` 次数。`Client.Stats()` 直接返回快照（不再是 `Stats().Snapshot()`）。
+- `UsageTracker` 为接口：v1 提供 `MemoryUsageTracker`；持久化（SQLite/OTel/Prometheus）由使用方实现接口注入，SDK 不内置存储。真实签名是 `Record(ctx context.Context, r UsageRecord)` / `Snapshot() UsageSnapshot`。
+- 记录点：非流式在响应返回时；流式在终止时（正常、出错或调用方 `Close()`）；调用方主动 `Close()` 的流不计入 `UsageMissing`。
 
 ### 5.4 流式引擎（SSE）
 
 `internal/sse` 三协议共用解析器（约 200 行，零依赖）：
 
 - 按行读取 `data:` / `event:` / 注释行，多行 `data` 拼接，空行分发事件；处理 `\r\n`；`[DONE]` 终止（OpenAI 系）。
-- `bufio.Reader` 自定义读取（Scanner 默认 64KB 上限不够，长 JSON delta 会截断）——动态增长缓冲，单事件上限可配（默认 8MB）。
-- **取消与超时**：`ctx` 贯穿；请求 header 发出后即响应取消；空闲超时（连续 N 秒无字节，默认 60s，可配）判为错误并断开。
+- `bufio.Reader` 自定义读取（`ReadSlice` 复用缓冲，行不能跨缓冲时累积）——单行上限 2MiB、单事件上限 16MiB（`internal/sse` 常量，**不可配置**，超限返回 `ErrTooLarge`）。
+- **取消与超时**：`ctx` 贯穿，调用方取消即刻中断阻塞中的读取；**没有空闲超时**（流生命周期完全由调用方 ctx 约束，无内置 idle 判定）。
 - **断流语义**：收到 `error` 事件（Anthropic）或连接中断 → 返回 `*APIError`（已收到的增量事件不丢，调用方可用 `stream.Partial()` 取已聚合的部分文本）。
 - `Stream` 接口：`Next() bool` / `Event() *Event` / `Err() error` / `Usage() Usage` / `Partial() *ChatResponse` / `Collect() (*ChatResponse, error)` / `Close() error`。
 
 ### 5.5 HTTP 层、超时与重试
 
-- 复用 `http.Client`（可注入）；默认拨号/TLS/响应头超时分层设置。
+- 复用 `http.Client`（可注入）；默认自建 `*http.Transport`，`DialContext`(30s) / `TLSHandshakeTimeout`(10s) / `ResponseHeaderTimeout`(30s) 分层设置（v0.6.0 起；缺失拨号/TLS 上界会让流式请求无界挂起）。默认**不读环境代理**。
 - 重试（默认开，`WithMaxRetries` 控制）：命中 429/500/502/503/504 与网络错误；指数退避 + 抖动；尊重 `Retry-After`；流式仅在**收到首字节前**失败才重试；带 body 请求整体重发安全（每次请求都由统一模型完整重建 payload）。
 - 鉴权头由适配器决定（Bearer vs `x-api-key`+`anthropic-version`），`Client` 不感知。
 
 ### 5.6 上下文长度校验与 token 估算
 
 - 内置启发式 `TokenEstimator`：CJK ≈ 1 token/字符，ASCII ≈ 1 token/4 字符（保守偏高），叠加每消息固定开销；纯本地、零依赖。
-- 默认行为：估算总量 + 预留 `MaxOutputTokens` 超过 `ContextWindow` 时**记 warning 不阻断**；`WithStrictContextCheck(true)` 改为返回 `ErrContextTooLong`。
-- 可插拔：`WithTokenEstimator(custom)` 接入精确实现；Anthropic 可选对接 `/v1/messages/count_tokens`（路线图）。
+- 默认行为：估算总量 + 预留输出上限超过 `ContextWindow` 时**记 warning 不阻断**；`WithStrictContextCheck(true)` 改为返回 `ErrContextTooLong`。
+- **不可插拔**：估算器是内置启发式的（`EstimateTokens` / `estimateInputTokens`），无 `WithTokenEstimator` 选项——需要精确计数请自行在调用前用真实 tokenizer 校验。`/v1/messages/count_tokens` 未对接。
 
 ---
 
@@ -501,19 +499,22 @@ Rosetta/
 ├── models.go                   # ModelInfo
 ├── url.go                      # joinEndpoint 等 URL 工具
 ├── provider_openai_chat.go     # OpenAI Chat 适配器（请求/响应/SSE/降级探测）
-├── provider_openai_responses.go# Responses 适配器（M3）
-├── provider_anthropic.go       # Anthropic 适配器（M2）
-├── provider_stubs.go           # 未落地适配器的占位（返回 ErrNotImplemented）
-├── registry.go                 # 模型注册表（合并/查询）—— M4
-├── registry_data/models.json   # go:embed 内置知识库 —— M4
-├── detector.go                 # 协议探测 —— M4
-├── estimator.go                # token 估算 —— M4
+├── provider_openai_responses.go# Responses 适配器
+├── provider_anthropic.go       # Anthropic 适配器
+├── provider_openai_common.go   # OpenAI 族共用（auth/headers、/models 拉取）
+├── auxiliary.go                # Embed / Rerank 共用 POST 与鉴权
+├── embedding.go                # EmbeddingRequest / Embed
+├── rerank.go                   # RerankRequest / Rerank
+├── registry.go                 # 模型注册表（两级合并/查询）
+├── detector.go                 # 协议探测
+├── estimator.go                # token 估算
 ├── internal/
-│   ├── sse/                    # SSE 解析器（已落地）
-│   ├── httpx/                  # 请求执行 / 重试 / 退避（已落地）
-│   └── jsonx/                  # 宽松 JSON 解码 —— M6
+│   ├── sse/                    # SSE 解析器
+│   ├── httpx/                  # 请求执行 / 重试 / 退避 / 凭据脱敏
+│   └── jsonx/                  # 宽松 JSON 解码（encoding/json/v2）
 ├── examples/
-│   ├── chat/  ├── stream/  └── usage/   #（后续协议示例随里程碑增加）
+│   ├── chat/  ├── stream/  ├── responses/  ├── anthropic/
+│   ├── embedding/  ├── rerank/  ├── usage/  └── models/
 └── .github/workflows/ci.yml
 ```
 
@@ -531,7 +532,7 @@ Rosetta/
 | 第三方脏数据 | jsonx 宽松解码专项用例（类型漂移、字段缺失） |
 | 并发 | `-race` 全量开启；统计器并发压测 |
 | 真实服务冒烟 | `examples/` 下带 `ROSETTA_SMOKE=1` + 真实 key 才运行的冒烟测试（CI 无 key 自动跳过） |
-| 静态检查 | golangci-lint；公开 API 文档齐全（godoc）；测试覆盖率核心包 ≥ 85% |
+| 静态检查 | `gofmt` / `go vet`（CI 强制）；公开 API 文档齐全（godoc）；CI 覆盖率门禁 75%（当前约 84%） |
 
 ---
 
@@ -539,12 +540,15 @@ Rosetta/
 
 单人全职估算，总计约 5 周；各里程碑均有可运行交付物与验收标准。
 
-> **进度（2026-09-05）**：M0~M6 全部完成，标记 **v0.1.0**（`rosetta.Version`）。
-> 已落地：三大协议适配器（M1 Chat / M2 Anthropic / M3 Responses）、模型体系（M4：go:embed
-> 知识库 + 三级合并注册表 + DetectClient 探测 + WithVendor 厂商预设 + thinking 门控 +
-> 上下文校验）、用量统计（M5：Tracker/Snapshot/usage_missing/流式兜底）、打磨（M6：
-> internal/jsonx 宽松解码、CI workflow、6 个示例、README）。剩余事项：真实服务冒烟
-> （已通过）。module path `github.com/cn-maul/rosetta`、许可证 MIT 均已定（2026-09-05），§10 待确认事项全部闭环。
+> **进度（2026-09-05，后于 2026-10 校正）**：M0~M6 全部完成，标记 **v0.1.0**（`rosetta.Version`）。
+> 已落地：三大协议适配器（M1 Chat / M2 Anthropic / M3 Responses）、模型体系（M4：**两级**合并注册表
+> ——手动配置 + 远端 `/models`，**无内置知识库、无 `go:embed`、无 `WithVendor`**；`DetectClient` 探测 +
+> thinking 门控 + 上下文校验）、用量统计（M5：Tracker/Snapshot/`UsageMissing`/流式兜底）、打磨（M6：
+> internal/jsonx 宽松解码、CI workflow、示例、README）。剩余事项：真实服务冒烟（已通过）。
+> module path `github.com/cn-maul/rosetta`、许可证 MIT 均已定。
+>
+> **与草案的偏差**：计划中的「内嵌 JSON 知识库」「三级合并」「`WithVendor` 厂商预设」「`WithTokenEstimator`
+> 可插拔估算器」最终**均未实现**——改为「不猜测、能力只认显式声明」的保守设计（见 §5.1、§5.6）。
 
 | 阶段 | 内容 | 交付物 / 验收 | 预估 |
 |---|---|---|---|
@@ -552,7 +556,7 @@ Rosetta/
 | **M1 OpenAI Chat** | 请求/响应映射、流式、usage、工具透传、重试 | 对官方 + 1 家兼容服务（如 DeepSeek）跑通非流式/流式 | 1 周 |
 | **M2 Anthropic** | 消息映射（system 提升）、thinking（含 budget clamp）、流式 delta、cache usage | 对官方 API 跑通；thinking 多轮回传 signature 正确 | 1 周 |
 | **M3 Responses** | items 映射、类型化事件流归一、reasoning.effort | 对官方跑通；与 M1 共用同一测试请求集 | 0.5 周 |
-| **M4 模型体系** | 内置知识库、ListModels、手动配置合并、上下文校验、探测 | 探测对三类 endpoint 命中正确；合并优先级测试通过 | 1 周 |
+| **M4 模型体系** | ~~内置知识库~~、ListModels、手动配置合并、上下文校验、探测（**实际为两级合并、无知识库**） | 探测对三类 endpoint 命中正确；合并优先级测试通过 | 1 周 |
 | **M5 用量统计** | 统计器、Snapshot、Tracker 接口、流式 usage 兜底 | 并发统计无竞态（-race）；各协议流式均能取到 usage | 0.5 周 |
 | **M6 打磨发布** | quirks、examples、README、godoc、语义化版本 v0.1.0 | 5 个示例可运行；文档完整；覆盖率达标 | 0.5 周 |
 
@@ -566,20 +570,22 @@ Rosetta/
 |---|---|---|
 | Responses API 仍在演进，字段变动 | 映射失效 | 宽松解码 + `Raw` 逃生口 + fixture 随版本更新 |
 | 第三方兼容服务质量参差（无 usage、非法流式） | 统计失真、流式崩溃 | jsonx 宽松解码、quirks 机制、usage_missing 计数、解析器永不 panic |
-| 内置知识库过期（新模型上下文参数变化） | 校验不准 | `Known=false` 保守默认；手动配置最高优先级；随版本更新 JSON |
+| 能力元数据缺失（远端 `/models` 不含上下文长度等） | 校验/门控不生效 | **不猜测**：仅手动声明生效，`Known=false` 保守放行；需要门控时用 `WithModelInfo` / `WithModelsFile` 显式声明 |
 | 思考参数互斥规则（Anthropic temperature=1、budget<max） | 请求 400 | SDK 自动纠正 + warning；文档明示 |
 | 兼容服务对 `max_completion_tokens` 支持不一 | 请求 400 | 默认字段探测 + `WithMaxTokensField` 覆盖 |
-| SSE 长事件截断/连接抖动 | 流式中断 | 动态大缓冲、空闲超时、`Partial()` 保留已收内容、可重试策略 |
+| SSE 长事件截断/连接抖动 | 流式中断 | 单行/单事件上限（超限报错）、`Partial()` 保留已收内容、截断合成 `ErrStreamTruncated`；取消由调用方 ctx 负责（无内置空闲超时） |
 
 ---
 
-## 10. 待确认事项（实现前需拍板）
+## 10. 待确认事项（历史决策记录）
+
+> 以下问题在实现阶段已全部拍板，保留以记录取舍（2026-10 校正）。
 
 1. ~~**module path**~~：已定 `github.com/cn-maul/rosetta`（2026-09-05）。
-2. **工具调用**：是否按本计划纳入 v1（仅透传，不含执行循环）？若不需要可砍掉约 3 天工作量。
+2. ~~**工具调用**~~：已纳入，仅透传 `Tools` + 回传 `BlockToolResult`，不含执行循环（`ToolDefinition` / `ToolCall` / `ToolResult`）。
 3. ~~**Go 最低版本**~~：已定 Go 1.27+（go.mod `go 1.27`，2026-09-13）。
-4. **用量持久化**：v1 仅内存 + 接口扩展点，是否符合预期？是否需要内置 SQLite/文件持久化？
-5. **多模态范围**：图片输入（URL/base64）v1 纳入，音频/视频是否需要？
+4. ~~**用量持久化**~~：仅内存 `MemoryUsageTracker` + `UsageTracker` 接口扩展点，**不内置** SQLite/文件持久化。
+5. ~~**多模态范围**~~：图片 + 音频（仅 OpenAI 系）+ 文档（三协议）均已纳入；视频不支持。
 6. ~~**SDK 命名**~~：已定名 **Rosetta**（2026-09-05，原暂定名 PolyAI 弃用）。
 7. ~~**许可证**~~：已定 MIT（2026-09-05）。
 
@@ -598,7 +604,7 @@ Rosetta/
 | 2 | `proxy/sse.rs` | SSE 解析三要点：①块边界取 `\r\n\r\n` 与 `\n\n` 中最先出现者；②字段解析同时兼容 `field:` 与 `field: `（冒号后空格可选）；③跨 chunk 的 UTF-8 多字节字符需缓冲余量（其测试专门把中文/emoji 拆到两个 chunk） | 写入 §7 `internal/sse` 的实现与测试要求；Go 侧按字节缓冲，仅在完整事件上解析 |
 | 3 | `proxy/thinking_budget_rectifier.rs` | **响应式 thinking 整流**：上游返回 400 且错误信息含 `budget_tokens`/`thinking`/`1024` 约束时，自动改写 `budget_tokens=32000`、`max_tokens<32001` 则抬到 64000 并重试一次；`type=="adaptive"` 跳过 | 补进 §4 Anthropic 适配：主动 clamp（§5）防错 + 响应式整流兜错，`WithThinkingRectify(true)` 默认开启，仅重试一次 |
 | 4 | `docs/pi-thinking-level-map-requirements-zh.md` | 原则「**预设完整可靠，自定义配置不猜测**」：模型知识库只覆盖内置预设，自定义模型不自动推断能力；档位映射用稀疏语义 | 强化 §5 `ModelInfo.Known` 语义：`Known=false` 时不推断 thinking/上下文能力，以上游实际返回为准；per-model 档位覆盖记录为 v0.2 候选 |
-| 5 | `src/config/universalProviderPresets.ts` | 供应商预设结构：`{name, providerType, defaultModels, websiteUrl, ...}` + 工厂函数由 (preset, baseUrl, apiKey) 生成实例 | §4 兼容面列表升级为**内置 Vendor 预设表**：`WithVendor("deepseek")` 一次设置默认 endpoint、协议、quirks、模型列表；v0.1 内置 6~8 家主流厂商 |
+| 5 | `src/config/universalProviderPresets.ts` | 供应商预设结构：`{name, providerType, defaultModels, websiteUrl, ...}` + 工厂函数由 (preset, baseUrl, apiKey) 生成实例 | **未采纳**：最终不内置 Vendor 预设表（避免内置知识库过期与猜测）；用户显式传 endpoint/key/model |
 | 6 | `services/model_fetch.rs` / `model_pricing.rs` | 从 `/models` 拉取列表 + 本地价格表估算成本 | 拉取逻辑已在 §5；成本估算不在本期需求，不采纳 |
 
 ### 11.2 不适用的部分

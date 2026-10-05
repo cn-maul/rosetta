@@ -57,7 +57,7 @@ func main() {
 | [模型体系](docs/models.md) | 两级合并注册表、协议探测、能力声明与门控 |
 | [协议与兼容](docs/protocols.md) | 三协议映射、自动降级、quirks、脏数据处理、重试策略 |
 | [用量统计](docs/usage-stats.md) | Usage 字段、Tracker 接口、Snapshot 查询 |
-| [设计文档](PLAN.md) | 架构决策、里程碑、参考研究 |
+| [设计文档](PLAN.md) | 架构决策与设计取舍（**v0.1 历史草案**：API 片段以 [docs/](docs/) 与 godoc 为准，部分设想未实现） |
 
 可运行示例见 [examples/](examples/)：chat / stream / responses / anthropic / embedding / rerank / usage / models。
 

@@ -237,13 +237,8 @@ rr, err := client.Rerank(ctx, &rosetta.RerankRequest{
   ```
   同理，写单测时若断言"请求到不了服务器"，别依赖某个不存在的域名解析失败——设了代理的机器上代理会代答（一条 `http_proxy` 就能让这类断言红掉），用恒失败的 `RoundTripper` 更可靠。
 - 默认的跨主机重定向守卫：SDK 会拒绝跳到别的主机的 3xx（net/http 只剥离 `Authorization`/`Cookie`，不会剥离 `x-api-key`），拒绝是永久错误、立即返回（v0.6.0 起不再消耗退避序列）；自己传 `http.Client` 时若已设 `CheckRedirect` 则以你的为准。
-- Windows 本地跑 `go test -race` 需要 CGO（gcc）；无 gcc 环境用 `go test ./...` 即可，CI（Linux）会跑 race。
-- **MinGW 装在含空格的路径下（如 `C:\Program Files\mingw64`）会导致所有 cgo 链接失败**（gcc 的 `*endfile` spec 引用 `default-manifest.o` 时路径未加引号）。把 MinGW 移到无空格路径是根治方案；临时绕过：导出并打补丁 specs 后在 `-ldflags` 中引用：
-  ```bash
-  gcc -dumpspecs > C:/Users/<you>/mingw64-specs.txt
-  sed -i 's/%{!shared:%:if-exists(default-manifest\.o%s)}//' C:/Users/<you>/mingw64-specs.txt
-  go build -ldflags "-extldflags=-specs=C:/Users/<you>/mingw64-specs.txt" ./...
-  ```
-- Windows Insider 构建（本机 build 29648）上 `-race` 可编译链接，但 TSan 运行时在固定地址分配 shadow memory 会报 `error code: 87` 而无法启动——属 OS 层限制，本地以 `go test ./...` 为准，race 由 CI（Linux）执行。
-- MinGW 在含空格路径下跑 `-race` 的另一条绕过：给链接器显式传短路径的库搜索目录，`CC='C:/PROGRA~1/mingw64/bin/gcc.exe' CGO_LDFLAGS='-B C:/PROGRA~1/mingw64/x86_64-w64-mingw32/lib/' go test -race ./...`（`PROGRA~1` 是 `Program Files` 的 DOS 短名，规避 ld 对未加引号路径的拆分）。**2026-09-20 复测：这条绕过在当前工具链上已失效**（`ld.exe: cannot find C:/Program`）——gcc 内部仍按编译期前缀展开成长路径。可靠做法是把 MinGW 装到无空格路径（如 `C:\mingw64`）并设 `CC=C:/mingw64/bin/gcc.exe`，或改在 WSL / Linux 上跑本地 race 检查。
+- Windows 本地跑 `go test -race` 需要 CGO 与一个 C 编译器。**已实测可用的方案**：用 winget 装 WinLibs MinGW-w64 GCC（`winget install --id BrechtSanders.WinLibs.POSIX.UCRT -e`），装到无空格路径后把它加入 PATH，然后 `CGO_ENABLED=1 go test -race ./...` 即可（本机 GCC 16.2 + Go 1.27 验证通过，含 `runtime/cgo` 的 TSan 运行时）。CI（Linux）同样跑 race。
+- 若 winget 直连 GitHub 失败（release 资源经 github.com 跳转，国内常被墙），可经镜像下载同一 zip 并校验 winget manifest 公布的 SHA256 后手动解压；或改在 WSL / Linux 上跑 race。
+- 不要把 MinGW 装在含空格的路径（如 `C:\Program Files\mingw64`）：gcc 的 `*endfile` spec 引用 `default-manifest.o` 时路径未加引号，会导致所有 cgo 链接失败。装到 `C:\WinLibs\mingw64` 这类无空格路径是根治方案。
+- 曾记录的两条绕过（打补丁 specs、`PROGRA~1` 短名 + `-B` 库搜索目录）在当前工具链上均已失效（gcc 仍按编译期前缀展开成长路径），**不要再依赖**；直接装到无空格路径即可。
 - 示例程序读 `ROSETTA_ENDPOINT` / `ROSETTA_API_KEY` / `ROSETTA_MODEL` 环境变量：`go run ./examples/chat`。
