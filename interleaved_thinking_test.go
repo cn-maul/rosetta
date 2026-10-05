@@ -23,7 +23,7 @@ import (
 	"testing"
 )
 
-func TestPayloadNeedsInterleavedThinking(t *testing.T) {
+func TestScanPayloadInterleavedThinking(t *testing.T) {
 	tools := []map[string]any{{"name": "t", "input_schema": map[string]any{"type": "object"}}}
 	tests := []struct {
 		name string
@@ -56,8 +56,8 @@ func TestPayloadNeedsInterleavedThinking(t *testing.T) {
 		}, false},
 	}
 	for _, tc := range tests {
-		if got := payloadNeedsInterleavedThinking(tc.v); got != tc.want {
-			t.Errorf("%s: payloadNeedsInterleavedThinking = %v, want %v", tc.name, got, tc.want)
+		if got := scanAnthropicPayload(tc.v).needsInterleaved; got != tc.want {
+			t.Errorf("%s: needsInterleaved = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

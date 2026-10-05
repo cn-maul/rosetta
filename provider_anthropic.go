@@ -131,24 +131,6 @@ func scanAnthropicPayload(v any) anthroPayloadScan {
 	return s
 }
 
-// payloadNeedsExtendedCacheTTL reports whether the *built payload* carries a
-// cache breakpoint asking for the 1-hour TTL, which Anthropic gates behind a
-// beta header. It delegates to the single-pass scan.
-func payloadNeedsExtendedCacheTTL(v any) bool {
-	return scanAnthropicPayload(v).needsExtendedTTL
-}
-
-// payloadNeedsInterleavedThinking reports whether the built payload enables
-// extended thinking while also offering tools — the exact scope Anthropic
-// documents for the interleaved-thinking beta ("only supported for tools used
-// through the Messages API"). A request without tools gains nothing from the
-// header, and leaving it off keeps the request acceptable to gateways that
-// forward to platforms where the header is rejected. It delegates to the
-// single-pass scan.
-func payloadNeedsInterleavedThinking(v any) bool {
-	return scanAnthropicPayload(v).needsInterleaved
-}
-
 // wantsInterleavedThinking resolves the tri-state WithInterleavedThinking
 // setting against the payload: an explicit choice wins, otherwise the payload
 // decides.
@@ -173,15 +155,6 @@ func (p *anthropicProvider) betaHeaders(scan anthroPayloadScan) string {
 		betas = append(betas, interleavedThinkingBeta)
 	}
 	return strings.Join(betas, ",")
-}
-
-// countCacheControl walks a built payload counting cache_control breakpoints
-// so the wire request can be checked against Anthropic's four-breakpoint
-// ceiling — which is enforced on what actually reaches the API, so an
-// empty-text block whose breakpoint was dropped is not counted. It delegates
-// to the single-pass scan.
-func countCacheControl(v any) int {
-	return scanAnthropicPayload(v).breakpoints
 }
 
 // anthroPlan is the per-request resolution of max_tokens and thinking

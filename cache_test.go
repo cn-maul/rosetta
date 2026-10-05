@@ -180,9 +180,9 @@ func TestAnthropicSystemWireShape(t *testing.T) {
 	}
 }
 
-// payloadNeedsExtendedCacheTTL must see a 1h breakpoint in every container
-// shape the builders and Extra can produce.
-func TestPayloadNeedsExtendedCacheTTL(t *testing.T) {
+// scanAnthropicPayload must see a 1h breakpoint in every container shape the
+// builders and Extra can produce.
+func TestScanPayloadExtendedCacheTTL(t *testing.T) {
 	hourly := map[string]any{"type": "ephemeral", "ttl": "1h"}
 	tests := []struct {
 		name string
@@ -208,8 +208,8 @@ func TestPayloadNeedsExtendedCacheTTL(t *testing.T) {
 		}}, false},
 	}
 	for _, tc := range tests {
-		if got := payloadNeedsExtendedCacheTTL(tc.v); got != tc.want {
-			t.Errorf("%s: payloadNeedsExtendedCacheTTL = %v, want %v", tc.name, got, tc.want)
+		if got := scanAnthropicPayload(tc.v).needsExtendedTTL; got != tc.want {
+			t.Errorf("%s: needsExtendedTTL = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -346,7 +346,7 @@ func TestAnthropicCacheBreakpointsReachEveryBlockKind(t *testing.T) {
 			t.Errorf("%s block lost its breakpoint: %v", w.typ, blk)
 		}
 	}
-	if n := countCacheControl(payload); n != 4 {
+	if n := scanAnthropicPayload(payload).breakpoints; n != 4 {
 		t.Fatalf("wire breakpoints = %d, want 4", n)
 	}
 }
