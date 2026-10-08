@@ -27,7 +27,7 @@
 package rosetta
 
 // Version is the semantic version of this SDK release.
-const Version = "1.0.0"
+const Version = "1.0.1"
 
 // Protocol identifies one of the supported wire protocols.
 type Protocol string

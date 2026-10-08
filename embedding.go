@@ -149,7 +149,9 @@ func decodeEmbeddingsResponse(body []byte, expected, dimensions int) (*Embedding
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &wire); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding embeddings response: %w", err)
+		// Unary upstream body decode failure — see ErrUpstreamMalformed.
+		// A caller that gets this should retry elsewhere, not edit its request.
+		return nil, fmt.Errorf("%w: embeddings response: %w", ErrUpstreamMalformed, err)
 	}
 	if len(wire.Data) == 0 {
 		return nil, fmt.Errorf("rosetta: embeddings response contains no data")

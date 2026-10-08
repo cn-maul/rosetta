@@ -547,6 +547,12 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				// A malformed event may carry content the caller will
 				// otherwise never see; dropping it silently would corrupt
 				// text or tool-call arguments, so fail the stream instead.
+				//
+				// NOT ErrUpstreamMalformed: same reasoning as the openai-chat
+				// stream decoder — a stream error may arrive after the caller
+				// already received events, so "fail over and retry" would
+				// duplicate delivered output. See ErrUpstreamMalformed's doc
+				// and the comment on the openai-chat site.
 				return nil, fmt.Errorf("rosetta: responses stream (%s %s): malformed event: %w", method, url, err)
 			}
 			// Dispatch on the JSON type field, but fall back to the SSE
@@ -830,7 +836,10 @@ type oaRespEvent struct {
 func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	var r oaRespResponse
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding responses payload: %w", err)
+		// Unary response body decode failure: upstream fault, not the
+		// caller's — see ErrUpstreamMalformed. Same %w/%w shape and safety
+		// argument as decodeOpenAIChatResponse.
+		return nil, fmt.Errorf("%w: responses payload: %w", ErrUpstreamMalformed, err)
 	}
 	if r.Error != nil {
 		apiErr := r.Error.apiError(200)

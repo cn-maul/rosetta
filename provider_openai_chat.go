@@ -562,6 +562,20 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 				// A malformed chunk may carry content the caller will
 				// otherwise never see; dropping it silently would corrupt
 				// text or tool-call arguments, so fail the stream instead.
+				//
+				// NOT ErrUpstreamMalformed — deliberately, and this is the one
+				// place where the obvious-looking change is wrong. A stream
+				// error can surface *after* events were already handed to the
+				// caller, and the natural consumer mapping
+				// `errors.Is(err, ErrUpstreamMalformed) -> fail over to the
+				// next upstream` is unsafe there: the caller has already
+				// delivered bytes, so retrying replays output and can be
+				// double-charged. This is verified end-to-end from the
+				// consumer side (rosetta-gateway's TestE2E_C3: a stream cut
+				// after the first chunk must NOT touch the healthy next
+				// target). Consumers gate failover on their own committed
+				// state instead, which requires this error to stay
+				// distinguishable from the unary case.
 				return nil, fmt.Errorf("rosetta: openai-chat stream (%s %s): malformed event: %w", method, url, err)
 			}
 			if ch.Error != nil {
@@ -770,7 +784,25 @@ type oaResponse struct {
 func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	var r oaResponse
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding openai-chat response: %w", err)
+		// Unary response body decode failure: the upstream answered success
+		// with something we cannot read (truncated body, HTML error page from
+		// an intermediary). The request was fine, so this is an upstream
+		// fault — hence ErrUpstreamMalformed, which lets callers fail over
+		// instead of blaming themselves.
+		//
+		// %w on the sentinel so errors.Is matches. The json detail is also
+		// wrapped with %w rather than rendered with %v: it keeps the original
+		// error's errors.As reachability (a *json.SyntaxError carries the byte
+		// Offset, which is the single most useful diagnostic here). That is
+		// safe because encoding/json never puts input bytes into its error
+		// values — *SyntaxError holds only Offset+msg, and
+		// *UnmarshalTypeError holds Go type/field names and the JSON *type*
+		// name ("string"), never the offending value. Verified empirically
+		// over truncated / HTML / type-mismatch / secret-in-value bodies.
+		// Neither type is a rosetta sentinel, so the chain cannot
+		// accidentally satisfy errors.Is(err, ErrInvalidRequest) or match
+		// *APIError / *TransportError.
+		return nil, fmt.Errorf("%w: openai-chat response: %w", ErrUpstreamMalformed, err)
 	}
 	if r.Error != nil {
 		apiErr := r.Error.apiError(200)

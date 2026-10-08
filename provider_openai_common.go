@@ -91,13 +91,28 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding model list: %w", err)
+		// /models catalog decode failure: the upstream body is not the shape
+		// this protocol requires — an upstream fault (see
+		// ErrUpstreamMalformed), not a caller mistake.
+		return nil, fmt.Errorf("%w: model list: %w", ErrUpstreamMalformed, err)
 	}
 	// A 200 with no "data" field (or an explicit null) is a malformed catalog,
 	// not an empty one. Treating it as empty would let SetRemote wipe every
 	// previously learned remote entry (audit B11).
+	//
+	// Tagged with the same sentinel as the decode failure above: this is the
+	// post-condition of the very same decode step, and {"data":null} is no
+	// more a catalog than `{` is. Leaving it untagged would recreate the exact
+	// classification hole one line below the fix.
+	//
+	// Contrast with the *content* checks further down (empty vector, wrong
+	// dimension, non-numeric element): those inspect a body that DID decode to
+	// the required shape, so they are deliberately left untagged — the
+	// sentinel means "could not be decoded into the required shape", and
+	// stretching it to "decoded but semantically unacceptable" would make
+	// errors.Is(ErrUpstreamMalformed) useless as a failover signal.
 	if list.Data == nil {
-		return nil, fmt.Errorf("rosetta: model list response is missing the required \"data\" field")
+		return nil, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 	}
 	models := make([]ModelInfo, 0, len(*list.Data))
 	for _, m := range *list.Data {

@@ -736,6 +736,15 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 		}
 		return ev
 	}
+	// malformed builds the error for an undecodable stream event.
+	//
+	// NOT ErrUpstreamMalformed — deliberately. Unlike a unary response decode
+	// failure, this fires from inside the event iterator, which may already
+	// have handed the caller earlier events. A consumer that maps
+	// ErrUpstreamMalformed to "fail over to the next upstream" would then
+	// replay output the caller has already delivered (and re-bill it). The
+	// safe decision needs the consumer's committed state, so the stream error
+	// stays untyped here; see ErrUpstreamMalformed's doc comment.
 	malformed := func(err error) error {
 		return fmt.Errorf("rosetta: anthropic stream (%s %s): malformed event: %w", method, url, err)
 	}
@@ -931,13 +940,23 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 			LastID  string `json:"last_id"`
 		}
 		if err := json.Unmarshal(body, &list); err != nil {
-			return nil, fmt.Errorf("rosetta: decoding model list: %w", err)
+			// /models catalog decode failure: upstream fault — see
+			// ErrUpstreamMalformed. Same classification as the OpenAI-compat
+			// catalog decoder in provider_openai_common.go so a caller sees
+			// one behaviour regardless of which protocol it probed.
+			return nil, fmt.Errorf("%w: model list: %w", ErrUpstreamMalformed, err)
 		}
 		// Missing/null "data" is a malformed catalog, not an empty one:
 		// treating it as empty would wipe the previously learned remote
 		// layer (audit B11).
+		//
+		// Tagged with the same sentinel as the decode failure above: it is the
+		// post-condition of that same decode step, and a required field being
+		// absent/null is a structural defect — indistinguishable to a caller
+		// from a body that failed to parse at all. Content checks that run on a
+		// body which DID decode to the required shape stay untagged.
 		if list.Data == nil {
-			return nil, fmt.Errorf("rosetta: model list response is missing the required \"data\" field")
+			return nil, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 		}
 		for _, m := range *list.Data {
 			if m.ID == "" {
@@ -1056,7 +1075,12 @@ type anthroResponse struct {
 func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	var r anthroResponse
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding anthropic response: %w", err)
+		// Unary response body decode failure: upstream fault, not the
+		// caller's — see ErrUpstreamMalformed. Same %w/%w shape and safety
+		// argument as decodeOpenAIChatResponse: the sentinel stays matchable
+		// via errors.Is and the json detail keeps its errors.As reachability
+		// without ever carrying response bytes.
+		return nil, fmt.Errorf("%w: anthropic response: %w", ErrUpstreamMalformed, err)
 	}
 	if r.Error != nil {
 		// An in-band 200 error still carries request context, so callers can

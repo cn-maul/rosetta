@@ -162,7 +162,8 @@ func decodeRerankResponse(body []byte, expectedDocs int) (*RerankResponse, error
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &wire); err != nil {
-		return nil, fmt.Errorf("rosetta: decoding rerank response: %w", err)
+		// Unary upstream body decode failure — see ErrUpstreamMalformed.
+		return nil, fmt.Errorf("%w: rerank response: %w", ErrUpstreamMalformed, err)
 	}
 	if len(wire.Results) == 0 {
 		return nil, fmt.Errorf("rosetta: rerank response contains no results")

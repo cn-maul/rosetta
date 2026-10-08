@@ -43,6 +43,51 @@ var (
 	// bounds memory against a hostile or buggy provider. The partial response
 	// stays available via Stream.Partial; match with errors.Is.
 	ErrStreamOverflow = errors.New("rosetta: stream accumulation exceeded safety limits")
+	// ErrUpstreamMalformed is returned when the upstream answered with a
+	// success status (or a 200-equivalent) but its response body could not be
+	// decoded into the shape the protocol requires — a truncated body, an HTML
+	// error page from an intermediary, a half-written JSON document.
+	//
+	// # Why this needs to be a distinct sentinel
+	//
+	// The direction of blame decides the caller's action, and for this failure
+	// the two directions are opposite:
+	//
+	//   - ErrInvalidRequest means *the caller* built something the SDK or the
+	//     provider rejected. Retrying it unchanged fails identically, and
+	//     blaming the provider would hide the caller's bug.
+	//   - ErrUpstreamMalformed means *the upstream* produced an unusable
+	//     answer to a request that was fine. The caller's only useful moves are
+	//     to retry elsewhere (failover), back off, or surface the fault — and
+	//     none of them is "fix your request".
+	//
+	// Before this sentinel existed these failures were wrapped in a bare
+	// fmt.Errorf, so no caller could classify them: a gateway's error mapper
+	// found no sentinel, no *APIError and no *TransportError, fell through to
+	// its "internal gateway error" bucket, and returned 500 while also
+	// declining to fail over — misreporting an upstream fault as the gateway's
+	// own and leaving the request pinned to the broken upstream.
+	//
+	// # Scope: this covers unary response decoding, NOT mid-stream event parsing
+	//
+	// Deliberately not attached to stream-event decode failures (see
+	// provider_openai_chat.go / provider_anthropic.go /
+	// provider_openai_responses.go, each marked "NOT ErrUpstreamMalformed").
+	// A stream error may arrive after content was already delivered, and
+	// "retry the upstream" is then actively harmful — it duplicates output and
+	// double-charges. Because one sentinel cannot express "safe to retry" for
+	// a failure whose safety depends on how far the caller got, the streams
+	// keep an untyped error and callers gate on their own committed state.
+	// Tagging them here would turn the natural
+	// `errors.Is(err, ErrUpstreamMalformed) -> failover` mapping into a
+	// correctness bug.
+	//
+	// The original decode error is preserved with %w so errors.As can still
+	// reach the underlying *json.SyntaxError / *json.UnmarshalTypeError for
+	// diagnostics. Those carry an offset and at most a field name — never the
+	// body itself — so wrapping them does not put response content into logs;
+	// the malformed bytes are deliberately not attached.
+	ErrUpstreamMalformed = errors.New("rosetta: upstream response could not be decoded")
 )
 
 // TransportError wraps a lower-level network failure (DNS, connect, TLS,
