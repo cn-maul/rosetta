@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
@@ -88,6 +90,18 @@ var (
 	// body itself — so wrapping them does not put response content into logs;
 	// the malformed bytes are deliberately not attached.
 	ErrUpstreamMalformed = errors.New("rosetta: upstream response could not be decoded")
+	// ErrStreamIdleTimeout is the recommended cause for Stream.Abort when a
+	// watchdog aborts a stream that delivered no event within its idle
+	// window. The SDK never raises it itself — WithTimeout is unary-only
+	// and an established stream is governed by the caller — so matching it
+	// always means a caller-side watchdog fired. The partial response
+	// stays available via Stream.Partial.
+	ErrStreamIdleTimeout = errors.New("rosetta: stream idle timeout (caller watchdog)")
+	// ErrStreamAborted is the default cause used when Stream.Abort is
+	// called with a nil error. Matching it means the caller aborted the
+	// stream for an unspecified reason; prefer passing an explicit cause
+	// (e.g. ErrStreamIdleTimeout) so downstream code can distinguish.
+	ErrStreamAborted = errors.New("rosetta: stream aborted by caller")
 )
 
 // TransportError wraps a lower-level network failure (DNS, connect, TLS,
@@ -120,13 +134,88 @@ type APIError struct {
 	// policy allows it (GET-like methods by default; non-idempotent POSTs
 	// like chat require an explicit policy).
 	Retryable bool
+	// RetryAfter is the server-stated wait, parsed from the Retry-After
+	// response header (delay-seconds or HTTP-date) and capped at 60s.
+	// Zero means the server gave none (or the value was unparsable).
+	//
+	// It is a hint for callers — cooldown scheduling, header pass-through,
+	// backoff elsewhere — not an instruction: the SDK's own retry loop has
+	// already honored whatever it is going to honor, and this field is set
+	// even on the final error a caller receives after retries ran out.
+	// Only status-code failures from the transport carry it; in-band (200)
+	// errors never do, since the HTTP layer succeeded.
+	RetryAfter time.Duration
 	// InBand marks an error that arrived inside a 200 response body or a
 	// stream event rather than as a non-2xx HTTP status. Such errors carry
 	// StatusCode=200 (the transport succeeded) but are real failures; callers
 	// that gate on StatusCode >= 400 must also check InBand (G11).
 	InBand bool
-	Raw    json.RawMessage // original response body (may be truncated)
+	// Category is a coarse attribution hint derived from the status code
+	// and the provider's structured error fields (code/type). It tells a
+	// caller which *thing* failed — the account's money, the account's
+	// quota window, the rate limit, the model's availability, or content
+	// policy — so decisions like "rest this credential" or "fail over to
+	// another model" don't have to re-parse provider bodies.
+	//
+	// It is advisory: CatUnclassified means "no known canonical signal
+	// matched", not "none of the above applies". Callers must treat it as
+	// a hint layered on StatusCode, never as a replacement for it.
+	Category ErrorCategory
+	// AffectsModel is the model the provider explicitly named as the
+	// reason for the failure (empty when it didn't). Set for model-level
+	// failures — "model not found", "model not available in your plan",
+	// "model decommissioned" — so a caller can stop offering that model on
+	// this credential without resting the credential itself for its other
+	// models.
+	AffectsModel string
+	Raw          json.RawMessage // original response body (may be truncated)
 }
+
+// ErrorCategory is a coarse attribution hint for an APIError: which kind of
+// thing the provider said failed. Values are matched against canonical
+// protocol signals only — documented status codes and the structured
+// code/type fields of OpenAI and Anthropic error bodies. Deliberately NOT
+// matched: free-text message keywords (English or otherwise). A message
+// wordlist is unbounded vendor-private surface that drifts with every
+// provider's rewording; a gateway that needs it can layer its own hints on
+// top of Raw, which is always available.
+type ErrorCategory int8
+
+const (
+	// CatUnclassified means no canonical signal matched. It is the zero
+	// value and must stay first.
+	CatUnclassified ErrorCategory = iota
+	// CatOutOfCredit: the account has no money. OpenAI 429 with
+	// code "insufficient_quota"; Anthropic 400 type "billing_error"
+	// (its docs say "you've hit your maximum spend") and 402 credit_too_low.
+	// Not retryable against the same account until it is topped up.
+	CatOutOfCredit
+	// CatRateLimited: the request was throttled. 429 without the
+	// insufficient_quota code; Retry-After often carries the wait.
+	// Retryable — possibly against a different credential.
+	CatRateLimited
+	// CatQuotaExhausted: a subscription usage window is spent (distinct
+	// from pay-as-you-go credit). Anthropic 429 type "rate_limit_error"
+	// whose message names a daily/weekly/monthly/billing window reset.
+	// Recovers when the window resets.
+	CatQuotaExhausted
+	// CatModelUnavailable: the model itself cannot be served on this
+	// account/endpoint — not found, not in the plan, or decommissioned.
+	// OpenAI 404 code "model_not_found" / "model_decommissioned"; Anthropic
+	// 404 type "not_found_error" naming the model. AffectsModel is set
+	// when the provider names one. The credential's other models are fine.
+	CatModelUnavailable
+	// CatContentRefused: the request content was refused (safety system,
+	// prompt injection filter, moderation). OpenAI 400 type
+	// "content_filter" / code "content_policy_violation"; Anthropic 400
+	// type "request_blocked" (its web firewall) — the account is innocent:
+	// retrying the same prompt on another credential fails the same way.
+	CatContentRefused
+	// CatAuthFailed: the credential itself was rejected. 401, or 403 that
+	// is not a content refusal. The key is bad, expired or lacks access;
+	// no other request will succeed with it until it is fixed.
+	CatAuthFailed
+)
 
 func (e *APIError) Error() string {
 	var b strings.Builder
@@ -146,6 +235,107 @@ func (e *APIError) Error() string {
 	}
 	return b.String()
 }
+
+// withRetryAfter fills an APIError's RetryAfter from the response headers.
+// Applied at every non-2xx return so the server-stated wait reaches the
+// caller uniformly across protocols and call kinds. Nil or empty headers
+// leave it zero.
+func withRetryAfter(e *APIError, h http.Header) *APIError {
+	if e == nil {
+		return nil
+	}
+	e.RetryAfter = httpx.RetryAfterOf(h)
+	return e
+}
+
+// classify fills Category and AffectsModel from the status code and the
+// structured code/type fields already parsed onto e. Canonical signals
+// only — see ErrorCategory for why message keywords are deliberately not
+// consulted (except the one Anthropic rate_limit_error case where the
+// canonical type is shared between "slow down" and "window spent" and the
+// distinction is only in the message's reset-time phrasing, which is
+// itself documented API surface: "Please try again in 1hr" style window
+// resets).
+//
+// Called at the end of every error-body parse, so classification is
+// uniform across the three protocols and the auxiliary APIs.
+func (e *APIError) classify() {
+	if e == nil {
+		return
+	}
+	code, typ := e.Code, e.Type
+	switch {
+	case e.StatusCode == http.StatusUnauthorized:
+		e.Category = CatAuthFailed
+	case e.StatusCode == http.StatusForbidden && typ != "request_blocked":
+		e.Category = CatAuthFailed
+
+	// Money: OpenAI's documented insufficient_quota (billing hard limit),
+	// Anthropic's billing_error / credit_too_low.
+	//
+	// Either field alone is enough: OpenAI sends code "insufficient_quota"
+	// on some deployments and type "insufficient_quota" on others, and
+	// third-party relays pick one or the other. Requiring both would miss
+	// the single most important case a caller needs to get right.
+	case e.StatusCode == 402 && (code == "credit_too_low" || typ == "credit_too_low" || typ == "billing_error"):
+		e.Category = CatOutOfCredit
+	case code == "insufficient_quota" || typ == "insufficient_quota":
+		e.Category = CatOutOfCredit
+	case typ == "billing_error":
+		e.Category = CatOutOfCredit
+
+	// Throttling: 429s that are not the credit case. Anthropic's
+	// rate_limit_error covers both "too fast" and "daily/weekly window
+	// spent"; the window case says a reset time, which is the documented
+	// distinction between the two.
+	case e.StatusCode == http.StatusTooManyRequests:
+		if typ == "rate_limit_error" && windowResetPhrases.MatchString(e.Message) {
+			e.Category = CatQuotaExhausted
+		} else {
+			e.Category = CatRateLimited
+		}
+
+	// Model-level unavailability. OpenAI's codes; Anthropic's 404 names
+	// the model in its message ("model: <id> is not available"), which is
+	// documented behavior, so the model id is recoverable from there.
+	case e.StatusCode == http.StatusNotFound && (code == "model_not_found" || code == "model_decommissioned" || typ == "not_found_error"):
+		e.Category = CatModelUnavailable
+		e.AffectsModel = e.namedModel()
+
+	// Content policy. request_blocked is Anthropic's firewall, not a
+	// permission failure — the account is fine.
+	case typ == "request_blocked", typ == "content_filter", code == "content_policy_violation":
+		e.Category = CatContentRefused
+	}
+}
+
+// windowResetPhrases distinguishes Anthropic's "usage window spent" 429s
+// from its "slow down" 429s. Both arrive as type rate_limit_error; the
+// window case carries a reset deadline in the message, per Anthropic's
+// documented error shapes ("Please try again in 8h", "...until 3pm
+// Monday", "resets at 9am Pacific"). Time-unit and reset phrasings only —
+// no vendor names or private wording.
+var windowResetPhrases = regexp.MustCompile(
+	`(?i)\b(\d+\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|d|day|days|week|weeks)\b|until\s+\S+|resets?\b|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b`)
+
+// namedModel extracts the model id the provider named in the message.
+// Anthropic's 404 says "model: <id> is not available..."; OpenAI's
+// model_not_found says "The model '<id>' does not exist". Both quoted and
+// colon forms are canonical document shapes.
+func (e *APIError) namedModel() string {
+	if m := quotedModelRe.FindStringSubmatch(e.Message); len(m) > 1 {
+		return m[1]
+	}
+	if m := colonModelRe.FindStringSubmatch(e.Message); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+var (
+	quotedModelRe = regexp.MustCompile(`(?i)\bmodel\s+'([^']+)'`)
+	colonModelRe  = regexp.MustCompile(`(?i)\bmodel:\s*(\S+)`)
+)
 
 // transport wraps a network error with request context.
 func transport(err error, method, url string) error {

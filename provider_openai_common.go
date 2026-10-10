@@ -83,7 +83,7 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+		return nil, withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 	}
 	var list struct {
 		Data *[]struct {

@@ -52,16 +52,57 @@ type Stream interface {
 	Partial() *ChatResponse     // 时点快照：已累积的响应（深拷贝，可安全持有，不受后续事件影响）
 	Collect() (*ChatResponse, error) // 拖完剩余事件并返回完整响应
 	Close() error               // 释放连接；干净结束后调用是无害 no-op
+	Abort(cause error)          // 以 cause 中断；Err() 之后匹配 cause（看门狗超时用）
 }
 ```
 
-`Next` 必须由单 goroutine 驱动；`Err` / `Usage` / `Partial` / `Close` 与之并发安全（例如看门狗超时关闭流、旁路 goroutine 读取 `Partial`），快照与并发关闭都有 race 检测覆盖。
+`Next` 必须由单 goroutine 驱动；`Err` / `Usage` / `Partial` / `Close` / `Abort` 与之并发安全（例如看门狗超时中断流、旁路 goroutine 读取 `Partial`），快照与并发关闭都有 race 检测覆盖。
 
 只想要最终结果不关心过程时，`Collect` 一步到位：
 
 ```go
 resp, err := stream.Collect()
 ```
+
+## 看门狗：流空闲超时
+
+`WithTimeout` **只作用于非流式调用**；已建连的流没有字节间空闲上限，流生命周期只由调用方的 ctx 约束。因此空闲超时看门狗由调用方持有——SDK 提供的是把它做对所需的零件：
+
+```go
+const idle = 30 * time.Second
+
+stream, err := client.ChatStream(ctx, req)
+if err != nil {
+	return err
+}
+defer stream.Close()
+
+// 超时即中断，并把原因留在 Err() 里
+watch := time.AfterFunc(idle, func() { stream.Abort(rosetta.ErrStreamIdleTimeout) })
+defer watch.Stop()
+
+for stream.Next() {
+	watch.Reset(idle) // 每收到一个事件就续期
+	switch ev := stream.Event(); ev.Type {
+	case rosetta.EventTextDelta:
+		io.WriteString(w, ev.Text)
+	}
+}
+if errors.Is(stream.Err(), rosetta.ErrStreamIdleTimeout) {
+	// 上游静默过久；已收到的内容仍在 stream.Partial() 里
+}
+```
+
+**`Abort` 与 `Close` 的区别是刻意的**：
+
+| | `Close()` | `Abort(cause)` |
+|---|---|---|
+| 语义 | 调用方主动走开（放弃这次请求） | 因 `cause` 而死 |
+| `Err()` | 保持 `nil` | 匹配 `cause` |
+| 用量记账 | 不计入 `UsageMissing`（主动放弃 ≠ 上游没报用量） | 照常触发，携带 `cause` |
+| `Partial()` | 保留已收内容 | 保留已收内容 |
+
+两者都可从任意 goroutine 调用（包括 `time.AfterFunc` 回调与阻塞中的 `Next` 竞争），且都是**恰好一次**收尾。若流已正常结束、或已因自身错误结束，迟到的 `Abort` 是**空操作**——不会覆盖真实结果，也不会把一次干净结束报成超时。`Abort(nil)` 退化为 `ErrStreamAborted`。
 
 ## 中断与收尾语义
 

@@ -70,7 +70,7 @@ func postAuxJSON(ctx context.Context, c *Client, path string, payload map[string
 		return nil, rerr
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+		return nil, withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 	}
 	return body, nil
 }

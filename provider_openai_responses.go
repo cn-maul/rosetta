@@ -148,7 +148,7 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
-			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+			apiErr := withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model) {
 				sanitizes++
 				continue
@@ -193,7 +193,7 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 			if rerr != nil {
 				return nil, rerr
 			}
-			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+			apiErr := withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model) {
 				sanitizes++
 				continue
@@ -213,6 +213,7 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 			return bufferedStream(cr), nil
 		}
 		s := newStream(p.streamEvents(resp.Body, method, url, reqID), nil)
+		s.setIdle(p.c.settings.streamIdle)
 		s.attachCloser(resp.Body)
 		return s, nil
 	}
@@ -334,13 +335,36 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 				})
 			}
 			for _, b := range m.Blocks {
-				if b.Type == BlockToolCall {
+				switch b.Type {
+				case BlockToolCall:
 					items = append(items, map[string]any{
 						"type":      "function_call",
 						"call_id":   b.ToolCallID,
 						"name":      b.ToolName,
 						"arguments": b.Arguments,
 					})
+				case BlockThinking:
+					// A sealed payload only rides this API family's own
+					// reasoning item — it was sealed by OpenAI and is
+					// meaningless to another upstream. SealedBy gates it so a
+					// conversation routed elsewhere drops the seal instead
+					// of sending foreign opaque state to a provider that
+					// never issued it.
+					if b.Sealed == "" || b.SealedBy != "openai-responses" {
+						continue
+					}
+					item := map[string]any{
+						"type":              "reasoning",
+						"encrypted_content": b.Sealed,
+					}
+					// The summary is what the model sees; an empty one is
+					// omitted rather than sent as "".
+					if b.Thinking != "" {
+						item["summary"] = []map[string]any{
+							{"type": "summary_text", "text": b.Thinking},
+						}
+					}
+					items = append(items, item)
 				}
 			}
 		case RoleTool:
@@ -784,11 +808,16 @@ func (u *oaRespUsage) toUsage() Usage {
 
 type oaRespOutputItem struct {
 	Type      string               `json:"type"`
+	ID        string               `json:"id"` // reasoning items; replayed verbatim
 	Role      string               `json:"role"`
 	CallID    string               `json:"call_id"`
 	Name      string               `json:"name"`
 	Arguments jsonx.FlexJSONString `json:"arguments"`
-	Content   []struct {
+	// EncryptedContent is the opaque reasoning payload of a reasoning item.
+	// OpenAI requires it back, unchanged, for the conversation to continue
+	// across turns; it is never interpreted.
+	EncryptedContent string `json:"encrypted_content"`
+	Content          []struct {
 		Type string `json:"type"` // output_text | reasoning_text
 		Text string `json:"text"`
 	} `json:"content"`
@@ -880,8 +909,18 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 					th.WriteString(part.Text)
 				}
 			}
-			if th.Len() > 0 {
-				out.Content = append(out.Content, Block{Type: BlockThinking, Thinking: th.String()})
+			// A reasoning item with an encrypted payload but no readable
+			// text is still a real turn: it carries the state OpenAI needs
+			// to continue, and dropping it because "there is nothing to
+			// show" would break the next replay. The seal goes in Sealed,
+			// never mixed into the displayable Thinking text.
+			if th.Len() > 0 || item.EncryptedContent != "" {
+				out.Content = append(out.Content, Block{
+					Type:     BlockThinking,
+					Thinking: th.String(),
+					Sealed:   item.EncryptedContent,
+					SealedBy: "openai-responses",
+				})
 			}
 		case "function_call":
 			sawToolCall = true

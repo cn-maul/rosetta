@@ -198,7 +198,7 @@ if apiErr, ok := errors.AsType[*rosetta.APIError](err); ok {
 }
 ```
 
-哨兵错误（`errors.Is` 匹配）：`ErrNoEndpoint`、`ErrNoAPIKey`、`ErrUnknownModel`、`ErrContextTooLong`、`ErrThinkingUnsupported`、`ErrInvalidRequest`、`ErrNotSupported`、`ErrStreamTruncated`、`ErrStreamOverflow`、`ErrUpstreamMalformed`。
+哨兵错误（`errors.Is` 匹配）：`ErrNoEndpoint`、`ErrNoAPIKey`、`ErrUnknownModel`、`ErrContextTooLong`、`ErrThinkingUnsupported`、`ErrInvalidRequest`、`ErrNotSupported`、`ErrStreamTruncated`、`ErrStreamOverflow`、`ErrUpstreamMalformed`、`ErrStreamIdleTimeout`、`ErrStreamAborted`。
 
 `ErrUpstreamMalformed`（v1.0.1 新增）表示**上游**回了成功状态却给了一份无法解码的响应体——截断的响应、中间代理的 HTML 错误页、半截 JSON。它与 `ErrInvalidRequest` 的方向**相反**：后者是"你的请求有问题、原样重试必然同样失败"，前者是"请求没问题、换上游/退避才有意义"。故障转移型调用方据此决定是否换目标。
 
@@ -210,7 +210,29 @@ if errors.Is(err, rosetta.ErrUpstreamMalformed) {
 
 **流式事件解析失败刻意不带这个哨兵**：流式错误可能在事件已交付给调用方之后才出现，此时"换上游重试"会重放已交付的输出并可能重复计费。判断能否安全重试需要调用方自己的 committed 状态，错误本身不知道，所以流式保持无类型。
 
-`APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / InBand / Raw`，由三协议的错误体归一而来。`InBand=true` 标记"信内"错误——HTTP 200 但响应体或流事件内嵌了 `error`：传输层确实成功，`StatusCode` 保持 200，**按 `StatusCode >= 400` 判定失败的调用方应同时检查 `InBand`**。`Raw` 存储前做保守脱敏（**先脱敏后截断**，超 4KB 的大错误体同样生效）：敏感键的值替换为 `[redacted]`，`sk-…` 密钥材料统一掩码；但错误信息与 Raw 仍可能包含 provider 回显的内容，请避免把完整错误对象直接写入公开日志。注意 `Retryable` 是给调用方的重试提示（408/429/5xx/529 为 true），**SDK 自身只按重试策略自动重试**：GET 类请求默认重试；chat POST（三协议）v0.6.0 起默认携带 `Idempotency-Key` 并对 429/503 做传输层退避重试（默认最多 2 次），对不识别该头或绝不能重放请求的网关，用 `WithQuirks(Quirks{NoIdempotencyKey: true})` 恢复 v0.5.x 行为（不发该头、429/503 立即报错）；embedding/rerank 幂等，按策略重试。流内错误（HTTP 200 但 SSE 事件报错，即 `InBand=true`）与流截断（`ErrStreamTruncated`）不看 HTTP 状态码判断。另外：第三方网关以 400 拒绝某个可选字段**取值**（如 `reasoning.effort: low`）时按配置错误原样报错，不会触发"删除整个字段"的降级；字段级拒绝的降级记忆按模型隔离。
+`APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / InBand / RetryAfter / Category / AffectsModel / Raw`，由三协议的错误体归一而来。`InBand=true` 标记"信内"错误——HTTP 200 但响应体或流事件内嵌了 `error`：传输层确实成功，`StatusCode` 保持 200，**按 `StatusCode >= 400` 判定失败的调用方应同时检查 `InBand`**。`Raw` 存储前做保守脱敏（**先脱敏后截断**，超 4KB 的大错误体同样生效）：敏感键的值替换为 `[redacted]`，`sk-…` 密钥材料统一掩码；但错误信息与 Raw 仍可能包含 provider 回显的内容，请避免把完整错误对象直接写入公开日志。注意 `Retryable` 是给调用方的重试提示（408/429/5xx/529 为 true），**SDK 自身只按重试策略自动重试**：GET 类请求默认重试；chat POST（三协议）v0.6.0 起默认携带 `Idempotency-Key` 并对 429/503 做传输层退避重试（默认最多 2 次），对不识别该头或绝不能重放请求的网关，用 `WithQuirks(Quirks{NoIdempotencyKey: true})` 恢复 v0.5.x 行为（不发该头、429/503 立即报错）；embedding/rerank 幂等，按策略重试。流内错误（HTTP 200 但 SSE 事件报错，即 `InBand=true`）与流截断（`ErrStreamTruncated`）不看 HTTP 状态码判断。另外：第三方网关以 400 拒绝某个可选字段**取值**（如 `reasoning.effort: low`）时按配置错误原样报错，不会触发"删除整个字段"的降级；字段级拒绝的降级记忆按模型隔离。
+
+### 错误归因：Category / AffectsModel
+
+`APIError.Category` 给出**归因方向**，让「这把 key 该不该被冷却/摘掉」不必由每个调用方重新解析 provider 错误体：
+
+| 值 | 含义 | 调用方通常的动作 |
+|---|---|---|
+| `CatUnclassified` | 无规范信号命中（零值） | 按 `StatusCode` 常规处理 |
+| `CatOutOfCredit` | 账户没钱（OpenAI `insufficient_quota`、Anthropic `billing_error`/`credit_too_low`） | 换凭据；重试同一账户无意义 |
+| `CatRateLimited` | 被限速（429，窗口未耗尽） | 按 `RetryAfter` 退避后重试，或换凭据 |
+| `CatQuotaExhausted` | 订阅窗口耗尽（Anthropic `rate_limit_error` 且报出重置时间） | 等窗口重置，或换凭据 |
+| `CatModelUnavailable` | 该模型在此账户/端点不可用 | 只下架**该模型**，凭据的其他模型照常 |
+| `CatContentRefused` | 内容被安全策略拒绝（`content_filter`、`request_blocked`） | **别动凭据**——换一把重发同样的内容照样被拒 |
+| `CatAuthFailed` | 凭据本身被拒（401，或非内容类的 403） | 停用该凭据 |
+
+`AffectsModel` 在厂商明确点名模型时非空（OpenAI `model_not_found` 的 `'...'`，Anthropic 404 的 `model: <id>`），配合 `CatModelUnavailable` 可实现**模型级隔离**而不连坐整把 key。
+
+两点边界：**它是提示，不是判据**——`CatUnclassified` 意为「没匹配到已知信号」，不是「以上皆非」，必须与 `StatusCode` 叠加使用。判定只依据**状态码与结构化的 `code`/`type`**（以及 Anthropic 官方文档化的重置时间措辞），**刻意不匹配错误消息里的自由文本关键词**——那是没有边界、随厂商改写而漂移的表面，需要的话请自行基于 `Raw` 叠加。
+
+### Retry-After：上游说的等待时间
+
+`APIError.RetryAfter` 透传上游 `Retry-After` 响应头（秒数或 HTTP-date，与 SDK 自身退避同一套解析，同样受 60s 上限保护；无该头时为 0）。它是**给调用方的提示**——冷却排期、向下游透传 `Retry-After` 响应头、或在别处退避——SDK 自己的重试循环已经遵守过它了。仅状态码类失败会有该字段；`InBand`（HTTP 200 信内错误）不携带。
 
 ## 嵌入与重排
 

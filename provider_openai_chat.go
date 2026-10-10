@@ -417,7 +417,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
-			apiErr := parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id"))
+			apiErr := withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 			if resp.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model, false) {
 				sanitizes++
 				continue
@@ -466,7 +466,7 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		if rerr != nil {
 			return nil, rerr
 		}
-		apiErr := parseOpenAIError(r.StatusCode, body, method, url, r.Header.Get("X-Request-Id"))
+		apiErr := withRetryAfter(parseOpenAIError(r.StatusCode, body, method, url, r.Header.Get("X-Request-Id")), r.Header)
 		if r.StatusCode == http.StatusBadRequest && sanitizes < 4 && p.sanitize(st, apiErr, req.Model, true) {
 			sanitizes++
 			continue
@@ -489,6 +489,7 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		return bufferedStream(cr), nil
 	}
 	s := newStream(p.streamEvents(resp.Body, method, url, reqID), nil)
+	s.setIdle(p.c.settings.streamIdle)
 	s.attachCloser(resp.Body)
 	return s, nil
 }
@@ -884,6 +885,11 @@ func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) 
 // parseOpenAIError converts a non-2xx body into an APIError. OpenAI's
 // shape is {"error":{"message","type","code"}} but "error" is sometimes a
 // bare string on third-party services; both are handled.
+//
+// The deferred classify() runs on every return path — including the
+// early bail-outs below — so no error shape can escape without a
+// Category. It must come after construction because classification reads
+// the fields the parses below fill in.
 func parseOpenAIError(status int, body []byte, method, url, requestID string) *APIError {
 	apiErr := &APIError{
 		StatusCode: status,
@@ -893,6 +899,7 @@ func parseOpenAIError(status int, body []byte, method, url, requestID string) *A
 		Retryable:  retryableStatus(status),
 		Raw:        safeTruncateBody(body),
 	}
+	defer apiErr.classify()
 	var top struct {
 		Error json.RawMessage `json:"error"`
 	}

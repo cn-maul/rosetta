@@ -48,7 +48,8 @@ const (
 //     FileID (uploaded reference), plus FileName and MimeType
 //   - BlockToolCall: ToolCallID, ToolName, Arguments (raw JSON string)
 //   - BlockToolResult: ToolCallID, ToolName, Content (text payload), IsError
-//   - BlockThinking: Thinking, Signature (Anthropic passthrough)
+//   - BlockThinking: Thinking, Signature (Anthropic passthrough), and
+//     optionally Sealed/SealedBy for an opaque provider-sealed payload
 type Block struct {
 	Type        BlockType
 	Text        string
@@ -66,6 +67,24 @@ type Block struct {
 	IsError     bool
 	Thinking    string
 	Signature   string
+	// Sealed carries an opaque reasoning payload that the provider produced
+	// and expects back verbatim, and SealedBy names the API family that
+	// sealed it ("openai-responses" or "anthropic"). It is what keeps a
+	// multi-turn reasoning conversation intact: OpenAI's Responses API
+	// returns reasoning items with an `id` and an `encrypted_content` that
+	// must be replayed unchanged, Anthropic returns signed thinking blocks.
+	//
+	// The payload is never interpreted — not for display, not for token
+	// estimation — and is written back only to the API family named in
+	// SealedBy. Replaying it to a different family (or dropping it while
+	// the caller asked for that family) either breaks the conversation or
+	// silently degrades reasoning, which is why the seal travels with its
+	// origin rather than being flattened into a generic opaque field.
+	//
+	// Thinking may coexist with it: OpenAI sends a readable summary plus the
+	// encrypted blob, and the summary is what a caller displays.
+	Sealed   string
+	SealedBy string
 	// CacheControl marks an Anthropic prompt-cache breakpoint after this
 	// block (text, image, document, tool_result, tool_use). Ignored by the
 	// OpenAI protocols, which cache prefixes automatically.
@@ -170,6 +189,22 @@ func ToolResult(callID, name, content string) Message {
 // provider-supplied signature and must be passed through unchanged).
 func Thinking(text, signature string) Block {
 	return Block{Type: BlockThinking, Thinking: text, Signature: signature}
+}
+
+// SealedThinking builds a thinking block carrying an opaque
+// provider-sealed reasoning payload — OpenAI's Responses
+// `encrypted_content`, or an Anthropic signed thinking payload — that must
+// be replayed verbatim. summary is the readable text (OpenAI sends one
+// alongside the blob); sealed is the opaque payload; sealedBy names the API
+// family that produced it, so the payload is only ever written back there.
+//
+// Replaying a sealed block is what lets a reasoning conversation survive
+// multiple turns. Dropping it is not always harmless: OpenAI answers 400
+// "Item with id 'rs_…' not found" when a stored item is referenced without
+// store=true, and relays in front of OpenAI refuse sealed content sent to
+// a non-OpenAI upstream.
+func SealedThinking(summary, sealed, sealedBy string) Block {
+	return Block{Type: BlockThinking, Thinking: summary, Sealed: sealed, SealedBy: sealedBy}
 }
 
 // text returns the concatenation of the message's text blocks.
@@ -296,7 +331,11 @@ func (b Block) validate() error {
 			return fmt.Errorf("tool_result block needs ToolCallID")
 		}
 	case BlockThinking:
-		if b.Thinking == "" && b.Signature == "" {
+		// A sealed payload is content even with no readable text: it is the
+		// opaque state the provider needs back, and rejecting it as "empty"
+		// would break the next replay. This is why an encrypted-only
+		// reasoning item decodes to a block at all.
+		if b.Thinking == "" && b.Signature == "" && b.Sealed == "" {
 			return fmt.Errorf("thinking block is empty")
 		}
 	case BlockRedactedThinking:

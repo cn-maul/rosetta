@@ -640,7 +640,7 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
-			apiErr := parseAnthropicError(resp.StatusCode, body, method, url, requestID(resp.Header))
+			apiErr := withRetryAfter(parseAnthropicError(resp.StatusCode, body, method, url, requestID(resp.Header)), resp.Header)
 			if resp.StatusCode == http.StatusBadRequest && p.c.settings.thinkingRectify && pl.rectify(apiErr.Message) {
 				p.c.settings.logger.Debug("anthropic: rectifying thinking budget and retrying",
 					"budget", pl.budget, "max_tokens", pl.maxTokens)
@@ -692,7 +692,7 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 		if rerr != nil {
 			return nil, rerr
 		}
-		apiErr := parseAnthropicError(r.StatusCode, body, method, url, requestID(r.Header))
+		apiErr := withRetryAfter(parseAnthropicError(r.StatusCode, body, method, url, requestID(r.Header)), r.Header)
 		if r.StatusCode == http.StatusBadRequest && p.c.settings.thinkingRectify && pl.rectify(apiErr.Message) {
 			continue
 		}
@@ -711,6 +711,7 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 		return bufferedStream(cr), nil
 	}
 	s := newStream(p.streamEvents(resp.Body, method, url, reqID), nil)
+	s.setIdle(p.c.settings.streamIdle)
 	s.attachCloser(resp.Body)
 	return s, nil
 }
@@ -937,7 +938,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 			return nil, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header))
+			return nil, withRetryAfter(parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header)), resp.Header)
 		}
 		var list struct {
 			Data *[]struct {

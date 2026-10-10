@@ -40,6 +40,7 @@ type settings struct {
 	protocolSet      bool // WithProtocol supplied explicitly (B12)
 	httpClient       *http.Client
 	timeout          time.Duration
+	streamIdle       time.Duration
 	maxRetries       int
 	retryBase        time.Duration
 	defaultMaxOutput int
@@ -147,6 +148,27 @@ func WithHTTPClient(c *http.Client) Option {
 // to disable the bound entirely.
 func WithTimeout(d time.Duration) Option {
 	return func(s *settings) { s.timeout = d }
+}
+
+// WithStreamIdleTimeout bounds how long a stream may go without delivering
+// an event before it is aborted with ErrStreamIdleTimeout. It is the missing
+// counterpart to WithTimeout, which deliberately leaves streams alone: a
+// total stream budget would punish a legitimately long generation, while
+// this only fires when the upstream has gone *silent*.
+//
+// Unset (or a non-positive value) disables the watchdog — the default,
+// since a reasonable ceiling varies by provider and by what the caller is
+// streaming. The window is per-Read, not per-stream, so a slow-but-alive
+// stream is never cut. Err() then matches ErrStreamIdleTimeout and Partial()
+// keeps whatever arrived, so the caller can tell a timeout apart from a
+// truncation or a clean end.
+func WithStreamIdleTimeout(d time.Duration) Option {
+	return func(s *settings) {
+		if d < 0 {
+			d = 0
+		}
+		s.streamIdle = d
+	}
 }
 
 // WithMaxRetries sets how many times an eligible failed attempt (transport

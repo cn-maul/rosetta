@@ -311,6 +311,25 @@ func retryAfter(v string) time.Duration {
 	return 0
 }
 
+// RetryAfterOf parses a response's Retry-After header the same way the
+// retry loop does (delay-seconds or HTTP-date), capped at maxRetryAfter,
+// and returns the duration a caller should wait before trying again.
+// Zero when the header is absent or unparsable. Exported so the rosetta
+// package can surface the server-stated wait on APIError without a second,
+// drifting implementation of the same parse.
+func RetryAfterOf(h http.Header) time.Duration {
+	if h == nil {
+		return 0
+	}
+	if d := retryAfter(h.Get("Retry-After")); d > 0 {
+		if d > maxRetryAfter {
+			return maxRetryAfter
+		}
+		return d
+	}
+	return 0
+}
+
 // maxRetryAfter bounds a server-provided Retry-After so a hostile or
 // misconfigured gateway cannot stall callers for arbitrarily long.
 const maxRetryAfter = 60 * time.Second

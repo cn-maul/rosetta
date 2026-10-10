@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 )
 
 // EventType enumerates unified stream event kinds.
@@ -57,6 +58,25 @@ type Event struct {
 //		}
 //	}
 //	if err := stream.Err(); err != nil { return err }
+//
+// # Watchdog timeouts
+//
+// The SDK applies no timeout to an established stream (WithTimeout is
+// unary-only); a stalled provider would block Next forever. The supported
+// pattern is a watchdog goroutine that aborts the stream after an idle
+// interval:
+//
+//	st, _ := client.ChatStream(ctx, req)
+//	watch := time.AfterFunc(30*time.Second, func() { st.Abort(rosetta.ErrStreamIdleTimeout) })
+//	defer watch.Stop()
+//	// reset the timer on every delivered event, e.g. inside the Next loop:
+//	//   watch.Reset(30*time.Second)
+//
+// Abort differs from Close in one decisive way: Close is the caller walking
+// away (Err stays nil, usage is not recorded); Abort records why the stream
+// died, so Err() matches the sentinel afterwards and the terminal usage
+// callback (WithUsageTracker) still fires with the error. The partial
+// response remains available via Partial.
 type Stream interface {
 	// Next advances to the next event, returning false at the end of the
 	// stream (clean end or error — check Err).
@@ -76,8 +96,16 @@ type Stream interface {
 	Collect() (*ChatResponse, error)
 	// Close releases underlying resources (HTTP connection, context).
 	// Calling it after a clean end is a no-op; calling it mid-stream
-	// discards the rest of the response.
+	// discards the rest of the response. It is the caller walking away:
+	// Err() stays nil and the stream is not counted as a failure.
 	Close() error
+	// Abort terminates the stream with cause as its failure, releasing the
+	// same resources Close would. Err() matches cause afterwards; Partial
+	// keeps whatever was accumulated. Use it for watchdog-style timeouts
+	// where the reason for the death must be observable, unlike Close
+	// which is a deliberate walk-away. Aborting an already-finished
+	// stream is a no-op.
+	Abort(cause error)
 }
 
 // streamCore is the shared Stream implementation. Protocol adapters supply
@@ -92,6 +120,10 @@ type streamCore struct {
 	onEnd  func(Usage, error)
 	cancel context.CancelFunc
 	closer io.Closer
+	// idle is the per-Next watchdog window; zero disables the watchdog and
+	// keeps the plain blocking read. Read without the lock in Next — it is
+	// set once at construction and never mutated.
+	idle time.Duration
 
 	mu              sync.Mutex
 	done            bool
@@ -134,6 +166,15 @@ type accBlock struct {
 // is invoked once when the stream finishes (cleanly or with an error).
 func newStream(next func() (*Event, error), onEnd func(Usage, error)) *streamCore {
 	return &streamCore{next: next, onEnd: onEnd}
+}
+
+// setIdle arms the per-Next idle watchdog. It must be called once, before
+// the stream is handed to the consumer; a non-positive d disables it.
+func (s *streamCore) setIdle(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.idle = d
 }
 
 // bufferedStream replays a fully-decoded, non-event-stream ChatResponse as a
@@ -222,9 +263,45 @@ func (s *streamCore) Next() bool {
 	}
 	s.mu.Unlock()
 
-	// The producer runs outside the lock: it blocks on network reads.
-	ev, err := s.next()
+	// The producer runs outside the lock: it blocks on network reads. An
+	// idle watchdog, when configured, runs beside it and aborts the stream
+	// if no event arrives within the window — without it a silent upstream
+	// blocks Next forever (WithTimeout is unary-only).
+	//
+	// The goroutine + select only exists when a watchdog is configured; the
+	// common no-timeout path stays a plain call, unchanged.
+	if s.idle <= 0 {
+		ev, err := s.next()
+		return s.finishEvent(ev, err)
+	}
 
+	idleTimer := time.NewTimer(s.idle)
+	defer idleTimer.Stop()
+	type result struct {
+		ev  *Event
+		err error
+	}
+	// Buffered so the producer never blocks on its send: after an idle
+	// abort it stays blocked on the read until releaseLocked cancels the
+	// request context, then its send lands here and is discarded. No leak.
+	ch := make(chan result, 1)
+	go func() {
+		ev, err := s.next()
+		ch <- result{ev, err}
+	}()
+	select {
+	case r := <-ch:
+		return s.finishEvent(r.ev, r.err)
+	case <-idleTimer.C:
+		s.Abort(fmt.Errorf("%w: no event for %s", ErrStreamIdleTimeout, s.idle))
+		return false
+	}
+}
+
+// finishEvent folds a producer result into the stream state under the lock
+// and returns whether the consumer should keep iterating. Split out of Next
+// so the watchdog and non-watchdog paths share one implementation.
+func (s *streamCore) finishEvent(ev *Event, err error) bool {
 	s.mu.Lock()
 	if s.done {
 		// Close() won the race while we were blocked in next(); it already
@@ -347,6 +424,41 @@ func (s *streamCore) aborted() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.abortedByCaller
+}
+
+// Abort terminates the stream with cause as its failure. It is the
+// watchdog counterpart of Close: Close records a deliberate walk-away
+// (Err stays nil, onEnd fires with a nil error so usage bookkeeping skips
+// it), while Abort records why the stream died — s.err is set (only when
+// the stream had not already finished with its own outcome), onEnd fires
+// with the cause, and Partial keeps the accumulated content.
+//
+// Concurrency matches Close: safe to call from any goroutine, including a
+// timer callback racing a blocked Next. If a real outcome (clean end,
+// provider error, or an earlier Close/Abort) already happened, Abort is a
+// no-op — an idle-timeout firing after the stream finished must not
+// overwrite the stream's own terminal state. A nil cause is treated as
+// ErrStreamAborted so Err() is never silently nil after an Abort.
+func (s *streamCore) Abort(cause error) {
+	if cause == nil {
+		cause = ErrStreamAborted
+	}
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return
+	}
+	s.done = true
+	if s.err == nil {
+		s.err = cause
+	}
+	s.releaseLocked()
+	s.mu.Unlock()
+	// Fire onEnd outside the lock, same discipline as Close: user trackers
+	// may read stream accessors or re-enter, which must not deadlock.
+	if call, usage, err := s.takeOnEnd(); call != nil {
+		call(usage, err)
+	}
 }
 
 // releaseLocked finalizes the stream exactly once: cancels the request

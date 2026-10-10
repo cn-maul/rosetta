@@ -1,5 +1,79 @@
 # 更新日志
 
+## 未发布
+
+面向网关/多凭据调用方的三项错误可观测性增强。均为**新增字段与方法**，不改 wire 行为；
+按 v1.0.0 冻结契约，`APIError`/`Stream` 成员扩充属 minor。
+
+### 新增
+
+- **`APIError.RetryAfter`**：透传上游 `Retry-After` 响应头（秒数或 HTTP-date，
+  与传输层退避同一套 `httpx.retryAfter` 解析，同样受 60s 上限；无该头时为 0）。
+
+  **为什么**：该头此前只被 SDK 自身消费——完整解析与上限都实现了，却只写进 debug
+  日志，调用方拿到的 429 上**看不到上游要求的等待时长**。这对网关是真实缺口：凭据
+  冷却只能拍一个固定值，上游说 5 秒会白扔容量，说 300 秒则会提前叫醒它继续吃 429；
+  向下游透传 `Retry-After` 也无从谈起。
+
+  ```go
+  var apiErr *rosetta.APIError
+  if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+      // 按上游给的时长安排重试/冷却，而非猜一个值
+  }
+  ```
+
+  覆盖三协议 chat（流式与非流式）、embeddings/rerank 与 `/models` 目录的全部非 2xx
+  出口。`InBand`（HTTP 200 信内错误）不携带——那类错误的 HTTP 交换已成功，没有等待
+  语义。
+
+- **`Stream.Abort(cause)` 与 `ErrStreamIdleTimeout` / `ErrStreamAborted`**：让流的
+  中断原因可留痕。
+
+  **为什么**：`Close()` 的语义是「调用方主动走开」——`Err()` 保持 `nil`、不计入
+  `UsageMissing`，这是对的；但看门狗因**上游静默**掐断流时，调用方只能调 `Close()`，
+  于是「我掐的」与「上游断了」在结果里**无法区分**，被迫各自发明留痕（如网关侧用
+  `atomic.Bool` 旁路记录）。`Abort` 补上另一半：释放同样的资源，但把 `cause` 记进
+  `Err()`，并照常触发用量回调。
+
+  与 `Close` 一样并发安全、可与阻塞中的 `Next` 竞争、恰好一次收尾；若流已正常结束或
+  已因自身错误结束，**迟到的 `Abort` 是空操作**——不会把干净结束误报成超时。
+  `Abort(nil)` 退化为 `ErrStreamAborted`。
+
+  SDK 仍**不内建**空闲计时器（`WithTimeout` 依旧只约束非流式调用）：不同上游合理静默
+  上限差异很大，计时策略属于调用方。官方范式见 `docs/streaming.md` 的「看门狗」一节。
+
+- **`APIError.Category`（`ErrorCategory`）与 `AffectsModel`**：错误归因提示，免去每个
+  调用方重新解析 provider 错误体。
+
+  `CatUnclassified`（零值）/ `CatOutOfCredit` / `CatRateLimited` / `CatQuotaExhausted` /
+  `CatModelUnavailable` / `CatContentRefused` / `CatAuthFailed`，外加厂商点名模型时的
+  `AffectsModel`。三处对网关尤其有用：
+
+  - `CatContentRefused`——内容被安全策略拒绝，**凭据无辜**。换一把 key 重发同样的内容
+    照样被拒；误当限流会导致无意义的全凭据轮询。
+  - `CatOutOfCredit` 与 `CatQuotaExhausted` 分开——「没钱」要充值、「窗口耗尽」等重置，
+    处置完全不同。
+  - `CatModelUnavailable` + `AffectsModel`——可只下架**该模型**而不连坐整把 key。
+
+  **刻意不匹配错误消息里的自由文本关键词**：那是没有边界、随厂商改写而漂移的表面。
+  判定只用**状态码与结构化的 `code`/`type`**，外加 Anthropic 官方文档化的重置时间措辞
+  （用于区分其 429 的「太快」与「窗口耗尽」）。需要更细的判断请自行基于 `Raw` 叠加。
+
+  它是**提示而非判据**：`CatUnclassified` 意为「无已知信号命中」，不是「以上皆非」，
+  必须与 `StatusCode` 叠加使用。
+
+### 测试
+
+`error_affordance_test.go` 新增。除正向用例外，**每项都配了反向断言**（延续
+`upstream_malformed_test.go` 的纪律：过宽的提示比没有提示更糟，因为调用方要拿它做
+真实决策）——已结束的流不得被迟到的 `Abort` 改写、prose 里的 "quota" 字样不得变成
+欠费信号、未点名模型的 404 不得变成模型级信号、每个错误出口（含无法解析的 body）
+都必须拿到分类。
+
+### 质量基线
+
+`go test ./... -race` 全绿；`go vet`、`gofmt` 无告警；新增字段后既有测试无需修改即通过。
+
 ## v1.0.1 (2026-10-08)
 
 修复批次：让「上游响应体解不开」成为**可分类**的错误。纯修复，不含任何 wire 行为变更。
