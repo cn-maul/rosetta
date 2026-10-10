@@ -244,13 +244,18 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st
 	}
 	// Sampling params (temperature/top_p) are only rejected when a
 	// reasoning config actually rides the wire; gate the drop on that,
-	// not merely on the caller having set Thinking (a sticky reasoning
-	// drop or an unset effort sends no reasoning, so there is no
-	// conflict).
+	// not merely on the caller having set Thinking. Two cases send no
+	// reasoning: a sticky drop (st.reasoning == false) and Thinking == nil.
+	// A Thinking with no level named is not one of them — effort() defaults
+	// it to medium, so it emits and does drop these.
 	emitReasoning := false
 	if req.Thinking != nil && st.reasoning {
-		if eff := req.effort(); eff != EffortUnset {
-			payload["reasoning"] = map[string]any{"effort": string(eff)}
+		// effortWire honors EffortRaw (see ThinkingConfig.EffortRaw) and is
+		// otherwise identical to effort(), so this is behavior-preserving.
+		// The guard is defensive: non-nil Thinking never yields an empty
+		// value thanks to the medium default.
+		if eff := req.effortWire(); eff != "" {
+			payload["reasoning"] = map[string]any{"effort": eff}
 			emitReasoning = true
 		}
 	}

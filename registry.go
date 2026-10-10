@@ -150,8 +150,24 @@ func (r *Registry) SetRemote(infos []ModelInfo) error {
 // DisableThinking is the explicit revocation switch and must hold even
 // when no cross-layer merge happens for the entry.
 func normalizeInfo(m *ModelInfo) {
+	// Levels imply reasoning. Normalizing here (not only in mergeInfo) means
+	// a single-layer entry — the common case, where SetManual sees one
+	// model and nothing to merge with — carries the same invariant.
+	if len(m.EffortLevels) > 0 {
+		m.SupportsThinking = true
+	}
+	// Revocation stays last so an explicit disable still wins, matching the
+	// ordering in mergeInfo.
+	//
+	// It also drops the dials. Leaving them behind would publish "this model
+	// cannot reason" alongside a list of dials to dial, which is exactly the
+	// self-contradictory entry the inference above exists to prevent — and it
+	// is actively harmful downstream: a fronting gateway reads these levels to
+	// tell its callers which options to offer, so a revoked model would still
+	// advertise choices that can never be honored.
 	if m.DisableThinking {
 		m.SupportsThinking = false
+		m.EffortLevels = nil
 	}
 }
 
@@ -207,22 +223,49 @@ func mergeInfo(high, low ModelInfo) ModelInfo {
 	if !out.SupportsThinking {
 		out.SupportsThinking = low.SupportsThinking
 	}
+	if len(out.Aliases) == 0 {
+		out.Aliases = low.Aliases
+	}
+	if len(out.EffortLevels) == 0 {
+		out.EffortLevels = low.EffortLevels
+	}
+	// Declaring levels is itself a thinking claim, so it must light the
+	// boolean up rather than leaving an entry that says "levels exist" but
+	// "cannot reason" — a combination no caller can act on sensibly. The
+	// reverse is deliberately not inferred: a model can reason without
+	// this package knowing its dials.
+	//
+	// Ordered before the DisableThinking block so an explicit revocation
+	// still wins; the other way round would let levels resurrect a
+	// capability some layer had deliberately turned off.
+	if len(out.EffortLevels) > 0 {
+		out.SupportsThinking = true
+	}
 	// DisableThinking is the explicit revocation knob. A high (manual) entry
 	// that itself asserts SupportsThinking wins over a lower layer's
 	// DisableThinking — a remote/manual-lower claim must not revoke a manual
 	// declaration (audit C23); otherwise the lower layer's disable still holds.
-	out.DisableThinking = high.DisableThinking || (low.DisableThinking && !high.SupportsThinking)
+	//
+	// "Asserts thinking" must count EffortLevels, not just the boolean: a
+	// manual entry that declares only levels is making exactly the same claim,
+	// and reading the raw bool here would let a lower DisableThinking revoke
+	// it — a rule that would then depend on whether normalizeInfo happened to
+	// promote the bool before this point. Depending on call ordering for a
+	// semantic rule is how the two halves of this function drift apart.
+	highClaimsThinking := high.SupportsThinking || len(high.EffortLevels) > 0
+	out.DisableThinking = high.DisableThinking || (low.DisableThinking && !highClaimsThinking)
 	if out.DisableThinking {
 		out.SupportsThinking = false
+		// Drop the dials for the reason given in normalizeInfo: a revoked
+		// model must not keep advertising levels to callers that will offer
+		// them. This also covers levels inherited from the lower layer.
+		out.EffortLevels = nil
 	}
 	if out.Protocol == "" {
 		out.Protocol = low.Protocol
 	}
 	if out.Type == "" {
 		out.Type = low.Type
-	}
-	if len(out.Aliases) == 0 {
-		out.Aliases = low.Aliases
 	}
 	out.Known = high.Known || low.Known
 	return out
@@ -268,5 +311,6 @@ func (r *Registry) List() []ModelInfo {
 // aliases registry state.
 func cloneModelInfo(m ModelInfo) ModelInfo {
 	m.Aliases = slices.Clone(m.Aliases)
+	m.EffortLevels = slices.Clone(m.EffortLevels)
 	return m
 }

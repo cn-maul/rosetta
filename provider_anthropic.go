@@ -176,6 +176,14 @@ func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
 	}
 	b := req.Thinking.BudgetTokens
 	if b <= 0 {
+		// Deliberately effort(), not effortWire(): Anthropic has no
+		// effort field, so a verbatim level from EffortRaw has no meaning
+		// here. Folding it into the three-tier table would invent a
+		// mapping the protocol does not define, and an invented budget is
+		// worse than an explicit one — it changes how long the model
+		// thinks while looking like the caller asked for it. Callers
+		// targeting Anthropic set BudgetTokens, which passes through as-is
+		// on the branch above.
 		b = anthropicBudget(req.effort())
 	}
 	if b < 1024 {

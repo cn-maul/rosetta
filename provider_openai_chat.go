@@ -90,12 +90,24 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 	}
 	// Sampling params (temperature/top_p) are rejected by reasoning-capable
 	// models, so they are dropped whenever reasoning_effort actually rides
-	// the wire — mirroring the Responses adapter (G1). A sticky reasoning
-	// drop or an unset effort sends no reasoning, so there is no conflict.
+	// the wire — mirroring the Responses adapter (G1). Two cases send no
+	// reasoning at all: a sticky reasoning drop (st.reasoning == false) and
+	// a request that never asked for thinking (Thinking == nil). Note that a
+	// request that asked for thinking but named no level is NOT one of them:
+	// effort() defaults it to medium, so it does emit and does drop these.
 	emitReasoning := false
 	if req.Thinking != nil && st.reasoning {
-		if eff := req.effort(); eff != EffortUnset {
-			pl["reasoning_effort"] = string(eff)
+		// effortWire honors EffortRaw, so a caller can forward a level
+		// outside low/medium/high untouched instead of having it rewritten
+		// (see ThinkingConfig.EffortRaw). With EffortRaw unset it returns
+		// exactly what effort() did, so this is behavior-preserving.
+		//
+		// The guard is defensive: for a non-nil Thinking, effortWire never
+		// returns empty (the medium default guarantees it). It exists so a
+		// future change to effortWire's default cannot silently start
+		// emitting an empty reasoning_effort.
+		if eff := req.effortWire(); eff != "" {
+			pl["reasoning_effort"] = eff
 			emitReasoning = true
 		}
 	}

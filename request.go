@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"strings"
+	"unicode/utf8"
 )
 
 // Effort is a protocol-independent thinking dial.
@@ -31,6 +33,44 @@ type ThinkingConfig struct {
 	// value as-is (minimum 1024); OpenAI protocols map to the nearest
 	// Effort level.
 	BudgetTokens int
+	// EffortRaw is a thinking level to send **verbatim** on the OpenAI
+	// protocols, bypassing the low/medium/high normalization Effort
+	// imposes. It exists because that normalization is lossy: models now
+	// ship levels outside the trio (OpenAI's minimal and xhigh among
+	// them), and a gateway fronting them must be able to forward a caller's
+	// choice untouched instead of quietly downgrading "xhigh" to "high".
+	//
+	// Empty (the default) means "use Effort/BudgetTokens", so every
+	// existing caller keeps its exact behavior.
+	//
+	// Precedence: EffortRaw > Effort > BudgetTokens. Anthropic ignores
+	// it — that protocol has no effort field, so inventing a mapping from
+	// an arbitrary level to a token budget would be guesswork; callers
+	// targeting Anthropic set BudgetTokens instead.
+	//
+	// The value is not validated against a known set: the whole point is
+	// to carry levels this package does not know about. It is still
+	// checked for JSON-safety and emptiness so a malformed value fails
+	// locally rather than as an opaque upstream 400.
+	//
+	// # Two degradations worth knowing about
+	//
+	// Both predate this field but are newly visible now that a caller can
+	// supply a level the package has never seen:
+	//
+	//  1. **Sticky field downgrade.** If an upstream rejects the whole
+	//     reasoning_effort field (as opposed to one value inside it), the
+	//     sanitizer remembers that for the model and later requests send no
+	//     reasoning at all — EffortRaw included. A mistyped level that trips
+	//     this stays quiet for that model's whole client lifetime.
+	//  2. **Thinking gate.** For a Known model declared not to support
+	//     thinking, WithThinkingFallback(true) drops the config silently
+	//     (otherwise it errors). EffortRaw goes with it.
+	//
+	// A rejection of a *value* (the upstream naming the level) is neither
+	// case: it surfaces as an APIError, by design, since one bad level says
+	// nothing about whether the field is supported on that model.
+	EffortRaw string
 }
 
 // effortFromBudget maps an explicit token budget to the nearest Effort.
@@ -317,6 +357,9 @@ func (r *ChatRequest) validate() error {
 		if r.Thinking.BudgetTokens > maxWireInt {
 			return fmt.Errorf("%w: Thinking.BudgetTokens %d exceeds the supported maximum %d", ErrInvalidRequest, r.Thinking.BudgetTokens, maxWireInt)
 		}
+		if err := validateEffortRaw(r.Thinking.EffortRaw); err != nil {
+			return err
+		}
 	}
 	for i, s := range r.StopSequences {
 		if s == "" {
@@ -384,3 +427,84 @@ func (r *ChatRequest) effort() Effort {
 	// Thinking requested without a level: default to medium.
 	return EffortMedium
 }
+
+// effortWire resolves the value the OpenAI adapters put on the wire.
+//
+// EffortRaw wins over everything: the caller explicitly asked for a level
+// this package would otherwise rewrite. With EffortRaw unset the result is
+// exactly what effort() resolves, including its terminal default — so this
+// function is behavior-preserving for every pre-EffortRaw caller.
+//
+// # The medium default is load-bearing
+//
+// For a non-nil Thinking this NEVER returns "": effort() ends in an
+// unconditional EffortMedium, so "thinking requested without a level" still
+// sends reasoning_effort:"medium". That is the pre-existing contract the
+// OpenAI adapters' emitReasoning flag (which in turn gates dropping
+// temperature/top_p) has always rested on. A reader who assumes an
+// unleveled Thinking suppresses reasoning will mispredict both the payload
+// and the sampling params.
+//
+// The "" return is reachable only when Thinking is nil, which the adapters
+// already exclude; the guard remains as defense against a future change to
+// that default silently emitting an empty value.
+func (r *ChatRequest) effortWire() string {
+	if r.Thinking == nil {
+		return ""
+	}
+	if r.Thinking.EffortRaw != "" {
+		return r.Thinking.EffortRaw
+	}
+	return string(r.effort())
+}
+
+// validateEffortRaw checks that a verbatim level is safe to place on the
+// wire.
+//
+// The package deliberately does not check the value against a known set —
+// forwarding a level it has never heard of is the entire purpose of the
+// field. What it does reject is anything that could not survive the trip to
+// the upstream intact, because every one of those cases turns into an opaque
+// provider 400 that blames the caller for a level they never effectively sent.
+//
+// Ordering note: the cheap bounds run first so a wildly long value reports the
+// length problem rather than a character-class complaint.
+func validateEffortRaw(v string) error {
+	if v == "" {
+		return nil
+	}
+	if len(v) > maxEffortRawBytes {
+		return fmt.Errorf("%w: Thinking.EffortRaw is longer than %d bytes", ErrInvalidRequest, maxEffortRawBytes)
+	}
+	// Invalid UTF-8 would be silently rewritten to U+FFFD by json.Marshal, so
+	// the provider would receive a level the caller never wrote — a wrong
+	// value presented as the caller's own, which is worse than an outright
+	// rejection. ContainsFunc below cannot catch this: it ranges over runes,
+	// and each invalid byte decodes as utf8.RuneError, matching none of the
+	// rejected characters.
+	if !utf8.ValidString(v) {
+		return fmt.Errorf("%w: Thinking.EffortRaw is not valid UTF-8", ErrInvalidRequest)
+	}
+	// Surrounding whitespace is rejected rather than trimmed. Trimming here
+	// would leave validate() and the wire disagreeing about what was checked,
+	// and " xhigh" is never a real provider token — sending it verbatim earns
+	// an opaque 400, which is exactly what these checks exist to prevent.
+	// Rejecting is also the only option that keeps the validated value and the
+	// transmitted value byte-identical.
+	if strings.TrimSpace(v) == "" {
+		return fmt.Errorf("%w: Thinking.EffortRaw is only whitespace", ErrInvalidRequest)
+	}
+	if v != strings.TrimSpace(v) {
+		return fmt.Errorf("%w: Thinking.EffortRaw %q has leading or trailing whitespace", ErrInvalidRequest, v)
+	}
+	if strings.ContainsFunc(v, func(r rune) bool { return r < 0x20 || r == '"' || r == '\\' }) {
+		return fmt.Errorf("%w: Thinking.EffortRaw %q contains characters that cannot be sent as a bare JSON string", ErrInvalidRequest, v)
+	}
+	return nil
+}
+
+// maxEffortRawBytes bounds EffortRaw. Every real value in the wild is a short
+// enum token ("minimal", "xhigh", "ultra-deep"); 64 leaves room for a
+// vendor-qualified identifier while keeping the field from becoming an
+// unbounded free-form string on the wire.
+const maxEffortRawBytes = 64
