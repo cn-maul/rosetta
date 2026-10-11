@@ -21,6 +21,14 @@ import (
 
 type RetryPolicy int
 
+// NewTransport returns the SDK-owned default transport with bounded
+// dial/TLS lifecycle. Internal callers that create an *http.Client for
+// side channels (protocol probing) use it so a caller-supplied transport
+// without lifecycle timeouts cannot hang the side channel indefinitely.
+func NewTransport() *http.Transport {
+	return newTransport()
+}
+
 const (
 	// RetryDefault retries only intrinsically safe methods (GET/HEAD/
 	// OPTIONS/PUT/DELETE) and leaves non-idempotent POSTs alone.
@@ -126,15 +134,32 @@ func CrossHostSafeRedirect(req *http.Request, via []*http.Request) error {
 // are exhausted. The caller owns the returned response body.
 func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 	var slept time.Duration
+	// kept is the last retryable response, retained across attempts so a later
+	// failure cannot destroy it. Its body is buffered by storeKept at the
+	// moment it arrives, because the retry path drains and closes the live one.
+	var kept *http.Response
 	for attempt := 0; ; attempt++ {
 		resp, err := c.attempt(ctx, call)
 		if err == nil && !RetryableStatus(resp.StatusCode) {
 			return resp, nil
 		}
-		// A permanent (non-network) failure — bad method/URL or a Body()
-		// that cannot serialize — will fail identically every time; never
+		if resp != nil && !errors.Is(err, ErrPermanent) {
+			// Remember this provider response before it is drained below, so
+			// a later attempt that dies on an expired ctx cannot erase it.
+			kept = storeKept(resp, kept)
+		}
+		// A permanent (non-network) failure - bad method/URL or a Body()
+		// that cannot serialize - will fail identically every time; never
 		// spend a retry on it.
 		if errors.Is(err, ErrPermanent) || !c.canRetry(call) || attempt >= c.MaxRetries || ctx.Err() != nil {
+			// Hand back the provider response we already hold: the ctx.Done
+			// branch of the backoff sleep below does the same for the same
+			// reason, and losing it here would replace a precise upstream
+			// error (429 with Retry-After, a classified APIError body) with an
+			// opaque context/transport error that no caller can act on.
+			if kept != nil {
+				return kept, err
+			}
 			return resp, err
 		}
 		var wait time.Duration
@@ -150,9 +175,12 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 			wait = c.backoff(attempt)
 		}
 		if slept+wait > maxTotalWait {
-			// Budget exhausted. Return the response with its body still
-			// open so the caller can parse the final provider error instead
-			// of a dead body that would masquerade as a transport failure.
+			// Budget exhausted. Return the buffered response so the caller can
+			// parse the real provider error instead of a dead body that would
+			// masquerade as a transport failure.
+			if kept != nil {
+				return kept, err
+			}
 			return resp, err
 		}
 		slept += wait
@@ -164,25 +192,41 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 				<-timer.C
 			}
 			// The caller's deadline expired during backoff. Return the last
-			// response with its body still open so the caller parses the
-			// actual provider error — e.g. a 429 body — instead of a generic
+			// response with its body still readable so the caller parses the
+			// actual provider error - e.g. a 429 body - instead of a generic
 			// context deadline that hides what the endpoint said. Only when
 			// there is no response to hand back (a pure transport failure) do
-			// we surface the context error. (The body is drained only in the
-			// timer branch below, so it is still readable here.)
-			if resp != nil {
-				return resp, err
+			// we surface the context error.
+			if kept != nil {
+				return kept, err
 			}
 			return nil, ctx.Err()
 		case <-timer.C:
 			// We are actually retrying: discard this attempt's body so its
-			// connection can be reused. Done after the sleep, not before, so
-			// the body is still open if ctx.Done wins the race above.
+			// connection can be reused. Done after the sleep, not before.
 			if resp != nil {
 				drain(resp)
 			}
 		}
 	}
+}
+
+// keptBodyLimit bounds how much of a retried response is retained so it can
+// still be read after the live body was drained and closed. Error bodies are
+// small; the cap exists so a large body cannot be buffered without bound while
+// the loop retries. The caller still gets the status and headers either way.
+const keptBodyLimit = 1 << 20
+
+// storeKept snapshots a retryable response before the loop drains it. The live
+// body is left in place so the existing drain() can still reuse the connection;
+// only a bounded prefix is copied into an in-memory body for the caller.
+// A newer response supersedes the previously kept one.
+func storeKept(resp *http.Response, prev *http.Response) *http.Response {
+	snapshot := *resp
+	buf, _ := io.ReadAll(io.LimitReader(resp.Body, keptBodyLimit))
+	snapshot.Body = io.NopCloser(bytes.NewReader(buf))
+	snapshot.ContentLength = int64(len(buf))
+	return &snapshot
 }
 
 func (c *Client) canRetry(call *Call) bool {

@@ -39,9 +39,14 @@ func DetectProtocol(ctx context.Context, endpoint, apiKey string) (Protocol, err
 
 // newProbeClient returns an HTTP client for probing that refuses to
 // re-send credentials on cross-host redirects (net/http only strips
-// Authorization/Cookie automatically, never x-api-key).
+// Authorization/Cookie automatically, never x-api-key) and uses a transport
+// with the same bounded dial/TLS lifecycle as the main client.
 func newProbeClient() *http.Client {
-	return &http.Client{Timeout: 10 * time.Second, CheckRedirect: httpx.CrossHostSafeRedirect}
+	return &http.Client{
+		Timeout:       10 * time.Second,
+		CheckRedirect: httpx.CrossHostSafeRedirect,
+		Transport:     httpx.NewTransport(),
+	}
 }
 
 // detectByProbe probes GET /models, first with Bearer auth then with

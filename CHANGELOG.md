@@ -1,6 +1,40 @@
 # 更新日志
 
-## 未发布
+## v1.1.1 (2026-10-11)
+
+修复批次：传输层与估算器的正确性修补。纯修复，不含任何 wire 行为变更。
+
+### 修复
+
+- **重试耗尽后仍能读到上游的真实错误**（`internal/httpx`）：`Client.Do` 现在在重试循环
+  中保留最后一次可重试响应（`storeKept`，上限 1 MiB 的有界快照），因此当重试预算耗尽、
+  或调用方 deadline 在退避期间到期时，返回的是**缓冲过的 provider 响应**而不是一个
+  body 已被 drain/close 的死响应。此前这会把一个精确的上游错误（带 `Retry-After` 的
+  429、已分类的 `APIError` 体）替换成调用方无法据以行动的 context/transport 错误。
+
+- **协议探测不再可能被挂死**（`detector.go`）：探测客户端改用 SDK 自带的
+  `httpx.NewTransport()`，与主客户端共享有界的 dial/TLS 生命周期，调用方自定义的
+  transport 无法再让这条旁路无限期悬挂。
+
+- **token 估算补齐 sealed reasoning 与内联文件**（`estimator.go`）：`BlockSealed` 按
+  原文计入（此前 Responses 多轮对话会本地放行、上游才炸在真实溢出上）；`BlockFile` 的
+  内联 base64 内容按序列化尺寸计价并保留 flat 下限，URL 引用维持原粗估。另将 ASCII
+  判定改为 `utf8.RuneSelf`。
+
+- **SSE 事件组装的复杂度从 O(n²) 降为 O(n)**（`internal/sse`）：大小守卫改用增量维护的
+  `dataBytes`，此前一个多行事件每行都要对已存分片求和。
+
+### 测试
+
+新增 `bench_release_cmp_test.go`、`internal/httpx/retry_response_preserved_test.go`、
+`internal/sse/multiline_scaling_test.go`，并修正 `error_affordance_test.go` 中两个会真的
+睡到退避时长的用例（关掉重试后它们既即时又确定）。
+
+### 质量基线
+
+`go test ./...` 全绿；`go vet`、`go build` 无告警。
+
+## v1.1.0 (2026-10-11)
 
 面向网关/多凭据调用方的三项错误可观测性增强。均为**新增字段与方法**，不改 wire 行为；
 按 v1.0.0 冻结契约，`APIError`/`Stream` 成员扩充属 minor。

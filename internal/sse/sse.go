@@ -38,6 +38,12 @@ type Scanner struct {
 	id      string
 	data    [][]byte
 	pending []byte // remainder after a lone-CR split, awaiting the next readLine
+	// dataBytes is the running total of bytes accumulated in data for the
+	// event currently being assembled. It is maintained incrementally as
+	// each data line arrives, so the size guard is O(1) per line; summing
+	// the already-stored parts on every line instead made one many-line
+	// event cost O(n^2). take() resets it.
+	dataBytes int
 }
 
 // New returns a Scanner reading from r.
@@ -74,10 +80,7 @@ func (s *Scanner) Next() (*Event, error) {
 			case "event":
 				s.name = string(value)
 			case "data":
-				size := len(value)
-				for _, part := range s.data {
-					size += len(part) + 1
-				}
+				size := s.dataBytes + len(value) + 1
 				if size > maxEventBytes {
 					return nil, ErrTooLarge
 				}
@@ -85,6 +88,7 @@ func (s *Scanner) Next() (*Event, error) {
 				// the value must be copied before it is stored — the next
 				// ReadSlice would otherwise overwrite these bytes.
 				s.data = append(s.data, append([]byte(nil), value...))
+				s.dataBytes = size
 			case "id":
 				s.id = string(value)
 			default:
@@ -103,6 +107,7 @@ func (s *Scanner) Next() (*Event, error) {
 func (s *Scanner) take() *Event {
 	if len(s.data) == 0 {
 		s.name, s.id = "", ""
+		s.dataBytes = 0
 		return nil
 	}
 	var data []byte
@@ -114,6 +119,7 @@ func (s *Scanner) take() *Event {
 	ev := &Event{Name: s.name, ID: s.id, Data: data}
 	s.name, s.id = "", ""
 	s.data = s.data[:0]
+	s.dataBytes = 0
 	return ev
 }
 

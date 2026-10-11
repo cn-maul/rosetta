@@ -28,7 +28,11 @@ func TestAPIErrorCarriesRetryAfter(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newTestClient(t, WithEndpoint(srv.URL+"/v1"), WithProtocol(ProtoOpenAIChat))
+	// Retries off: this asserts the header is read and exposed on the error,
+	// not that the loop backs off for it — with retries on the call slept the
+	// stated 17s before returning.
+	c := newTestClient(t, WithEndpoint(srv.URL+"/v1"), WithProtocol(ProtoOpenAIChat),
+		WithMaxRetries(0))
 	_, err := c.Chat(context.Background(), &ChatRequest{
 		Model:    "gpt-x",
 		Messages: []Message{User("hi")},
@@ -54,7 +58,14 @@ func TestRetryAfterCapsAndParsesHTTPDate(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newTestClient(t, WithEndpoint(srv.URL+"/v1"), WithProtocol(ProtoOpenAIChat))
+	// Retries off: this asserts how the header is parsed and surfaced, not
+	// that the loop backs off. With retries on, the loop honors the stated
+	// wait before surfacing the error, so the test spent 60 seconds asleep
+	// — exactly equal to the default unary timeout, which also made it race
+	// that deadline and fail intermittently under load. Disabling retries
+	// makes it both instant and deterministic.
+	c := newTestClient(t, WithEndpoint(srv.URL+"/v1"), WithProtocol(ProtoOpenAIChat),
+		WithMaxRetries(0))
 	_, err := c.Chat(context.Background(), &ChatRequest{
 		Model: "gpt-x", Messages: []Message{User("hi")},
 	})

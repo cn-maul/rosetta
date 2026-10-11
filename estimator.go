@@ -1,6 +1,10 @@
 package rosetta
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+	"unicode/utf8"
+)
 
 // MultimediaTokenEstimates overrides the flat per-block token estimates
 // used by the context-window check. The built-in defaults are deliberately
@@ -38,7 +42,7 @@ func (e MultimediaTokenEstimates) resolve() MultimediaTokenEstimates {
 func EstimateTokens(text string) int {
 	ascii, other := 0, 0
 	for _, r := range text {
-		if r < 0x80 {
+		if r < utf8.RuneSelf {
 			ascii++
 		} else {
 			other++
@@ -81,6 +85,11 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 				// multi-turn extended-thinking conversation (audit B15).
 				addText(b.Thinking)
 				addText(b.Signature)
+				// Sealed reasoning is likewise replayed byte-for-byte, so it
+				// must be priced by the same rule. Otherwise a Responses
+				// multi-turn conversation clears the context gate locally and
+				// dies upstream on the real overflow.
+				addText(b.Sealed)
 			case BlockRedactedThinking:
 				// Redacted reasoning rides in the Thinking field as an opaque
 				// base64 payload that is also replayed unchanged.
@@ -92,9 +101,16 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 				// provider-specific and duration is not carried on the block.
 				total += est.Audio
 			case BlockFile:
-				// Conservative flat estimate for a typical small document;
-				// real PDF cost varies by page count and content.
-				total += est.File
+				// Inline document content reaches the wire as base64 and is
+				// priced by its serialized size, not a fixed small-document
+				// fee; a URL reference has unknown remote size and keeps the
+				// coarse flat estimate. The floor prevents an empty/short
+				// inline payload from collapsing below the flat default.
+				n := (base64TokenUnits(b.FileData) + 3) / 4
+				if n < est.File {
+					n = est.File
+				}
+				total += n
 			case BlockToolCall:
 				addText(b.Arguments)
 				total += 16
@@ -138,11 +154,30 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 // without the per-block ceiling that EstimateTokens applies.
 func tokenCounts(text string) (ascii, other int) {
 	for _, r := range text {
-		if r < 0x80 {
+		if r < utf8.RuneSelf {
 			ascii++
 		} else {
 			other++
 		}
 	}
 	return
+}
+
+// base64TokenUnits returns the number of base64 characters carried by an
+// inline document payload, or 0 when the block has no inline content.
+func base64TokenUnits(fileData string) int {
+	if fileData == "" {
+		return 0
+	}
+	if strings.HasPrefix(fileData, "data:") {
+		if i := strings.IndexByte(fileData, ','); i >= 0 {
+			fileData = fileData[i+1:]
+		}
+	}
+	if strings.HasPrefix(fileData, "http://") || strings.HasPrefix(fileData, "https://") {
+		return 0
+	}
+	// Inline document payloads are billed after base64 expansion; the raw
+	// base64 character count is the available proxy.
+	return len(fileData)
 }

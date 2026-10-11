@@ -2,6 +2,7 @@ package rosetta
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +27,41 @@ func TestEstimateTokens(t *testing.T) {
 				t.Fatalf("EstimateTokens(%q) = %d, want %d", tt.text, got, tt.want)
 			}
 		})
+	}
+}
+
+// Inline document payloads reach the wire as base64 and are priced by their
+// length, not a fixed 3000-token floor; a URL reference still uses the
+// default flat estimate.
+func TestEstimateInputTokensInlineDocumentScalesWithPayload(t *testing.T) {
+	base := &ChatRequest{Model: "m", Messages: []Message{User("hi")}}
+	inline := &ChatRequest{Model: "m", Messages: []Message{{Role: RoleUser, Blocks: []Block{
+		{Type: BlockText, Text: "hi"},
+		{Type: BlockFile, FileData: strings.Repeat("QUJD", 1000)},
+	}}}}
+	if got := inline.estimateInputTokens(MultimediaTokenEstimates{File: 1}); got <= base.estimateInputTokens(MultimediaTokenEstimates{}) {
+		t.Fatalf("large inline document must scale with payload: %d vs %d", got, base.estimateInputTokens(MultimediaTokenEstimates{}))
+	}
+	// A URL reference has unknown size and must keep the coarse floor.
+	withURL := &ChatRequest{Model: "m", Messages: []Message{{Role: RoleUser, Blocks: []Block{
+		{Type: BlockFile, FileData: "https://example.com/doc.pdf"},
+	}}}}
+	if got := withURL.estimateInputTokens(MultimediaTokenEstimates{}); got != 4+3000 {
+		t.Fatalf("URL document estimate = %d, want 4+3000", got)
+	}
+}
+
+// Sealed reasoning is replayed on later turns, so it must add to the estimate
+// exactly like an Anthropic signature.
+func TestEstimateInputTokensCountsSealedReasoning(t *testing.T) {
+	base := &ChatRequest{Model: "m", Messages: []Message{{Role: RoleAssistant, Blocks: []Block{
+		{Type: BlockThinking, Thinking: "summary"},
+	}}}}
+	sealed := &ChatRequest{Model: "m", Messages: []Message{{Role: RoleAssistant, Blocks: []Block{
+		{Type: BlockThinking, Thinking: "summary", Sealed: strings.Repeat("e", 4000)},
+	}}}}
+	if got := sealed.estimateInputTokens(MultimediaTokenEstimates{}); got <= base.estimateInputTokens(MultimediaTokenEstimates{}) {
+		t.Fatalf("sealed reasoning must add to estimate: %d vs %d", got, base.estimateInputTokens(MultimediaTokenEstimates{}))
 	}
 }
 
