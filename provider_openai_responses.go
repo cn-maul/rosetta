@@ -325,16 +325,35 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 			}
 			items = append(items, item)
 		case RoleAssistant:
-			if t := m.text(); t != "" {
+			// Blocks are emitted in their original order. Collecting all
+			// text up front and appending the rest afterwards would move a
+			// text block that came after a reasoning item or a tool call to
+			// before it, which is exactly the reordering that breaks a
+			// multi-turn tool conversation.
+			var textGroup []string
+			flushText := func() {
+				if len(textGroup) == 0 {
+					return
+				}
+				content := make([]map[string]any, 0, len(textGroup))
+				for _, t := range textGroup {
+					content = append(content, map[string]any{"type": "output_text", "text": t})
+				}
 				items = append(items, map[string]any{
-					"type": "message",
-					"role": "assistant",
-					"content": []map[string]any{
-						{"type": "output_text", "text": t},
-					},
+					"type": "message", "role": "assistant", "content": content,
 				})
+				textGroup = nil
 			}
 			for _, b := range m.Blocks {
+				switch b.Type {
+				case BlockText:
+					if b.Text != "" {
+						textGroup = append(textGroup, b.Text)
+					}
+					continue
+				default:
+					flushText()
+				}
 				switch b.Type {
 				case BlockToolCall:
 					items = append(items, map[string]any{
@@ -357,16 +376,26 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 						"type":              "reasoning",
 						"encrypted_content": b.Sealed,
 					}
-					// The summary is what the model sees; an empty one is
-					// omitted rather than sent as "".
+					// The summary is what the model sees. It is sent as an
+					// explicit array even when empty: the reasoning item
+					// shape requires one, and omitting it makes the item
+					// invalid for an upstream that validates strictly.
+					summary := []map[string]any{}
 					if b.Thinking != "" {
-						item["summary"] = []map[string]any{
-							{"type": "summary_text", "text": b.Thinking},
-						}
+						summary = append(summary, map[string]any{"type": "summary_text", "text": b.Thinking})
+					}
+					item["summary"] = summary
+					// The item id is what makes the item addressable on the
+					// next turn, so it is carried back verbatim. A caller
+					// that built the block by hand without one keeps the
+					// previous behavior of omitting it.
+					if b.ReasoningID != "" {
+						item["id"] = b.ReasoningID
 					}
 					items = append(items, item)
 				}
 			}
+			flushText()
 		case RoleTool:
 			for _, b := range m.Blocks {
 				if b.Type == BlockToolResult {
@@ -449,6 +478,14 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 // either event still yields the end event (with StopOther) but the stream
 // then fails with ErrStreamTruncated, so callers never mistake a cut-off
 // response for a clean finish.
+//
+// Reasoning items carry an opaque sealed payload that must be replayed
+// verbatim to keep a multi-turn conversation intact, and the payload only
+// arrives on the terminating events. The item registry below therefore
+// tracks reasoning items by identity (item id, then output index) so their
+// text, sealed payload and source position all land in the same block, and
+// keeps a bounded queue of content that a terminating event contributes
+// before the stream emits its single EventMessageEnd.
 func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
@@ -471,7 +508,38 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 		// argument deltas.
 		nextToolIdx int
 		lastToolIdx = -1
+		items       = newItemRegistry()
 	)
+	finalizeItem := func(item *oaRespOutputItem, outIdx *int) ([]*Event, error) {
+		return items.finalize(item, outIdx)
+	}
+	finalizeFromEvent := func(ev oaRespEvent) ([]*Event, error) {
+		if ev.Item == nil {
+			return nil, nil
+		}
+		cp := *ev.Item
+		cp.eventID = ev.ItemID
+		return items.finalize(&cp, ev.OutputIndex)
+	}
+	malformed := func(what string) error {
+		return fmt.Errorf("rosetta: responses stream (%s %s): %s: %w", method, url, what, ErrUpstreamMalformed)
+	}
+	// queue holds events a terminating event contributed but that have not
+	// been delivered yet. It is drained before the single end event, so
+	// content always precedes EventMessageEnd.
+	queue := []*Event{}
+	enqueue := func(evs ...*Event) {
+		queue = append(queue, evs...)
+	}
+	nextQueued := func() (*Event, bool) {
+		if len(queue) == 0 {
+			return nil, false
+		}
+		ev := queue[0]
+		queue = queue[1:]
+		queue = queue[:len(queue):len(queue)] // keep the backing array bounded
+		return ev, true
+	}
 	// resolveToolIdx returns the unified ToolIndex for a function-call item
 	// announcement, preferring a registered item_id, then an explicit
 	// output_index, and finally allocating the next slot when the emitter
@@ -552,6 +620,11 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				if truncated {
 					return nil, fmt.Errorf("%w: responses stream ended without response.completed (partial response kept in Stream.Partial)", ErrStreamTruncated)
 				}
+				// Content a terminating event contributed is delivered
+				// before the stream reports its end.
+				if ev, ok := nextQueued(); ok {
+					return ev, nil
+				}
 				return nil, io.EOF
 			}
 			ssev, err := sc.Next()
@@ -597,6 +670,20 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 					return &Event{Type: EventMessageStart, ID: ev.Response.ID, Model: ev.Response.Model}, nil
 				}
 			case "response.output_item.added":
+				// A reasoning announcement registers identity and order only.
+				// Its encrypted_content is explicitly not final yet, so it is
+				// never surfaced as a sealed payload, and an item with no
+				// readable text yet must not create an empty content block.
+				if ev.Item != nil && ev.Item.Type == "reasoning" {
+					id, err := idFrom(ev.ItemID, ev.Item.ID)
+					if err != nil {
+						return nil, malformed(errIDConflict.Error())
+					}
+					if _, err := items.resolve(id, ev.OutputIndex); err != nil {
+						return nil, mapItemErr(err, method, url)
+					}
+					continue
+				}
 				if ev.Item != nil && ev.Item.Type == "function_call" {
 					sawToolCall = true
 					idx := resolveToolIdx(ev.ItemID, ev.OutputIndex)
@@ -614,6 +701,22 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 					break
 				}
 				switch ev.Item.Type {
+				case "reasoning":
+					// The only place the final sealed payload is guaranteed:
+					// an id-less event finds its item through the output index,
+					// so the payload lands in the block the text deltas built.
+					evs, err := finalizeFromEvent(ev)
+					if err != nil {
+						return nil, mapItemErr(err, method, url)
+					}
+					if len(evs) == 0 {
+						continue
+					}
+					enqueue(evs...)
+					if ev, ok := nextQueued(); ok {
+						return ev, nil
+					}
+					continue
 				case "function_call":
 					sawToolCall = true
 					idx := resolveToolIdx(ev.ItemID, ev.OutputIndex)
@@ -665,12 +768,19 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				}
 			case "response.output_text.delta", "response.text.delta":
 				if ev.Delta != "" {
+					// Each message item is its own block: without an index a
+					//// second message item's text would fold into the first.
 					ti := 0
 					if ev.OutputIndex != nil {
 						ti = *ev.OutputIndex
 					}
 					textDeltaSeen[ti] = true
-					return &Event{Type: EventTextDelta, Text: ev.Delta}, nil
+					out := &Event{Type: EventTextDelta, Text: ev.Delta, BlockIndex: ti}
+					if ev.OutputIndex != nil {
+						idx := *ev.OutputIndex
+						out.OutputIndex = &idx
+					}
+					return out, nil
 				}
 			case "response.refusal.delta":
 				if ev.Delta != "" {
@@ -678,7 +788,33 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				}
 			case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 				if ev.Delta != "" {
-					return &Event{Type: EventThinkingDelta, Text: ev.Delta}, nil
+					id, err := idFrom(ev.ItemID, "")
+					if err != nil {
+						return nil, malformed(errIDConflict.Error())
+					}
+					it, err := items.resolve(id, ev.OutputIndex)
+					if err != nil {
+						return nil, mapItemErr(err, method, url)
+					}
+					// The part this delta belongs to, so the terminating event
+					// does not append the same text again.
+					if ev.SummaryIndex != nil {
+						it.sawPart("summary", *ev.SummaryIndex)
+					} else {
+						it.sawPart("summary", 0)
+					}
+					if ev.ContentIndex != nil {
+						it.sawPart("content", *ev.ContentIndex)
+					}
+					out := &Event{
+						Type: EventThinkingDelta, BlockIndex: it.slot,
+						Text: ev.Delta, ReasoningID: it.id,
+					}
+					if ev.OutputIndex != nil {
+						idx := *ev.OutputIndex
+						out.OutputIndex = &idx
+					}
+					return out, nil
 				}
 			case "response.function_call_arguments.delta":
 				if ev.Delta != "" {
@@ -698,10 +834,30 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 						usage = &u
 					}
 					stop = mapResponsesStop(ev.Response.Status, ev.Response.IncompleteReason())
+					// The terminating output may be the only place an item's
+					// final text and sealed payload appear, so it is folded
+					// before the end event rather than dropped.
+					for i := range ev.Response.Output {
+						item := &ev.Response.Output[i]
+						if item.Type != "reasoning" {
+							continue
+						}
+						evs, ferr := finalizeItem(item, itemOutputIndex(&ev.Response.Output, i))
+						if ferr != nil {
+							return nil, mapItemErr(ferr, method, url)
+						}
+						enqueue(evs...)
+					}
 				}
 				if !ended {
 					ended = true
-					return endEvent(), nil
+					// The end event goes on the same queue so every event a
+					// terminating response contributed is delivered first, and
+					// the stream still reports its terminal state exactly once.
+					enqueue(endEvent())
+					if ev, ok := nextQueued(); ok {
+						return ev, nil
+					}
 				}
 			case "response.incomplete":
 				if ev.Response != nil {
@@ -710,10 +866,24 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 						usage = &u
 					}
 					stop = mapResponsesStop(ev.Response.Status, ev.Response.IncompleteReason())
+					for i := range ev.Response.Output {
+						item := &ev.Response.Output[i]
+						if item.Type != "reasoning" {
+							continue
+						}
+						evs, ferr := finalizeItem(item, itemOutputIndex(&ev.Response.Output, i))
+						if ferr != nil {
+							return nil, mapItemErr(ferr, method, url)
+						}
+						enqueue(evs...)
+					}
 				}
 				if !ended {
 					ended = true
-					return endEvent(), nil
+					enqueue(endEvent())
+					if ev, ok := nextQueued(); ok {
+						return ev, nil
+					}
 				}
 			case "response.failed":
 				if ev.Response != nil && ev.Response.Error != nil {
@@ -807,8 +977,12 @@ func (u *oaRespUsage) toUsage() Usage {
 }
 
 type oaRespOutputItem struct {
-	Type      string               `json:"type"`
-	ID        string               `json:"id"` // reasoning items; replayed verbatim
+	Type string `json:"type"`
+	ID   string `json:"id"` // reasoning items; replayed verbatim
+	// eventID is the enclosing event's item_id when it carried one. It is
+	// not part of the wire shape; the stream sets it before finalizing so a
+	// terminating event that omits the nested id can still be matched.
+	eventID   string
 	Role      string               `json:"role"`
 	CallID    string               `json:"call_id"`
 	Name      string               `json:"name"`
@@ -847,24 +1021,19 @@ func (r *oaRespResponse) IncompleteReason() string {
 }
 
 type oaRespEvent struct {
-	Type        string       `json:"type"`
-	ItemID      string       `json:"item_id"`
-	OutputIndex *int         `json:"output_index"`
-	Delta       string       `json:"delta"`
-	Code        string       `json:"code"`
-	Message     string       `json:"message"`
-	Error       *oaErrorBody `json:"error"`
-	Item        *struct {
-		Type      string               `json:"type"`
-		CallID    string               `json:"call_id"`
-		Name      string               `json:"name"`
-		Arguments jsonx.FlexJSONString `json:"arguments"`
-		Content   []struct {
-			Type string `json:"type"` // output_text
-			Text string `json:"text"`
-		} `json:"content"`
-	} `json:"item"`
-	Response *oaRespResponse `json:"response"`
+	Type        string `json:"type"`
+	ItemID      string `json:"item_id"`
+	OutputIndex *int   `json:"output_index"`
+	// SummaryIndex / ContentIndex locate a reasoning part inside its item.
+	// Pointers so a genuine 0 is distinguishable from an absent field.
+	SummaryIndex *int              `json:"summary_index"`
+	ContentIndex *int              `json:"content_index"`
+	Delta        string            `json:"delta"`
+	Code         string            `json:"code"`
+	Message      string            `json:"message"`
+	Error        *oaErrorBody      `json:"error"`
+	Item         *oaRespOutputItem `json:"item"`
+	Response     *oaRespResponse   `json:"response"`
 }
 
 func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
@@ -893,6 +1062,8 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 			}
 		case "reasoning":
 			var th strings.Builder
+			// The item id is what makes the reasoning addressable on the
+			// next turn, so it travels with the block.
 			for _, part := range item.Summary {
 				if part.Text != "" {
 					if th.Len() > 0 {
@@ -916,10 +1087,11 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 			// never mixed into the displayable Thinking text.
 			if th.Len() > 0 || item.EncryptedContent != "" {
 				out.Content = append(out.Content, Block{
-					Type:     BlockThinking,
-					Thinking: th.String(),
-					Sealed:   item.EncryptedContent,
-					SealedBy: "openai-responses",
+					Type:        BlockThinking,
+					Thinking:    th.String(),
+					Sealed:      item.EncryptedContent,
+					SealedBy:    "openai-responses",
+					ReasoningID: item.ID,
 				})
 			}
 		case "function_call":
@@ -945,4 +1117,315 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 		out.Usage = r.Usage.toUsage()
 	}
 	return out, nil
+}
+
+// itemRegistry tracks reasoning items across the Responses SSE stream.
+//
+// A reasoning item's sealed payload arrives only on its terminating event,
+// which may carry no item id at all, so the item must be re-identified
+// from whatever the event does carry. Identity is resolved from the item
+// id first and the output index second, and each item owns one internal
+// block slot for the whole stream: text deltas, the final text backfill and
+// the sealed payload all fold into that same slot.
+type itemRegistry struct {
+	byID    map[string]*respItem
+	byIndex map[int]*respItem
+	slots   []*respItem
+	// anonymous is the single id-less reasoning item a minimal emitter may
+	// produce. Nil once an item with an identity has been seen, so a
+	// mislabeled later event cannot be folded into it.
+	anonymous *respItem
+	idsBytes  int
+	nextSlot  int
+}
+
+// respItem is one tracked output item.
+type respItem struct {
+	slot      int
+	id        string
+	order     int
+	orderSet  bool
+	indexBind map[int]bool // output indices claimed for this item
+
+	// partOut[channel][index] records that a part's text has already been
+	// delivered, so a terminating event does not append it a second time.
+	partOut map[string]map[int]bool
+
+	sealed     string
+	sealedBy   string
+	sealedDone bool
+	finalized  bool
+}
+
+// maxTrackedItemIDs bounds the retained item ids. A metadata-only emitter
+// could otherwise grow the registry without bound, bypassing the stream
+// block cap that guards accumulated content.
+const maxTrackedItemIDs = maxStreamBlocks
+
+func newItemRegistry() *itemRegistry {
+	return &itemRegistry{
+		byID:    map[string]*respItem{},
+		byIndex: map[int]*respItem{},
+	}
+}
+
+// idFrom derives the item id from an event, preferring the nested item id
+// and falling back to the top-level item_id. Both present and different is
+// an upstream inconsistency rather than something to silently pick.
+func idFrom(eventID, nestedID string) (string, error) {
+	if nestedID == "" {
+		return eventID, nil
+	}
+	if eventID != "" && eventID != nestedID {
+		return "", errIDConflict
+	}
+	return nestedID, nil
+}
+
+var errIDConflict = errors.New("conflicting item ids")
+
+// resolve returns the item an event refers to, registering it when needed.
+//
+// id is the event's item id (may be empty), outIdx its output index (nil
+// when absent). The returned item is never nil unless the stream has run
+// out of trackable items, which is reported through errTooManyItems.
+func (r *itemRegistry) resolve(id string, outIdx *int) (*respItem, error) {
+	if id != "" {
+		if it := r.byID[id]; it != nil {
+			if outIdx != nil {
+				it.bindIndex(*outIdx)
+			}
+			return it, nil
+		}
+	}
+	// No known id: an unambiguous output index may already name the item,
+	// which is how a terminating event without an id finds its item.
+	if outIdx != nil {
+		if it := r.byIndex[*outIdx]; it != nil {
+			if it.id == "" || it.id == id {
+				if id != "" {
+					r.registerID(it, id)
+				}
+				return it, nil
+			}
+			// The index belongs to a different, already-identified item.
+			// Folding this event into it would put one item's text or
+			// sealed payload into another item's block, so the event is
+			// rejected instead of guessed at.
+			return nil, errIndexTaken
+		}
+	}
+	// A brand-new item. An anonymous one is only allowed while nothing has
+	// been identified, and there may only be one of them.
+	if id == "" {
+		if r.anonymous != nil {
+			return r.anonymous, nil
+		}
+		if r.hasIdentified() {
+			return nil, errUnidentified
+		}
+	}
+	if len(r.slots) >= maxStreamBlocks {
+		return nil, errTooManyItems
+	}
+	it := &respItem{slot: r.nextSlot, id: id, indexBind: map[int]bool{}}
+	r.nextSlot++
+	r.slots = append(r.slots, it)
+	if id != "" {
+		r.registerID(it, id)
+	} else {
+		r.anonymous = it
+	}
+	if outIdx != nil {
+		it.bindIndex(*outIdx)
+	}
+	return it, nil
+}
+
+func (r *itemRegistry) registerID(it *respItem, id string) {
+	if r.byID[id] == it {
+		return
+	}
+	if r.idsBytes+len(id) > maxTrackedItemIDs*maxItemIDBytes {
+		return
+	}
+	r.idsBytes += len(id)
+	r.byID[id] = it
+	it.id = id
+}
+
+// maxItemIDBytes bounds the retained id bytes; ids are short opaque
+// strings, so this only guards against a hostile emitter.
+const maxItemIDBytes = 1 << 10
+
+func (r *itemRegistry) hasIdentified() bool {
+	for _, it := range r.slots {
+		if it.id != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (it *respItem) bindIndex(idx int) {
+	it.indexBind[idx] = true
+}
+
+// sawPart records that a part's text was delivered.
+func (it *respItem) sawPart(channel string, index int) {
+	if it.partOut == nil {
+		it.partOut = map[string]map[int]bool{}
+	}
+	if it.partOut[channel] == nil {
+		it.partOut[channel] = map[int]bool{}
+	}
+	it.partOut[channel][index] = true
+}
+
+func (it *respItem) partSeen(channel string, index int) bool {
+	if it.partOut == nil {
+		return false
+	}
+	return it.partOut[channel][index]
+}
+
+var (
+	errIndexTaken    = errors.New("output index already bound to another item")
+	errUnidentified  = errors.New("cannot identify the item an event belongs to")
+	errTooManyItems  = errors.New("too many output items")
+	errSealConflict  = errors.New("conflicting sealed payloads for one item")
+	errIndexNegative = errors.New("negative part index")
+)
+
+// finalize accepts the terminating description of an item and returns the
+// events it still owes the consumer. It is used for both
+// response.output_item.done and the response.output of a terminating
+// response, so an item described by either source is folded exactly once.
+//
+// The events it returns are:
+//   - one EventThinkingDelta per part whose text never arrived as a delta
+//   - one EventThinkingDelta carrying the sealed payload and item id, when
+//     the item has a sealed payload (whether or not it has readable text)
+//
+// A terminating event that repeats state already delivered yields nothing,
+// which is what keeps done-then-completed from duplicating content.
+func (r *itemRegistry) finalize(item *oaRespOutputItem, outIdx *int) ([]*Event, error) {
+	if item.Type != "reasoning" {
+		return nil, nil
+	}
+	if outIdx != nil && *outIdx < 0 {
+		return nil, errIndexNegative
+	}
+	id, err := idFrom(item.eventID, item.ID)
+	if err != nil {
+		return nil, err
+	}
+	it, err := r.resolve(id, outIdx)
+	if err != nil {
+		return nil, err
+	}
+	if item.EncryptedContent != "" {
+		if it.sealedDone && it.sealed != item.EncryptedContent {
+			return nil, errSealConflict
+		}
+	}
+	var evs []*Event
+	text, parts := itemReadableText(item)
+	// A part whose text already arrived as a delta must not be appended
+	// again; only parts that never streamed are backfilled here.
+	if text != "" && !it.allPartsSeen(item, parts) {
+		evs = append(evs, &Event{
+			Type: EventThinkingDelta, BlockIndex: it.slot, Text: text,
+			ReasoningID: it.id,
+		})
+		_ = parts
+	}
+	if item.EncryptedContent != "" {
+		it.sealed = item.EncryptedContent
+		it.sealedBy = string(ProtoOpenAIResponses)
+		it.sealedDone = true
+		evs = append(evs, &Event{
+			Type: EventThinkingDelta, BlockIndex: it.slot,
+			Sealed: item.EncryptedContent, SealedBy: string(ProtoOpenAIResponses),
+			ReasoningID: it.id,
+		})
+	}
+	it.finalized = true
+	return evs, nil
+}
+
+// allPartsSeen reports whether every part of the item already streamed its
+// text, so a terminating event has nothing to backfill. A delta carries no
+// part index on a minimal emitter, which is treated as part 0.
+func (it *respItem) allPartsSeen(item *oaRespOutputItem, parts int) bool {
+	if parts == 0 {
+		return true
+	}
+	if it.partOut == nil {
+		return false
+	}
+	for channel, n := range map[string]int{"summary": len(item.Summary), "content": len(item.Content)} {
+		seen := 0
+		for i := 0; i < n; i++ {
+			if it.partSeen(channel, i) {
+				seen++
+			}
+		}
+		if seen < n {
+			return false
+		}
+	}
+	return true
+}
+
+// itemOutputIndex returns the position an item occupies in the terminating
+// output array. It is used as the fallback when no event named the index.
+func itemOutputIndex(output *[]oaRespOutputItem, i int) *int {
+	if output == nil {
+		return nil
+	}
+	return &[]int{i}[0]
+}
+
+// itemReadableText renders an item's readable summary text, joining parts
+// with a newline. The second return value reports how many parts carried
+// text, so callers can tell "no parts" from "parts, all empty".
+func itemReadableText(item *oaRespOutputItem) (string, int) {
+	var b strings.Builder
+	n := 0
+	writePart := func(text string) {
+		if text == "" {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(text)
+		n++
+	}
+	for _, p := range item.Summary {
+		writePart(p.Text)
+	}
+	for _, p := range item.Content {
+		if p.Type == "reasoning_text" {
+			writePart(p.Text)
+		}
+	}
+	return b.String(), n
+}
+
+// mapItemErr reports a registry failure as a stream error. Identity
+// conflicts are upstream inconsistencies, so they fail the stream with
+// ErrUpstreamMalformed and the request context, leaving whatever has
+// already been accumulated in Partial.
+func mapItemErr(err error, method, url string) error {
+	switch {
+	case errors.Is(err, errIDConflict), errors.Is(err, errIndexTaken),
+		errors.Is(err, errUnidentified), errors.Is(err, errSealConflict),
+		errors.Is(err, errIndexNegative):
+		return fmt.Errorf("rosetta: responses stream (%s %s): %s: %w", method, url, err, ErrUpstreamMalformed)
+	case errors.Is(err, errTooManyItems):
+		return fmt.Errorf("rosetta: responses stream (%s %s): %s: %w", method, url, err, ErrStreamOverflow)
+	}
+	return err
 }
