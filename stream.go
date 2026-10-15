@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,13 +29,32 @@ const (
 //   - EventToolCall: ToolIndex, ToolID, ToolName, ArgumentsDelta (fragments
 //     concatenate into a complete JSON arguments string)
 //   - EventMessageEnd: StopReason, Usage
+//
+// EventThinkingDelta also carries thinking-block metadata: Signature, and
+// the sealed reasoning payload (Sealed / SealedBy) plus its source item
+// ReasoningID. Such an event may arrive with an empty Text, so a consumer
+// that drops empty-text events loses the sealed state; renderers that only
+// display text may ignore it.
 type Event struct {
-	Type           EventType
-	ID             string
-	Model          string
-	Text           string
-	Signature      string // thinking signature passthrough (Anthropic)
-	BlockIndex     int    // content-block index for text/thinking merging (Anthropic); 0 elsewhere
+	Type      EventType
+	ID        string
+	Model     string
+	Text      string
+	Signature string // thinking signature passthrough (Anthropic)
+	// Sealed is an opaque provider-private reasoning payload that must be
+	// replayed verbatim to the same protocol family named in SealedBy on
+	// the next turn. It is never interpreted, trimmed or concatenated.
+	Sealed   string
+	SealedBy string
+	// ReasoningID is the provider-issued id of the reasoning item Sealed
+	// came from. Empty for providers that do not issue one.
+	ReasoningID string
+	// OutputIndex is an optional provider output-item position. nil means
+	// unspecified; 0 is a valid explicit index. It orders items in the
+	// materialized content and is not a merging key. The accumulator copies
+	// the value, so the producer must not mutate it afterwards.
+	OutputIndex    *int
+	BlockIndex     int // content-block index for text/thinking merging (Anthropic); 0 elsewhere
 	ToolIndex      int
 	ToolID         string
 	ToolName       string
@@ -157,9 +177,19 @@ type accBlock struct {
 	text      strings.Builder
 	thinking  strings.Builder
 	signature string
-	toolID    string
-	toolName  string
-	args      strings.Builder
+	sealed    string
+	sealedBy  string
+	// reasoningID is the provider-issued id of the reasoning item. It is
+	// only meaningful together with a sealed payload.
+	reasoningID string
+	// order / orderKnown hold the provider output-item position when the
+	// producer supplied one. They order the snapshot and are not part of a
+	// block's identity, so they never move an accumulator slot.
+	order      int
+	orderKnown bool
+	toolID     string
+	toolName   string
+	args       strings.Builder
 }
 
 // newStream wires a Stream from an event producer. onEnd, when non-nil,
@@ -181,19 +211,29 @@ func (s *streamCore) setIdle(d time.Duration) {
 // one-shot unified stream. Gateways that answer a stream:true request with a
 // buffered 200 application/json body would otherwise have their complete
 // reply mistaken for a truncated (empty) SSE stream (audit B3).
+//
+// Every block-level event carries the content index of the block it came
+// from, so the replay is 1:1: adjacent same-kind blocks keep their
+// boundaries instead of folding into one accumulator slot. Tool events use
+// ToolIndex for the same reason. Behavior change vs. the previous version,
+// which left the index at zero and merged neighbors.
 func bufferedStream(cr *ChatResponse) Stream {
 	events := make([]*Event, 0, len(cr.Content)+2)
 	events = append(events, &Event{Type: EventMessageStart, ID: cr.ID, Model: cr.Model})
-	for _, b := range cr.Content {
+	for i, b := range cr.Content {
 		switch b.Type {
 		case BlockText:
-			events = append(events, &Event{Type: EventTextDelta, Text: b.Text})
+			events = append(events, &Event{Type: EventTextDelta, Text: b.Text, BlockIndex: i})
 		case BlockThinking:
-			events = append(events, &Event{Type: EventThinkingDelta, Text: b.Thinking, Signature: b.Signature})
+			events = append(events, &Event{
+				Type: EventThinkingDelta, Text: b.Thinking, Signature: b.Signature,
+				Sealed: b.Sealed, SealedBy: b.SealedBy, ReasoningID: b.ReasoningID,
+				BlockIndex: i,
+			})
 		case BlockRedactedThinking:
-			events = append(events, &Event{Type: EventThinkingDelta, Text: b.Thinking})
+			events = append(events, &Event{Type: EventThinkingDelta, Text: b.Thinking, BlockIndex: i})
 		case BlockToolCall:
-			events = append(events, &Event{Type: EventToolCall, ToolID: b.ToolCallID, ToolName: b.ToolName, ArgumentsDelta: b.Arguments})
+			events = append(events, &Event{Type: EventToolCall, ToolID: b.ToolCallID, ToolName: b.ToolName, ArgumentsDelta: b.Arguments, ToolIndex: i})
 		}
 	}
 	u := cr.Usage
@@ -515,13 +555,32 @@ func (s *streamCore) apply(ev *Event) {
 	case EventTextDelta:
 		if b := s.blockFor(&s.textPos, ev.BlockIndex, BlockText, len(ev.Text)); b != nil {
 			b.text.WriteString(ev.Text)
+			if ev.OutputIndex != nil {
+				b.setOrder(*ev.OutputIndex)
+			}
 			s.contentDirty = true
 		}
 	case EventThinkingDelta:
-		if b := s.blockFor(&s.thinkPos, ev.BlockIndex, BlockThinking, len(ev.Text)); b != nil {
+		// Text is appended; sealed payload, its origin and the item id are
+		// state, not text. State is charged only when it actually changes,
+		// so a repeated delivery of the same payload costs nothing (R4, R8).
+		// The whole event is admitted or rejected as one unit, so a
+		// rejected event never leaves a half-updated block behind.
+		meta := s.thinkingMetaCost(ev)
+		if b := s.blockFor(&s.thinkPos, ev.BlockIndex, BlockThinking, len(ev.Text)+meta); b != nil {
 			b.thinking.WriteString(ev.Text)
 			if ev.Signature != "" {
 				b.signature = ev.Signature
+			}
+			if ev.Sealed != "" {
+				b.sealed = ev.Sealed
+				b.sealedBy = ev.SealedBy
+			}
+			if ev.ReasoningID != "" {
+				b.reasoningID = ev.ReasoningID
+			}
+			if ev.OutputIndex != nil {
+				b.setOrder(*ev.OutputIndex)
 			}
 			s.contentDirty = true
 		}
@@ -534,6 +593,9 @@ func (s *streamCore) apply(ev *Event) {
 				b.toolName = ev.ToolName
 			}
 			b.args.WriteString(ev.ArgumentsDelta)
+			if ev.OutputIndex != nil {
+				b.setOrder(*ev.OutputIndex)
+			}
 			s.contentDirty = true
 		}
 	case EventMessageEnd:
@@ -551,8 +613,18 @@ func (s *streamCore) apply(ev *Event) {
 // on first use, and accounts bytes against the caps. A nil return means the
 // stream has overflowed; the caller drops the delta and Next surfaces the
 // error.
+//
+// The caps are checked before the block is handed out, so an overflow is
+// always an all-or-nothing admission: a rejected event leaves the existing
+// accumulator exactly as it was, with no partial text append and no
+// half-applied metadata update. Remaining capacity is computed by
+// subtraction, not by summing lengths.
 func (s *streamCore) blockFor(pos *map[int]int, index int, kind BlockType, addBytes int) *accBlock {
 	if i, ok := (*pos)[index]; ok {
+		if addBytes > 0 && !s.fits(addBytes) {
+			s.overflow = true
+			return nil
+		}
 		s.chargeBytes(addBytes)
 		return s.acc[i]
 	}
@@ -560,11 +632,9 @@ func (s *streamCore) blockFor(pos *map[int]int, index int, kind BlockType, addBy
 		s.overflow = true
 		return nil
 	}
-	if addBytes > 0 {
-		s.chargeBytes(addBytes)
-		if s.overflow {
-			return nil
-		}
+	if addBytes > 0 && !s.fits(addBytes) {
+		s.overflow = true
+		return nil
 	}
 	if *pos == nil {
 		*pos = make(map[int]int)
@@ -572,7 +642,54 @@ func (s *streamCore) blockFor(pos *map[int]int, index int, kind BlockType, addBy
 	i := len(s.acc)
 	(*pos)[index] = i
 	s.acc = append(s.acc, &accBlock{kind: kind})
+	s.chargeBytes(addBytes)
 	return s.acc[i]
+}
+
+// fits reports whether n more bytes stay within the accumulation budget.
+// The comparison is written as a subtraction so a sum of lengths can never
+// overflow past the cap and let an oversized event through.
+func (s *streamCore) fits(n int) bool {
+	return maxStreamAccumBytes-s.accBytes >= n
+}
+
+// thinkingMetaCost is the bytes a thinking event adds to the accumulated
+// state beyond its text. State values are charged only when they replace a
+// different value, so an idempotent redelivery of the same sealed payload,
+// signature or item id is free.
+func (s *streamCore) thinkingMetaCost(ev *Event) int {
+	if ev.Signature == "" && ev.Sealed == "" && ev.ReasoningID == "" {
+		return 0
+	}
+	b, ok := s.thinkPos[ev.BlockIndex]
+	if !ok {
+		return s.metaBytes("", "", "", "", ev)
+	}
+	return s.metaBytes(s.acc[b].signature, s.acc[b].sealed, s.acc[b].sealedBy, s.acc[b].reasoningID, ev)
+}
+
+func (s *streamCore) metaBytes(sig, sealed, sealedBy, id string, ev *Event) int {
+	n := 0
+	if ev.Signature != "" && ev.Signature != sig {
+		n += len(ev.Signature)
+	}
+	if ev.Sealed != "" && ev.Sealed != sealed {
+		n += len(ev.Sealed) + len(ev.SealedBy) + len(ev.ReasoningID)
+	} else if ev.ReasoningID != "" && ev.ReasoningID != id {
+		n += len(ev.ReasoningID)
+	}
+	return n
+}
+
+// setOrder records the provider output-item position. The first known
+// position wins: a later event for the same item that carries a different
+// index must not move the item, since identity is the item id and the
+// order is only its stable source position (R9).
+func (b *accBlock) setOrder(idx int) {
+	if !b.orderKnown {
+		b.order = idx
+		b.orderKnown = true
+	}
 }
 
 func (s *streamCore) chargeBytes(n int) {
@@ -586,20 +703,56 @@ func (s *streamCore) chargeBytes(n int) {
 }
 
 // buildContent materializes the accumulated blocks into a snapshot slice.
+// Blocks are ordered by their provider output-item position when one is
+// known, using a stable sort over a copy of the accumulator references: the
+// accumulator itself is never reordered, so the index maps stay valid.
+// Blocks with no known position keep their arrival place.
 func (s *streamCore) buildContent() []Block {
 	if len(s.acc) == 0 {
 		return nil
 	}
-	out := make([]Block, len(s.acc))
-	for i, b := range s.acc {
+	order := make([]*accBlock, len(s.acc))
+	copy(order, s.acc)
+	if anyOrderKnown(order) {
+		sort.SliceStable(order, func(i, j int) bool {
+			return orderKeyLess(order[i], order[j])
+		})
+	}
+	out := make([]Block, len(order))
+	for i, b := range order {
 		switch b.kind {
 		case BlockText:
 			out[i] = Block{Type: BlockText, Text: b.text.String()}
 		case BlockThinking:
-			out[i] = Block{Type: BlockThinking, Thinking: b.thinking.String(), Signature: b.signature}
+			out[i] = Block{Type: BlockThinking, Thinking: b.thinking.String(),
+				Signature: b.signature, Sealed: b.sealed, SealedBy: b.sealedBy, ReasoningID: b.reasoningID}
 		case BlockToolCall:
 			out[i] = Block{Type: BlockToolCall, ToolCallID: b.toolID, ToolName: b.toolName, Arguments: b.args.String()}
 		}
 	}
 	return out
+}
+
+// anyOrderKnown reports whether at least one block carries a provider
+// position. Without one the arrival order is already the best available.
+func anyOrderKnown(acc []*accBlock) bool {
+	for _, b := range acc {
+		if b.orderKnown {
+			return true
+		}
+	}
+	return false
+}
+
+// orderKeyLess orders a block with a known position ahead of one without,
+// so unknown blocks stay near their arrival place instead of being pushed
+// to the end. Known positions compare by value.
+func orderKeyLess(a, b *accBlock) bool {
+	if a.orderKnown != b.orderKnown {
+		return a.orderKnown
+	}
+	if !a.orderKnown {
+		return false
+	}
+	return a.order < b.order
 }

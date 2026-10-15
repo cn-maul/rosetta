@@ -267,3 +267,196 @@ func TestStreamCoreCloseErrorNotFailure(t *testing.T) {
 		t.Fatalf("Close = %v, want %v", err, closeErr)
 	}
 }
+
+// C09: buffered replay is 1:1 with the decoded content. Adjacent same-kind
+// blocks used to fold into one accumulator slot because the events carried
+// no index; each one now keeps its own identity and order. Sealed /
+// ReasoningID replay is asserted separately once those Event fields exist
+// (plan C10).
+func TestBufferedStreamKeepsBlockIdentity(t *testing.T) {
+	cr := &ChatResponse{ID: "r1", Content: []Block{
+		{Type: BlockText, Text: "A"},
+		{Type: BlockThinking, Thinking: "S1", Signature: "sig1"},
+		{Type: BlockThinking, Thinking: "S2", Signature: "sig2"},
+		{Type: BlockToolCall, ToolCallID: "c1", ToolName: "fn1", Arguments: `{"a":1}`},
+		{Type: BlockToolCall, ToolCallID: "c2", ToolName: "fn2", Arguments: `{"b":2}`},
+		{Type: BlockText, Text: "B"},
+	}}
+	got, err := bufferedStream(cr).Collect()
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(got.Content) != len(cr.Content) {
+		t.Fatalf("got %d blocks, want %d", len(got.Content), len(cr.Content))
+	}
+	want := []Block{
+		{Type: BlockText, Text: "A"},
+		{Type: BlockThinking, Thinking: "S1", Signature: "sig1"},
+		{Type: BlockThinking, Thinking: "S2", Signature: "sig2"},
+		{Type: BlockToolCall, ToolCallID: "c1", ToolName: "fn1", Arguments: `{"a":1}`},
+		{Type: BlockToolCall, ToolCallID: "c2", ToolName: "fn2", Arguments: `{"b":2}`},
+		{Type: BlockText, Text: "B"},
+	}
+	if got.ID != cr.ID {
+		t.Errorf("ID = %q, want %q", got.ID, cr.ID)
+	}
+	for i := range want {
+		if got.Content[i] != want[i] {
+			t.Errorf("block %d = %+v, want %+v", i, got.Content[i], want[i])
+		}
+	}
+}
+
+// C11: an event that exceeds the remaining budget is rejected whole. The
+// accumulator must not keep a partial write from a rejected event, so the
+// existing block and any state already held in it survive untouched.
+func TestBlockForOverflowLeavesBlockUnchanged(t *testing.T) {
+	s := newStream(seqNext(), nil)
+	if b := s.blockFor(&s.textPos, 0, BlockText, 0); b == nil {
+		t.Fatal("blockFor returned nil for a fresh block")
+	} else {
+		b.text.WriteString("keep")
+	}
+	before := s.buildContent()[0].Text
+	s.accBytes = maxStreamAccumBytes - 1
+	if b := s.blockFor(&s.textPos, 0, BlockText, 16); b != nil {
+		t.Fatal("blockFor admitted an event that exceeds the budget")
+	}
+	if !s.overflow {
+		t.Error("overflow flag not set")
+	}
+	if after := s.buildContent()[0].Text; after != before {
+		t.Errorf("text = %q after rejected event, want %q", after, before)
+	}
+}
+
+// C12: the same rejection applies to a block that does not exist yet, and
+// must not leave a half-created block behind.
+func TestBlockForOverflowDoesNotCreateBlock(t *testing.T) {
+	s := newStream(seqNext(), nil)
+	s.accBytes = maxStreamAccumBytes - 1
+	if b := s.blockFor(&s.textPos, 7, BlockText, 16); b != nil {
+		t.Fatal("blockFor admitted a new block that exceeds the budget")
+	}
+	if len(s.acc) != 0 {
+		t.Fatalf("acc has %d blocks, want 0", len(s.acc))
+	}
+	if _, ok := s.textPos[7]; ok {
+		t.Error("rejected index was registered")
+	}
+	if s.Partial().Content != nil {
+		t.Errorf("Partial has content %+v, want none", s.Partial().Content)
+	}
+}
+
+// C01/C02/C04: a thinking block accumulates text, signature and sealed
+// payload side by side. The sealed payload may arrive as an event with an
+// empty Text, which must still land in the same block.
+func TestStreamCoreThinkingSealAccumulation(t *testing.T) {
+	s := newStream(seqNext(
+		&Event{Type: EventThinkingDelta, Text: "step one ", BlockIndex: 0},
+		&Event{Type: EventThinkingDelta, Text: "step two", BlockIndex: 0, Signature: "sig"},
+		&Event{Type: EventThinkingDelta, BlockIndex: 0, Sealed: "BLOB", SealedBy: "openai-responses", ReasoningID: "rs_1"},
+	), nil)
+	defer s.Close()
+	for s.Next() {
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("Err: %v", err)
+	}
+	got := s.Partial().Content
+	if len(got) != 1 {
+		t.Fatalf("got %d blocks, want 1", len(got))
+	}
+	if got[0].Thinking != "step one step two" {
+		t.Errorf("Thinking = %q", got[0].Thinking)
+	}
+	if got[0].Signature != "sig" {
+		t.Errorf("Signature = %q, want sig", got[0].Signature)
+	}
+	if got[0].Sealed != "BLOB" || got[0].SealedBy != "openai-responses" || got[0].ReasoningID != "rs_1" {
+		t.Errorf("seal = %+v", got[0])
+	}
+}
+
+// C03: the public accumulator stores sealed state regardless of its
+// protocol family; filtering foreign payloads is the outbound adapter's
+// job, not the accumulator's.
+func TestStreamCoreKeepsForeignSealedState(t *testing.T) {
+	s := newStream(seqNext(
+		&Event{Type: EventThinkingDelta, BlockIndex: 0, Sealed: "FUTURE", SealedBy: "future-protocol"},
+	), nil)
+	defer s.Close()
+	for s.Next() {
+	}
+	got := s.Partial().Content
+	if len(got) != 1 || got[0].Sealed != "FUTURE" || got[0].SealedBy != "future-protocol" {
+		t.Fatalf("sealed state not kept: %+v", got)
+	}
+}
+
+// C05: Partial is a snapshot. Updating the sealed state after a Partial
+// call must not mutate the slice the caller already holds, and the next
+// Partial must show the new state.
+func TestStreamCorePartialSnapshotAfterSealUpdate(t *testing.T) {
+	s := newStream(seqNext(
+		&Event{Type: EventThinkingDelta, Text: "t", BlockIndex: 0},
+		&Event{Type: EventThinkingDelta, BlockIndex: 0, Sealed: "FIRST", SealedBy: "openai-responses"},
+	), nil)
+	defer s.Close()
+	if !s.Next() {
+		t.Fatal("no first event")
+	}
+	if !s.Next() {
+		t.Fatal("no second event")
+	}
+	first := s.Partial().Content
+	if len(first) != 1 || first[0].Sealed != "FIRST" {
+		t.Fatalf("first snapshot = %+v", first)
+	}
+	for s.Next() {
+	}
+	second := s.Partial().Content
+	if len(second) != 1 || second[0].Sealed != "FIRST" {
+		t.Fatalf("second snapshot = %+v", second)
+	}
+	if first[0].Thinking != "t" {
+		t.Errorf("first snapshot mutated: %+v", first[0])
+	}
+}
+
+// C06: distinct block indices never merge, so payloads cannot cross
+// between two reasoning items that share a provider output index.
+func TestStreamCoreThinkingBlocksDoNotMerge(t *testing.T) {
+	s := newStream(seqNext(
+		&Event{Type: EventThinkingDelta, Text: "first", BlockIndex: 0},
+		&Event{Type: EventThinkingDelta, Text: "second", BlockIndex: 1, Sealed: "B2", SealedBy: "openai-responses"},
+		&Event{Type: EventThinkingDelta, BlockIndex: 0, Sealed: "B1", SealedBy: "openai-responses"},
+	), nil)
+	defer s.Close()
+	for s.Next() {
+	}
+	got := s.Partial().Content
+	if len(got) != 2 {
+		t.Fatalf("got %d blocks, want 2", len(got))
+	}
+	if got[0].Thinking != "first" || got[0].Sealed != "B1" {
+		t.Errorf("block 0 = %+v", got[0])
+	}
+	if got[1].Thinking != "second" || got[1].Sealed != "B2" {
+		t.Errorf("block 1 = %+v", got[1])
+	}
+}
+
+// C13: an idempotent redelivery of the same sealed state costs nothing
+// extra against the byte budget.
+func TestStreamCoreSealRedeliveryIsFree(t *testing.T) {
+	s := newStream(seqNext(), nil)
+	seal := &Event{Type: EventThinkingDelta, BlockIndex: 0, Sealed: "BLOB", SealedBy: "openai-responses", ReasoningID: "rs_1"}
+	s.apply(seal)
+	afterFirst := s.accBytes
+	s.apply(seal)
+	if s.accBytes != afterFirst {
+		t.Errorf("redelivery charged %d bytes", s.accBytes-afterFirst)
+	}
+}
