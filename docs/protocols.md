@@ -42,6 +42,36 @@
 
 usage 组装：Chat 在 usage chunk；Responses 在 completed 事件；Anthropic 的 input 来自 `message_start`、output 来自 `message_delta`——服务端缺哪部分就缺哪部分（如实呈现零值，不伪造）。
 
+## Responses reasoning 与密封载荷
+
+Responses 的 reasoning item 带一个 `encrypted_content` 载荷，OpenAI 要求下一轮**原样回放**，
+否则报 `400 Item with id 'rs_...' not found`。它落在 `Block.Sealed` / `Block.SealedBy` /
+`Block.ReasoningID`，解码与流式两条路径都保留；流式消费者也可以在事件上直接读取
+（见[思考块的元数据事件](streaming.md#思考块的元数据事件)）。
+
+- **来源**：`response.output_item.done` 与终结 `response.completed` 的 `response.output`。
+  `output_item.added` 上的载荷尚未终结，不会被当作最终值。
+
+- **回放**：assistant 内容按原块顺序编码为 input item，reasoning 块写成
+  `{"type":"reasoning","id":...,"summary":[...],"encrypted_content":...}`。`SealedBy` 必须是
+  `"openai-responses"`，否则不出站——加密状态不会发给没有签发它的上游。
+
+- **载荷本身**：不 trim、不解密、不重编码、不拼接、不截断。
+
+**无状态续接**：官方在 `store:false`（或 ZDR）下默认返回 `encrypted_content`；旧版
+`include:["reasoning.encrypted_content"]` 仍被接受。SDK 不自动改写 `store`，也不把
+`include` 设为保留键，两者都经 `ChatRequest.Extra` 显式传递：
+
+```go
+req := &rosetta.ChatRequest{
+	Model:    model,
+	Messages: history,
+	Extra:    map[string]any{"store": false},
+}
+```
+
+SDK 只保存并回放上游实际提供的状态，不保证所有第三方上游都会生成 `encrypted_content`。
+
 ## 输出上限字段探测（OpenAI Chat）
 
 官方 API 要求 `max_completion_tokens`，老服务只认 `max_tokens`。策略：

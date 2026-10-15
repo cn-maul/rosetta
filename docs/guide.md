@@ -148,6 +148,31 @@ Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens �
 
 **能力门控**：对已知的非思考模型（手动配置的 `ModelInfo.Known && !SupportsThinking`），请求 thinking 默认报 `ErrThinkingUnsupported`；`WithThinkingFallback(true)` 改为静默去掉 thinking 配置。未知模型不做猜测、原样透传。
 
+**多轮 reasoning 续接**：Responses 的 reasoning item 带 `encrypted_content`，必须原样回放，
+否则下一轮报 `400 Item with id 'rs_...' not found`。SDK 把它保存在 `Block.Sealed`
+（连同 `SealedBy` 与 `ReasoningID`），回放时随 assistant 历史一起写回。因此多轮 agent
+应当**保留上一步的整个 assistant 响应**，而不是只保留正文：
+
+```go
+// 第一轮：流式或非流式都保留密封载荷
+first, _ := stream.Collect()
+history := append(history, rosetta.Message{
+	Role:   rosetta.RoleAssistant,
+	Blocks: first.Content, // reasoning / text / tool_call 全带上，顺序不变
+})
+history = append(history, rosetta.ToolResult(call.ToolCallID, "", result))
+
+// 无状态续接（官方默认返回 encrypted_content）
+second, _ := client.Chat(ctx, &rosetta.ChatRequest{
+	Model:    model,
+	Messages: history,
+	Extra:    map[string]any{"store": false},
+})
+```
+
+若只保留正文而丢掉 reasoning 块，续接会断裂或静默降级。`SealedBy` 只对签发它的协议族有效，
+切换到其他上游时该载荷会被丢弃而不是误发。详细规则见[协议与兼容](protocols.md#responses-reasoning-与密封载荷)。
+
 ## 上下文校验
 
 请求发出前，若模型在注册表中有 `ContextWindow`，SDK 会用启发式估算（中文≈1 token/字、英文≈4 字符/token、每图 1500、每段音频 500、每份文档 3000、每条消息 +4、每个工具定义 +24 与 schema 文本、`Extra` 按其 JSON 长度）比较 `估算输入 + 输出上限` 与窗口。文本 token 按全部文本累计后**一次取整**（v0.6.0 起，不再逐块取整累加，短块多的请求估算略降、更接近真实）：

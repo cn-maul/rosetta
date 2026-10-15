@@ -1,5 +1,76 @@
 # 更新日志
 
+## v1.2.0 (未发布)
+
+Responses 流式路径现在保留 reasoning item 的 `encrypted_content`，多轮 reasoning 对话在流式
+路径下不再断裂。同时修正了三个相关的块归属与回放顺序缺陷。
+
+### 新增
+
+- **`Block.ReasoningID`**：reasoning item 的供应商标识。回放时与密封载荷一起写回
+  `id`，这是让 item 在下一轮可寻址的前提。手工构造的 `SealedThinking` 不填该字段，
+  出站行为与之前一致（不编造上游 ID）。
+- **`Event.Sealed` / `Event.SealedBy` / `Event.ReasoningID`**：流式消费者可以直接取得
+  密封载荷，不必等 `Partial()` / `Collect()`。
+- **`Event.OutputIndex`**（可选）：供应商标记的 output item 位置，用于按来源顺序排列内容。
+  它**不是**合并键；合并仍由 `BlockIndex` / `ToolIndex` 承担。`nil` 表示未提供。
+
+### 修复
+
+- **流式 Responses 保留 sealed reasoning**：`response.output_item.done` 与终结
+  `response.completed` 里的 reasoning item 现在会被折叠进 `Partial()` / `Collect()`。
+  此前 `output_item.done` 的类型 switch 只处理 `function_call` 与 `message`，reasoning
+  落到默认分支被静默丢弃，导致下一轮回放缺 `encrypted_content`。
+- **reasoning item 的文本归属**：summary delta 现在按 item 身份定位，而不是一律落到块 0。
+  此前多个 reasoning item 的文本会合并成一个 thinking 块，载荷也可能落到另一个 item 的块里。
+- **`bufferedStream` 恢复块边界**：JSON 回退路径（`stream:true` 却收到 `application/json`）
+  的各块级事件现在携带内容下标，相邻同类块不再被折叠。此前
+  `[text A, thinking S1, thinking S2, tool C1, tool C2, text B]` 会被合并成更少的块，
+  两个 tool 的参数还会串接。
+- **Responses 回放顺序**：assistant 内容不再先把所有文本汇总前置。此前
+  `[reasoning, text, tool, text]` 会被重排成 `[text, text, reasoning, tool]`，
+  打乱多轮工具对话的 item 次序。
+- **累积超限的原子性**：超限事件不再产生半次写入。此前 `blockFor` 对已存在块先计费再返回
+  指针，overflow 置位后调用方仍会继续追加。
+- **密封载荷计入累积配额**：`maxStreamAccumBytes` 现在覆盖 sealed 载荷、signature 与
+  reasoning ID，这些持久元数据不再是无界旁路。
+
+### 行为变化（需要下游注意）
+
+- **`EventThinkingDelta` 可能带空 `Text`**：当一次事件只用来更新 sealed 载荷 / 签名 /
+  item ID 时，`Text` 为空。只用 `Text` 做显示的消费者不受影响；但**不能用
+  `Text == ""` 作为丢弃整个事件的通用规则**，否则会丢掉密封状态。代理、记账、历史保存
+  类消费端必须读取这些字段或改读最终 `Block`。
+- **`bufferedStream` 保留多个同类块**：这是公开可观察的变化，作用于所有协议的 JSON
+  回退路径。
+- **reasoning item 显式携带 `summary` 数组**：无可读文本时为 `[]`，不再省略该字段。
+
+### 兼容性
+
+- 已有事件类型的字符串值、公开函数签名与 `SealedThinking` 的调用方式不变。
+- 常规使用命名字段字面量的调用方预期保持源码兼容。
+- 未命名字段字面量、反射、严格 JSON 快照或结构相等断言可能需要调整：新增 struct 字段
+  无法绝对保证所有 Go 代码兼容。
+- 协议族过滤仍在出站适配器执行：非 `openai-responses` 来源的密封载荷不会发给 Responses，
+  也不会被其他协议当作签名使用。
+
+### 测试
+
+新增 Responses SSE 身份解析、part 防重、终结回填、两轮 httptest 集成（SSE 与 JSON
+回退各一）以及公共累积器的配额、缓存失效与块身份用例。
+
+真实上游验证已完成（`responses_live_verify_test.go`，经环境变量 opt-in，CI 不执行）：
+流式第一轮产出带 `encrypted_content` 与 item id 的 reasoning 项，第二轮连同 tool call 与
+工具结果回放后被上游正常接受并继续推理，未出现 `400 Item with id 'rs_...' not found`。
+目标为 `https://api.deepseek.com/v1` 的 `deepseek-v4-flash`；该上游返回的
+`encrypted_content` 是 38 字符的标识串而非加密载荷，SDK 按不透明字符串原样透传，行为不受影响。
+
+### 未包含
+
+- Gateway 侧接入属于后续工作，不随本版本发布。
+- summary 数组分段、原始 JSON 字段顺序等未建模信息的逐字节往返不在承诺范围内。
+- message phase、内建工具、`item_reference`、compaction 等未建模能力不在本次范围内。
+
 ## v1.1.1 (2026-10-11)
 
 修复批次：传输层与估算器的正确性修补。纯修复，不含任何 wire 行为变更。
@@ -16,7 +87,7 @@
   `httpx.NewTransport()`，与主客户端共享有界的 dial/TLS 生命周期，调用方自定义的
   transport 无法再让这条旁路无限期悬挂。
 
-- **token 估算补齐 sealed reasoning 与内联文件**（`estimator.go`）：`BlockSealed` 按
+- **token 估算补齐 sealed reasoning 与内联文件**（`estimator.go`）：`Block.Sealed` 按
   原文计入（此前 Responses 多轮对话会本地放行、上游才炸在真实溢出上）；`BlockFile` 的
   内联 base64 内容按序列化尺寸计价并保留 flat 下限，URL 引用维持原粗估。另将 ASCII
   判定改为 `utf8.RuneSelf`。

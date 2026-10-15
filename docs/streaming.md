@@ -34,12 +34,41 @@ if err := stream.Err(); err != nil {
 | EventType | 有效字段 | 含义 |
 |---|---|---|
 | `EventMessageStart` | `ID`、`Model` | 首个事件，响应身份 |
-| `EventTextDelta` | `Text` | 正文增量 |
-| `EventThinkingDelta` | `Text`、`Signature` | 思考增量；`Signature` 为 Anthropic 签名，多轮回放时随 thinking 块原样回传 |
-| `EventToolCall` | `ToolIndex`、`ToolID`、`ToolName`、`ArgumentsDelta` | 工具调用片段，按 `ToolIndex` 分组，`ArgumentsDelta` 依次拼接成完整 JSON |
+| `EventTextDelta` | `Text`、`BlockIndex`、可选 `OutputIndex` | 正文增量 |
+| `EventThinkingDelta` | `Text`、`Signature`、`Sealed`、`SealedBy`、`ReasoningID`、`BlockIndex`、可选 `OutputIndex` | 思考增量，同时承载 thinking 块的元数据更新（见下节） |
+| `EventToolCall` | `ToolIndex`、`ToolID`、`ToolName`、`ArgumentsDelta`、可选 `OutputIndex` | 工具调用片段，按 `ToolIndex` 分组，`ArgumentsDelta` 依次拼接成完整 JSON |
 | `EventMessageEnd` | `StopReason`、`Usage` | 结束事件，携带终止原因与用量 |
 
 协议原始事件到统一事件的映射见[协议与兼容](protocols.md#流式事件映射)。
+
+## 思考块的元数据事件
+
+`EventThinkingDelta` 除文本增量外，还承载 thinking 块的**状态更新**：`Signature`（Anthropic
+签名）、`Sealed` / `SealedBy` / `ReasoningID`（Responses 的加密 reasoning 载荷及其来源）。
+
+当一个事件只更新状态而不带新文本时，`Text` 为**空字符串**。因此：
+
+- 只做显示的消费者可以继续只读 `Text`；
+- **不能把 `Text == ""` 当作丢弃整个事件的通用规则**——那样会丢掉密封载荷，下一轮回放随之断裂；
+- 代理、记账、历史保存类消费端必须读取这些字段，或改读最终的 `Block`（`Partial()` /
+  `Collect()` 已经把它们折进对应的 `BlockThinking`）。
+
+```go
+case rosetta.EventThinkingDelta:
+	if ev.Text != "" {
+		fmt.Print(ev.Text) // 可显示的思考摘要
+	}
+	if ev.Sealed != "" {
+		// 必须随下一轮历史一起保留；只对 ev.SealedBy 指定的协议族有效
+		keep(ev.Sealed, ev.SealedBy, ev.ReasoningID)
+	}
+```
+
+`BlockIndex` / `ToolIndex` 是本次流内的**合并键**，同一个块的所有增量与状态更新共用它；
+`OutputIndex` 是供应商标记的 output item 位置，只用于按来源顺序排列内容，不是合并键。
+`OutputIndex` 为 `nil` 表示上游未提供，此时内容按首次出现顺序排列。
+
+即使流被中断，已收到的密封载荷仍留在 `Partial()` 里，可以据此重建历史。
 
 ## 接口
 
