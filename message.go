@@ -86,8 +86,9 @@ type Block struct {
 	Sealed   string
 	SealedBy string
 	// ReasoningID is the provider-issued identifier of a reasoning item.
-	// For Responses replay it is emitted only alongside a matching sealed
-	// payload, since that is what makes the item addressable across turns.
+	// It is replayed for Responses even when the provider returned only a
+	// readable summary and no encrypted payload: some compatible upstreams
+	// require that item to be passed back and identify it by this id.
 	// It is distinct from the response ID and from a tool call's call_id,
 	// and is never generated locally.
 	ReasoningID string

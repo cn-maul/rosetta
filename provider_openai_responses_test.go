@@ -511,6 +511,43 @@ func TestResponsesSealedThinkingWithoutIDOmitsID(t *testing.T) {
 	}
 }
 
+// Some Responses-compatible providers return readable reasoning without an
+// encrypted payload. It still has to be replayed on the next turn.
+func TestResponsesSummaryOnlyThinkingReplay(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoOpenAIResponses))
+	p := c.provider.(*openaiResponsesProvider)
+	req := &ChatRequest{
+		Model: "m",
+		Messages: []Message{
+			User("go"),
+			{Role: RoleAssistant, Blocks: []Block{{
+				Type:        BlockThinking,
+				Thinking:    "thought",
+				SealedBy:    string(ProtoOpenAIResponses),
+				ReasoningID: "rs_1",
+			}}},
+		},
+	}
+	items, err := p.encodeInput(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("got %d items, want 2: %+v", len(items), items)
+	}
+	item := items[1]
+	if item["type"] != "reasoning" || item["id"] != "rs_1" {
+		t.Fatalf("reasoning item = %v", item)
+	}
+	if _, exists := item["encrypted_content"]; exists {
+		t.Fatalf("empty seal must not be sent: %v", item)
+	}
+	summary, ok := item["summary"].([]map[string]any)
+	if !ok || len(summary) != 1 || summary[0]["type"] != "summary_text" || summary[0]["text"] != "thought" {
+		t.Fatalf("summary = %v", item["summary"])
+	}
+}
+
 // §9.4 two-turn integration: the first turn streams a reasoning item and a
 // tool call, the second turn replays both and the captured request must
 // carry the reasoning id, its sealed payload, the call id and the item

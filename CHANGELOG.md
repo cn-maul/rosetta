@@ -17,6 +17,11 @@ Responses 流式路径现在保留 reasoning item 的 `encrypted_content`，多�
 
 ### 修复
 
+- **无密封载荷的 Responses reasoning 仍会回放**：部分 Responses 兼容上游只返回
+  可读 summary 和 item id、不返回 `encrypted_content`，但下一轮仍要求把 reasoning
+  item 带回；此前编码器因 `Sealed == ""` 整块丢弃，第二轮会报
+  `The reasoning_content in the thinking mode must be passed back to the API`。
+  现在 summary/id 与密封载荷可独立回放，空的 `encrypted_content` 不再写出。
 - **流式 Responses 保留 sealed reasoning**：`response.output_item.done` 与终结
   `response.completed` 里的 reasoning item 现在会被折叠进 `Partial()` / `Collect()`。
   此前 `output_item.done` 的类型 switch 只处理 `function_call` 与 `message`，reasoning

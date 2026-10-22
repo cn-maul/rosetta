@@ -363,19 +363,19 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 						"arguments": b.Arguments,
 					})
 				case BlockThinking:
-					// A sealed payload only rides this API family's own
-					// reasoning item — it was sealed by OpenAI and is
-					// meaningless to another upstream. SealedBy gates it so a
-					// conversation routed elsewhere drops the seal instead
-					// of sending foreign opaque state to a provider that
-					// never issued it.
-					if b.Sealed == "" || b.SealedBy != "openai-responses" {
+					// A reasoning item can continue the conversation with
+					// either readable summary text, an encrypted payload, or
+					// both. Some Responses-compatible upstreams return the
+					// summary and id without encrypted_content, but still
+					// require the item to be passed back. SealedBy keeps
+					// foreign opaque state from being sent to this provider.
+					if b.SealedBy != "openai-responses" {
 						continue
 					}
-					item := map[string]any{
-						"type":              "reasoning",
-						"encrypted_content": b.Sealed,
+					if b.Thinking == "" && b.Sealed == "" && b.ReasoningID == "" {
+						continue
 					}
+					item := map[string]any{"type": "reasoning"}
 					// The summary is what the model sees. It is sent as an
 					// explicit array even when empty: the reasoning item
 					// shape requires one, and omitting it makes the item
@@ -385,6 +385,9 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 						summary = append(summary, map[string]any{"type": "summary_text", "text": b.Thinking})
 					}
 					item["summary"] = summary
+					if b.Sealed != "" {
+						item["encrypted_content"] = b.Sealed
+					}
 					// The item id is what makes the item addressable on the
 					// next turn, so it is carried back verbatim. A caller
 					// that built the block by hand without one keeps the

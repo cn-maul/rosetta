@@ -53,7 +53,9 @@ Responses 的 reasoning item 带一个 `encrypted_content` 载荷，OpenAI 要�
   `output_item.added` 上的载荷尚未终结，不会被当作最终值。
 
 - **回放**：assistant 内容按原块顺序编码为 input item，reasoning 块写成
-  `{"type":"reasoning","id":...,"summary":[...],"encrypted_content":...}`。`SealedBy` 必须是
+  `{"type":"reasoning","id":...,"summary":[...]}`；有 `encrypted_content` 时再加该字段。
+  **只有 summary 和 id、没有密封载荷的 reasoning 也要回放**：部分 Responses 兼容上游
+  不返回加密内容，但下一轮仍要求把该 item 原样带回。`SealedBy` 必须是
   `"openai-responses"`，否则不出站——加密状态不会发给没有签发它的上游。
 
 - **载荷本身**：不 trim、不解密、不重编码、不拼接、不截断。
