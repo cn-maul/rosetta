@@ -25,6 +25,7 @@ client, err := rosetta.NewClient(
 | `WithProtocol(p)` | `ProtoOpenAIChat` | `ProtoOpenAIChat` / `ProtoOpenAIResponses` / `ProtoAnthropic`；也可由 `DetectClient` 探测决定 |
 | `WithHTTPClient(c)` | SDK 自建 Transport | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式；也用于 `DetectClient` 的协议探测。默认 Transport 的代理行为见[附注](#附注) |
 | `WithTimeout(d)` | 60s | 仅约束非流式调用（Chat / ListModels / ModelInfo / Embed / Rerank），以及 `DetectClient` 的协议探测；`WithTimeout(0)` 关闭默认上界。流式不受影响，由调用方 ctx 管辖 |
+| `WithStreamIdleTimeout(d)` | 关闭 | 流空闲看门狗：`d` 内没有新事件就以 `ErrStreamIdleTimeout` 中止。按「每次读」计时，慢但仍在输出的流不会被误杀；`Partial()` 保留已收内容，见[流式](streaming.md#看门狗流空闲超时) |
 | `WithMaxRetries(n)` | 2 | 可重试失败（网络错误、408/429/5xx/529）的重试次数，见[重试策略](protocols.md#重试策略) |
 | `WithRetryBase(d)` | 400ms | 退避基数（逐次翻倍 ±20%，上限 8s） |
 | `WithDefaultMaxOutputTokens(n)` | 无 | 请求未指定输出上限时的默认值 |
@@ -39,6 +40,15 @@ client, err := rosetta.NewClient(
 | `WithModelsFile(path)` | 无 | 从 JSON 文件加载模型元数据（与 `WithModelInfo` 合并进同一手动层） |
 | `WithEmbeddingEndpoint(url)` | 主 endpoint | Embed / Rerank 的独立基地址（chat 走主地址、embedding 走另一家时使用），见[嵌入与重排](#嵌入与重排) |
 | `WithEmbeddingAPIKey(key)` | 主 key | 嵌入端点的独立凭证 |
+| `WithHeader(k, v)` / `WithHeaders(h)` | 无 | 给每个请求加 header，同名覆盖 SDK 默认值。用于 Azure 的 `api-key`、OpenRouter 的 `HTTP-Referer`/`X-Title`、`traceparent` 透传 |
+| `WithBeta(flags...)` | 无 | 追加 Anthropic beta 标志，与 SDK 自动判定的（缓存 TTL、交错思考）逗号合并 |
+| `WithQueryParam(k, v)` | 无 | 给每个请求 URL 追加 query 参数（如 Azure 的 `api-version`）。endpoint 本身仍禁止带 query |
+| `WithPathPrefix(p)` | 无 | 给每个请求 URL 加路径前缀（Azure 的 `/openai`、反代的 `/llm`） |
+| `WithOrganization(id)` / `WithProject(id)` | 无 | OpenAI 系的 `OpenAI-Organization` / `OpenAI-Project` |
+| `WithUnknownEvents(v)` | false | 流式遇到未建模事件时发 `EventUnknown`（原始 SSE 在 `Event.Raw`），供网关透传；默认忽略以保持事件序列稳定 |
+| `WithTokenCounter(fn)` | 启发式 | 注入真实 tokenizer，用于上下文校验与 `Client.EstimateTokens`。SDK 不内置 tokenizer（零依赖） |
+| `WithHooks(h)` | 无 | 每次 HTTP 调用的 `OnRequest`/`OnResponse` 回调，带状态码、延迟、request-id；含重试与辅助 API |
+| `WithRequestIDFunc(fn)` | 无 | 给每个出站请求注入 `X-Request-Id`；显式 `WithHeader("X-Request-Id", ...)` 优先 |
 | `WithAnthropicBearerAuth(v)` | false | 额外发送 `Authorization: Bearer`（默认只发 `x-api-key`；仅认证方式只有 Bearer 的兼容网关需要） |
 | `WithExtraOverrides(v)` | false | 允许 `Extra` 覆盖 SDK 管理的负载字段（默认冲突即报 `ErrInvalidRequest`）。保留键按 API 族划分：chat（`model`/`messages`/`stream`/输出上限/采样/工具/thinking 等）、embeddings（`model`/`input`/`dimensions`/`user`/`encoding_format`）、rerank（`model`/`query`/`documents`/`top_n`/`return_documents`）——因此 `ChatRequest.Extra["user"]` 合法（chat 没有 user 字段），而 `EmbeddingRequest.Extra["user"]` 会被拒 |
 | `WithMultimediaTokenEstimates(e)` | 1500/500/3000 | 上下文检查中图片/音频/文档块的平估 token 数 |
@@ -46,7 +56,7 @@ client, err := rosetta.NewClient(
 
 ## 消息与内容块
 
-一条 `Message` 由角色 + 若干 `Block` 组成，七种块类型覆盖三协议的全部内容形态：
+一条 `Message` 由角色 + 若干 `Block` 组成，八种块类型覆盖三协议的全部内容形态：
 
 | BlockType | 有效字段 | 用途 |
 |---|---|---|
@@ -56,7 +66,8 @@ client, err := rosetta.NewClient(
 | `BlockFile` | `FileData`（base64、`data:` URL 或 http(s) URL）或 `FileID`，配 `FileName` / `MimeType` | 文档输入（PDF 等），见下 |
 | `BlockToolCall` | `ToolCallID` / `ToolName` / `Arguments`（JSON 字符串） | 模型请求调用工具 |
 | `BlockToolResult` | `ToolCallID` / `Content` / `IsError` | 工具结果回传 |
-| `BlockThinking` | `Thinking` / `Signature` | 思考内容（Signature 为 Anthropic 签名，回传时必须原样携带） |
+| `BlockThinking` | `Thinking` / `Signature` / `Sealed` / `SealedBy` / `ReasoningID` | 思考内容。`Signature` 是 Anthropic 签名，回传时必须原样携带；`Sealed` 存 OpenAI Responses 的 `encrypted_content` 等不透明载荷，配 `SealedBy` 只在同一协议族回放，用 `rosetta.SealedThinking(...)` 构造 |
+| `BlockRedactedThinking` | `Thinking`（不透明载荷） | Anthropic 服务端脱敏的推理块，回传时必须原样带回，载荷放在 `Thinking` 字段 |
 
 便捷构造函数覆盖常见场景：
 
@@ -72,7 +83,21 @@ rosetta.AssistantBlocks(                  // assistant 含工具调用/思考回
 	rosetta.Thinking("推理过程", "sig..."),
 )
 rosetta.ToolResult("call_1", "get_weather", "sunny 22C") // 工具结果（RoleTool）
+rosetta.SealedThinking("摘要", "opaque-payload", "openai-responses") // 密封推理回放
 ```
+
+其余公开构造函数：
+
+| 构造函数 | 用途 |
+|---|---|
+| `AudioContent(data, format)` | 独立音频块（`wav` / `mp3`），仅 OpenAI 系 |
+| `FileContent(name, mediaType, data)` | 内联文档块（base64 / data: URL / Anthropic 的 http(s) URL） |
+| `FileRef(name, fileID)` | 引用已上传的文件 id |
+| `Thinking(text, signature)` | Anthropic 签名思考块回放 |
+| `SealedThinking(summary, sealed, sealedBy)` | 不透明推理载荷回放（OpenAI Responses 的 `encrypted_content` 等） |
+| `EphemeralCache()` / `ExtendedCache()` | Anthropic 缓存断点（5 分钟 / 1 小时） |
+| `Float(v)` / `Bool(v)` | 取指针，用于 `Temperature` / `TopP` / `Strict` 等可选字段 |
+| `NewMemoryUsageTracker()` | 内存用量统计器，配 `WithUsageTracker` |
 
 回放轮若**只剩** thinking / redacted-thinking 块（协议无法回放，或 Anthropic 缺签名），请求构建期显式报 `ErrInvalidRequest` 并说明原因——不再退化成空 content 消息或整轮静默消失。
 
@@ -98,20 +123,61 @@ rosetta.ToolResult("call_1", "get_weather", "sunny 22C") // 工具结果（RoleT
 
 ```go
 type ChatRequest struct {
-	Model           string             // 必填
-	Messages        []Message          // 与 System 至少有一项
-	System          string             // 顶层系统提示
-	MaxOutputTokens int                // 0 = 依次回退：注册表元数据 → WithDefaultMaxOutputTokens；Anthropic 兜底 4096
-	Temperature     *float64           // 指针，nil = 不发送；用 rosetta.Float(0.7) 构造
-	TopP            *float64
-	StopSequences   []string           // Responses 协议不支持，会被丢弃并记日志
-	Tools           []ToolDefinition   // 仅透传，执行工具是你的事
-	Thinking        *ThinkingConfig    // nil = 协议默认（不思考）
-	Extra           map[string]any     // 逃生口：逐键合并进协议负载；与当前 API 的 SDK 管理字段冲突时报错（WithExtraOverrides 可放行）
+	Model              string           // 必填
+	Messages           []Message        // 与 System 至少有一项
+	System             string           // 顶层系统提示
+	MaxOutputTokens    int              // 0 = 依次回退：注册表元数据 → WithDefaultMaxOutputTokens；Anthropic 兜底 4096
+	Temperature        *float64         // 指针，nil = 不发送；用 rosetta.Float(0.7) 构造
+	TopP               *float64
+	Seed               *int             // 可复现采样（OpenAI 系）
+	PresencePenalty    *float64         // reasoning 请求下与 temperature 一同丢弃
+	FrequencyPenalty   *float64
+	TopK               *int             // 仅 Anthropic；thinking 模式下丢弃
+	Logprobs           *bool            // 原始载荷回填到 ChatResponse.Logprobs
+	TopLogprobs        *int
+	User               string           // OpenAI user / Anthropic metadata.user_id
+	ServiceTier        string           // "auto" / "default" / "flex" / "priority"
+	Store              *bool            // Responses：是否持久化
+	PreviousResponseID string           // Responses：续接已存储的对话
+	Verbosity          string           // Responses：text.verbosity
+	StopSequences      []string         // Responses 不支持，丢弃并记日志
+	ResponseFormat     *ResponseFormat  // 结构化输出，三协议映射
+	Tools              []ToolDefinition // 仅透传，执行工具是你的事
+	ToolChoice         *ToolChoice      // auto / none / required / tool
+	ParallelToolCalls  *bool            // ToolChoice.DisableParallel 优先
+	Thinking           *ThinkingConfig  // nil = 协议默认（不思考）
+	IdempotencyKey     string           // 空 = 每次随机；跨进程重试时传入稳定值
+	Extra              map[string]any   // 逃生口：逐键合并；与 SDK 管理字段冲突时报错（WithExtraOverrides 放行）
 }
 ```
 
-`ToolDefinition{Name, Description, Parameters json.RawMessage}` 的 Parameters 是 JSON Schema；省略时 SDK 补空对象。
+`ToolDefinition{Kind, Name, Description, Parameters, Strict, Config, CacheControl}`：
+
+- `Kind` 为空或 `"function"` 是普通函数工具；其它值（`web_search`、`file_search`、`code_interpreter`、`computer_use`、`mcp` 等）是服务端工具，`Config` 原样并入工具对象。
+- `Parameters` 是 JSON Schema，省略时 SDK 补空对象；`Strict` 请求上游严格校验 schema（Anthropic 无对应字段，忽略并记日志）。
+
+### 结构化输出
+
+```go
+strict := true
+req.ResponseFormat = &rosetta.ResponseFormat{
+	Type:   "json_schema",
+	Name:   "person",
+	Schema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}`),
+	Strict: &strict,
+}
+```
+
+映射：Chat 走 `response_format`，Responses 走 `text.format`，Anthropic 走 `output_config.format`。Anthropic 没有 `json_object` 模式，会返回 `ErrNotSupported`。
+
+### 工具控制
+
+```go
+req.ToolChoice = &rosetta.ToolChoice{Mode: rosetta.ToolChoiceRequired}
+req.ParallelToolCalls = rosetta.Bool(false)
+```
+
+`required` 会被翻译成 Anthropic 的 `any`；`DisableParallel` 在 Anthropic 上是 `tool_choice.disable_parallel_tool_use`。thinking 与强制工具冲突时本地报 `ErrInvalidRequest`。
 
 ## 工具调用往返
 
@@ -258,6 +324,40 @@ if errors.Is(err, rosetta.ErrUpstreamMalformed) {
 ### Retry-After：上游说的等待时间
 
 `APIError.RetryAfter` 透传上游 `Retry-After` 响应头（秒数或 HTTP-date，与 SDK 自身退避同一套解析，同样受 60s 上限保护；无该头时为 0）。它是**给调用方的提示**——冷却排期、向下游透传 `Retry-After` 响应头、或在别处退避——SDK 自己的重试循环已经遵守过它了。仅状态码类失败会有该字段；`InBand`（HTTP 200 信内错误）不携带。
+
+## 文件上传
+
+部分协议支持先上传再引用，避免每轮请求重复携带大块 base64。SDK 把两家的 Files API 统一成同一组方法：
+
+```go
+f, err := client.UploadFile(ctx, file, "report.pdf", "assistants")
+if err != nil {
+	return err
+}
+defer client.DeleteFile(ctx, f.ID)
+
+msg := rosetta.Message{Role: rosetta.RoleUser, Blocks: []rosetta.Block{
+	{Type: rosetta.BlockText, Text: "总结这份文档"},
+	rosetta.FileRef("report.pdf", f.ID),
+}}
+```
+
+- `UploadFile(ctx, io.Reader, filename, purpose)`：内存缓冲，上限 32 MiB。`purpose` 是 OpenAI 专用（`assistants` / `batch` / `vision` / `fine-tune`），Anthropic 忽略。
+- `ListFiles` / `GetFile` / `DeleteFile`。
+- OpenAI 走 `/files`；Anthropic 走 `/files` 并自动加 `files-api-2025-04-14` beta。
+- 返回的 `File` 把两家字段归一：OpenAI 的 `bytes` 与 Anthropic 的 `size_bytes` 都进 `Bytes`。
+
+## 精确 token 计数
+
+本地估算是启发式（CJK ≈1 token、ASCII ≈4 字符）。两种方式拿到更准的数字：
+
+```go
+// 1. 注入真实 tokenizer，影响上下文校验与 EstimateTokens
+client, _ := rosetta.NewClient(..., rosetta.WithTokenCounter(myTokenizer.Count))
+
+// 2. Anthropic 的原生端点（其他协议返回 ErrNotSupported）
+n, err := client.CountTokens(ctx, req)
+```
 
 ## 嵌入与重排
 

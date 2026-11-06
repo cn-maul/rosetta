@@ -1,5 +1,7 @@
 # rosetta SDK × magpie 对照分析与借鉴建议
 
+> **状态：已归档（基线 v1.0.1）。** 本文是早期对 magpie 的对照分析，可直接落地的结论已并入 v1.2/v1.3 的整改（错误分类字段、传输层防御、未知内容逃生口等）；未采纳的定位类建议见 `AUDIT-feature-gaps.md` 的 P2 决策表。保留作历史记录，不再更新。
+
 > 基线：rosetta SDK v1.0.1（`C:\Users\louis\Desktop\project\rosetta`）
 > 参考：magpie 0.1.1157（`C:\Users\louis\Downloads\magpie-0.1.1157`）
 > 姊妹篇：网关侧分析在 `rosetta-gateway/AUDIT/magpie-benchmark.md`，两份独立成立、互不依赖。

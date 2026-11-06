@@ -95,7 +95,21 @@ resp, err := stream.Collect()
 
 ## 看门狗：流空闲超时
 
-`WithTimeout` **只作用于非流式调用**；已建连的流没有字节间空闲上限，流生命周期只由调用方的 ctx 约束。因此空闲超时看门狗由调用方持有——SDK 提供的是把它做对所需的零件：
+`WithTimeout` **只作用于非流式调用**：一次合法的长生成不该被总时长掐断，所以流没有总预算。但上游长时间不给任何事件时必须兜底——这是**空闲**超时，不是总时长超时。
+
+**优先用内建选项** `WithStreamIdleTimeout`：
+
+```go
+client, err := rosetta.NewClient(
+	rosetta.WithEndpoint(baseURL),
+	rosetta.WithAPIKey(key),
+	rosetta.WithStreamIdleTimeout(30*time.Second),
+)
+```
+
+窗口按「每次读」计时：只要上游还在持续输出，慢流也不会被误杀；静默超过窗口即中止，`Err()` 匹配 `ErrStreamIdleTimeout`，已收到的内容仍在 `Partial()` 里。默认关闭（不同上游的合理静默上限差异很大）。
+
+只有需要自定义策略（按内容而非时间计时、多级退避、把原因映射成自己的错误）时才手写看门狗。此时**不要再同时启用** `WithStreamIdleTimeout`，否则两套计时会以不同语义竞争：
 
 ```go
 const idle = 30 * time.Second
