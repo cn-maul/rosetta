@@ -21,21 +21,7 @@ import (
 // (POST /v1/messages), including thinking budgets and their constraints.
 type anthropicProvider struct{ c *Client }
 
-const anthropicVersion = "2023-06-01"
-
-// extendedCacheTTLBeta gates Anthropic's 1-hour prompt-cache TTL: a request
-// carrying cache_control with ttl "1h" is rejected unless this beta header is
-// present.
-const extendedCacheTTLBeta = "extended-cache-ttl-2025-04-11"
-
-// interleavedThinkingBeta enables reasoning between tool calls inside a single
-// assistant turn. Per Anthropic's extended-thinking docs it is required on
-// Claude Opus 4.5 / Sonnet 4.5 and earlier Claude 4 models, is deprecated but
-// safely ignored on the adaptive-thinking models (Opus 4.6+ / Sonnet 5), and
-// is ignored on Haiku 4.5. The Claude API accepts it for any model without
-// erroring; Amazon Bedrock and Vertex AI reject it on models outside
-// Anthropic's whitelist, which is why WithInterleavedThinking(false) exists.
-const interleavedThinkingBeta = "interleaved-thinking-2025-05-14"
+const anthropicVersion = "2026-10-21"
 
 // maxCacheBreakpoints is Anthropic's hard limit on cache_control blocks per
 // request; exceeding it is a 400 upstream, so it is caught locally first.
@@ -59,45 +45,27 @@ func (p *anthropicProvider) headers(stream bool) http.Header {
 		}
 	}
 	h.Set("anthropic-version", anthropicVersion)
+	p.c.applyHeaders(h)
 	return h
 }
 
 // anthroPayloadScan is the result of a single pass over a built Anthropic
 // payload, producing the three facts the request path needs: whether a 1h
 // cache TTL is requested (extended-cache-ttl beta), whether extended
-// thinking is combined with tools (interleaved-thinking beta), and how many
-// cache_control breakpoints are present (the 4-breakpoint ceiling).
+// anthroPayloadScan is the result of a single pass over a built Anthropic
+// payload, producing the fact the request path needs: how many cache_control
+// breakpoints are present (the 4-breakpoint ceiling).
 type anthroPayloadScan struct {
-	needsExtendedTTL bool
-	needsInterleaved bool
-	breakpoints      int
+	breakpoints int
 }
 
-// scanAnthropicPayload walks a built payload once, collecting all three
-// facts in a single traversal instead of three separate recursive walks
-// (M3). It deliberately inspects the payload rather than the typed request:
-// breakpoints can arrive through Extra (WithExtraOverrides(true) writing
-// cache_control into tools/messages/system), and those are merged into the
-// payload only after the typed fields are rendered. Scanning the typed
-// request alone would let an Extra-supplied "1h" breakpoint reach the wire
-// without the beta header, which Anthropic answers with a 400.
+// scanAnthropicPayload walks a built payload once counting cache_control
+// breakpoints. It deliberately inspects the payload rather than the typed
+// request: breakpoints can arrive through Extra (WithExtraOverrides(true)
+// writing cache_control into tools/messages/system), and those are merged
+// into the payload only after the typed fields are rendered.
 func scanAnthropicPayload(v any) anthroPayloadScan {
 	var s anthroPayloadScan
-	// Interleaved thinking is a top-level property of the payload root:
-	// extended thinking combined with tools.
-	if m, ok := v.(map[string]any); ok {
-		if _, hasThinking := m["thinking"]; hasThinking {
-			switch tools := m["tools"].(type) {
-			case []map[string]any:
-				// How the builder types tool definitions.
-				s.needsInterleaved = len(tools) > 0
-			case []any:
-				// How a tool list injected through Extra arrives after the
-				// JSON round-trip that normalizes Extra values.
-				s.needsInterleaved = len(tools) > 0
-			}
-		}
-	}
 	var walk func(any)
 	walk = func(node any) {
 		switch t := node.(type) {
@@ -105,11 +73,6 @@ func scanAnthropicPayload(v any) anthroPayloadScan {
 			for k, val := range t {
 				if k == "cache_control" {
 					s.breakpoints++
-					if cc, ok := val.(map[string]any); ok {
-						if ttl, ok := cc["ttl"].(string); ok && ttl == "1h" {
-							s.needsExtendedTTL = true
-						}
-					}
 					continue
 				}
 				walk(val)
@@ -131,30 +94,12 @@ func scanAnthropicPayload(v any) anthroPayloadScan {
 	return s
 }
 
-// wantsInterleavedThinking resolves the tri-state WithInterleavedThinking
-// setting against the payload: an explicit choice wins, otherwise the payload
-// decides.
-func (p *anthropicProvider) wantsInterleavedThinking(needsInterleaved bool) bool {
-	if v := p.c.settings.interleavedThinking; v != nil {
-		return *v
-	}
-	return needsInterleaved
-}
-
 // betaHeaders returns the value for the anthropic-beta header, or "" when the
-// payload needs none. The values are joined with a comma instead of Set
-// individually because a second Set would overwrite the first: a request that
-// uses both a 1-hour cache TTL and interleaved thinking has to advertise both
-// betas or Anthropic rejects it for the one that went missing.
-func (p *anthropicProvider) betaHeaders(scan anthroPayloadScan) string {
-	var betas []string
-	if scan.needsExtendedTTL {
-		betas = append(betas, extendedCacheTTLBeta)
-	}
-	if p.wantsInterleavedThinking(scan.needsInterleaved) {
-		betas = append(betas, interleavedThinkingBeta)
-	}
-	return strings.Join(betas, ",")
+// caller supplied none. The 1-hour cache TTL and interleaved thinking that
+// this SDK used to auto-derive went GA in API version 2026-10-21 and no
+// longer need a beta header, so only explicit WithBeta values remain.
+func (p *anthropicProvider) betaHeaders() string {
+	return strings.Join(p.c.settings.betas, ",")
 }
 
 // anthroPlan is the per-request resolution of max_tokens and thinking
@@ -172,6 +117,11 @@ func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
 		pl.maxTokens = 4096
 	}
 	if req.Thinking == nil {
+		return pl
+	}
+	if req.Thinking.Adaptive {
+		// Adaptive thinking lets the model pick its own budget; no
+		// budget_tokens is sent, so the budget stays 0.
 		return pl
 	}
 	b := req.Thinking.BudgetTokens
@@ -206,6 +156,33 @@ func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
 // on this protocol alone.
 func (p *anthropicProvider) resolvedMaxOutput(req *ChatRequest) int {
 	return p.plan(req).maxTokens
+}
+
+// dropRemovedFields logs the sampling/sequence/tier fields that Anthropic
+// removed in API 2026-10-21 and that the adapter therefore leaves off the
+// wire. The unified ChatRequest still carries these for the OpenAI protocols,
+// so this is a per-protocol ignore rather than a request-level rejection.
+func (p *anthropicProvider) dropRemovedFields(req *ChatRequest) {
+	var dropped []string
+	if req.Temperature != nil {
+		dropped = append(dropped, "temperature")
+	}
+	if req.TopP != nil {
+		dropped = append(dropped, "top_p")
+	}
+	if req.TopK != nil {
+		dropped = append(dropped, "top_k")
+	}
+	if len(req.StopSequences) > 0 {
+		dropped = append(dropped, "stop_sequences")
+	}
+	if req.ServiceTier != "" {
+		dropped = append(dropped, "service_tier")
+	}
+	if len(dropped) > 0 {
+		p.c.settings.logger.Debug("anthropic: dropping fields removed in API 2026-10-21",
+			"fields", strings.Join(dropped, ","))
+	}
 }
 
 // rectify rewrites the budget once on a 400 error that cites thinking
@@ -244,51 +221,103 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 		payload["system"] = system
 	}
 	if req.Thinking != nil {
-		payload["thinking"] = map[string]any{
-			"type":          "enabled",
-			"budget_tokens": pl.budget,
-		}
-		// Thinking mode forbids sampling overrides; drop them quietly
-		// (the API would otherwise 400 on temperature != 1).
-		if req.Temperature != nil && *req.Temperature != 1 {
-			p.c.settings.logger.Debug("anthropic: dropping temperature in thinking mode")
-		}
-		if req.TopP != nil {
-			p.c.settings.logger.Debug("anthropic: dropping top_p in thinking mode")
-		}
-	} else {
-		if req.Temperature != nil {
-			payload["temperature"] = *req.Temperature
-		}
-		if req.TopP != nil {
-			payload["top_p"] = *req.TopP
+		if req.Thinking.Adaptive {
+			// Adaptive thinking: the model chooses its own budget.
+			payload["thinking"] = map[string]any{"type": "adaptive"}
+		} else {
+			payload["thinking"] = map[string]any{
+				"type":          "enabled",
+				"budget_tokens": pl.budget,
+			}
 		}
 	}
-	if len(req.StopSequences) > 0 {
-		payload["stop_sequences"] = req.StopSequences
+	// Anthropic removed temperature / top_p / top_k / stop_sequences /
+	// service_tier in API version 2026-10-21: sending any of them is a 400
+	// even at the default value. The unified request still carries them for
+	// the OpenAI protocols, so the Anthropic adapter drops them (with a
+	// debug note) rather than forwarding them.
+	p.dropRemovedFields(req)
+	if req.User != "" {
+		payload["metadata"] = map[string]any{"user_id": req.User}
 	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			if t.Kind != "" && t.Kind != "function" {
+				tool, err := serverToolWire(t)
+				if err != nil {
+					return nil, anthroPayloadScan{}, err
+				}
+				if cc := t.CacheControl.toWire(); cc != nil {
+					tool["cache_control"] = cc
+				}
+				tools = append(tools, tool)
+				continue
+			}
 			schema := t.Parameters
 			if len(schema) == 0 {
 				schema = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
-			tools = append(tools, map[string]any{
+			tool := map[string]any{
 				"name":         t.Name,
 				"description":  t.Description,
 				"input_schema": schema,
-			})
-			if cc := t.CacheControl.toWire(); cc != nil {
-				tools[len(tools)-1]["cache_control"] = cc
 			}
+			if t.Strict != nil {
+				// Anthropic has no per-tool strict flag: input_schema is
+				// advisory there. This is a capability difference, not
+				// content loss, so it is logged instead of rejected.
+				p.c.settings.logger.Debug("anthropic: tools[].strict has no wire field; ignoring", "tool", t.Name)
+			}
+			if cc := t.CacheControl.toWire(); cc != nil {
+				tool["cache_control"] = cc
+			}
+			tools = append(tools, tool)
 		}
 		payload["tools"] = tools
+	}
+	if tc := req.ToolChoice; tc != nil {
+		// Anthropic spells "required" as "any"; sending OpenAI's word
+		// verbatim is a 400.
+		wire := map[string]any{}
+		switch tc.Mode {
+		case ToolChoiceAuto:
+			wire["type"] = "auto"
+		case ToolChoiceNone:
+			wire["type"] = "none"
+		case ToolChoiceRequired:
+			wire["type"] = "any"
+		case ToolChoiceTool:
+			wire["type"] = "tool"
+			wire["name"] = tc.Name
+		}
+		if parallel, ok := parallelToolCalls(req); ok {
+			wire["disable_parallel_tool_use"] = !parallel
+		}
+		// Anthropic rejects extended thinking when tool_choice forces a
+		// tool, so surface the conflict locally instead of as a 400.
+		if req.Thinking != nil && (tc.Mode == ToolChoiceRequired || tc.Mode == ToolChoiceTool) {
+			return nil, anthroPayloadScan{}, fmt.Errorf("%w: anthropic does not allow extended thinking with a forced tool choice; drop Thinking or use auto", ErrInvalidRequest)
+		}
+		payload["tool_choice"] = wire
+	}
+	if rf := req.ResponseFormat; rf != nil {
+		switch rf.Type {
+		case "json_schema":
+			// Anthropic's structured output rides output_config.format.
+			// The schema is native; name and strict have no wire field.
+			payload["output_config"] = map[string]any{
+				"format": map[string]any{"type": "json_schema", "schema": rf.Schema},
+			}
+		case "json_object":
+			// No native equivalent: Anthropic only offers json_schema.
+			return nil, anthroPayloadScan{}, fmt.Errorf("%w: anthropic has no json_object response format; use json_schema", ErrNotSupported)
+		}
 	}
 	if stream {
 		payload["stream"] = true
 	}
-	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, anthropicReservedPayloadKeys); err != nil {
+	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.extraOverrides, anthropicReservedPayloadKeys); err != nil {
 		return nil, anthroPayloadScan{}, err
 	}
 	scan := scanAnthropicPayload(payload)
@@ -383,6 +412,12 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 			case BlockAudio:
 				return nil, nil, fmt.Errorf("%w: anthropic does not support audio input", ErrInvalidRequest)
 			case BlockFile:
+				// API 2026-10-21 rejects a document block placed directly in an
+				// assistant message (documents belong in user messages). Surface
+				// it locally instead of waiting for the upstream 400.
+				if m.role == "assistant" {
+					return nil, nil, fmt.Errorf("%w: anthropic does not allow a document block in an assistant message; move it to a user turn", ErrInvalidRequest)
+				}
 				doc, err := encodeAnthropicDocument(b)
 				if err != nil {
 					return nil, nil, err
@@ -393,7 +428,26 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 				tr := map[string]any{
 					"type":        "tool_result",
 					"tool_use_id": b.ToolCallID,
-					"content":     b.Content,
+				}
+				if len(b.ResultBlocks) > 0 {
+					// Multi-part tool output: text plus images, the shape
+					// computer-use screenshots use.
+					parts := make([]map[string]any, 0, len(b.ResultBlocks))
+					for _, rb := range b.ResultBlocks {
+						switch rb.Type {
+						case BlockText:
+							parts = append(parts, map[string]any{"type": "text", "text": rb.Text})
+						case BlockImage:
+							src, err := encodeAnthropicImage(rb.ImageURL)
+							if err != nil {
+								return nil, nil, err
+							}
+							parts = append(parts, map[string]any{"type": "image", "source": src})
+						}
+					}
+					tr["content"] = parts
+				} else {
+					tr["content"] = b.Content
 				}
 				if b.IsError {
 					tr["is_error"] = true
@@ -571,6 +625,9 @@ func encodeAnthropicDocument(b Block) (map[string]any, error) {
 	if b.FileName != "" {
 		doc["title"] = b.FileName
 	}
+	if b.Citations != nil {
+		doc["citations"] = map[string]any{"enabled": *b.Citations}
+	}
 	return doc, nil
 }
 
@@ -604,25 +661,22 @@ func parseToolInput(args string) map[string]any {
 // Chat performs a non-streaming completion.
 func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(p.c.settings.endpoint, "/messages")
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/messages"))
 	pl := p.plan(req)
 	for {
-		payload, scan, err := p.buildPayload(req, false, pl)
+		payload, _, err := p.buildPayload(req, false, pl)
 		if err != nil {
 			return nil, err
 		}
-		// Headers are derived from the payload that is about to be sent, so
-		// breakpoints and thinking configs contributed by Extra are seen by
-		// the beta switch too.
 		hdr := p.headers(false)
-		if beta := p.betaHeaders(scan); beta != "" {
+		if beta := p.betaHeaders(); beta != "" {
 			hdr.Set("anthropic-beta", beta)
 		}
 		retry := httpx.RetryIdempotent
 		if p.c.settings.quirks.NoIdempotencyKey {
 			retry = httpx.RetryDefault
 		} else {
-			hdr.Set("Idempotency-Key", newIdempotencyKey())
+			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
 			Method:      method,
@@ -631,7 +685,7 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 			Body:        func() ([]byte, error) { return json.Marshal(payload) },
 			RetryPolicy: retry,
 		}
-		resp, err := p.c.http.Do(ctx, call)
+		resp, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
@@ -655,23 +709,23 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 // StreamChat starts a streaming completion.
 func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stream, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(p.c.settings.endpoint, "/messages")
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/messages"))
 	pl := p.plan(req)
 	var resp *http.Response
 	for {
-		payload, scan, err := p.buildPayload(req, true, pl)
+		payload, _, err := p.buildPayload(req, true, pl)
 		if err != nil {
 			return nil, err
 		}
 		hdr := p.headers(true)
-		if beta := p.betaHeaders(scan); beta != "" {
+		if beta := p.betaHeaders(); beta != "" {
 			hdr.Set("anthropic-beta", beta)
 		}
 		retry := httpx.RetryIdempotent
 		if p.c.settings.quirks.NoIdempotencyKey {
 			retry = httpx.RetryDefault
 		} else {
-			hdr.Set("Idempotency-Key", newIdempotencyKey())
+			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
 			Method:      method,
@@ -680,7 +734,7 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 			Body:        func() ([]byte, error) { return json.Marshal(payload) },
 			RetryPolicy: retry,
 		}
-		r, err := p.c.http.Do(ctx, call)
+		r, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
@@ -769,6 +823,9 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 			}
 			ssev, err := sc.Next()
 			if err != nil {
+				if errors.Is(err, sse.ErrTooLarge) {
+					return nil, fmt.Errorf("%w: %v", ErrStreamOverflow, err)
+				}
 				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
 				// covers a real HTTP truncation (chunked stream cut before the
 				// final zero chunk, gateway timeout).
@@ -836,13 +893,30 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 					}
 				}
 			case "content_block_start":
-				if ch.ContentBlock != nil && ch.ContentBlock.Type == "tool_use" {
+				if ch.ContentBlock == nil {
+					continue
+				}
+				switch ch.ContentBlock.Type {
+				case "tool_use":
 					return &Event{
 						Type:      EventToolCall,
 						ToolIndex: ch.Index,
 						ToolID:    ch.ContentBlock.ID,
 						ToolName:  ch.ContentBlock.Name,
 					}, nil
+				case "redacted_thinking":
+					// redacted_thinking has no delta stream: the full opaque
+					// payload arrives in content_block_start and must be
+					// surfaceable so a later turn can replay it. The unary
+					// decoder already kept it; the streaming path used to
+					// drop the whole block.
+					if ch.ContentBlock.Data != "" {
+						return &Event{
+							Type:       EventRedactedThinkingDelta,
+							Text:       ch.ContentBlock.Data,
+							BlockIndex: ch.Index,
+						}, nil
+					}
 				}
 			case "content_block_delta":
 				if ch.Delta == nil {
@@ -901,9 +975,62 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 					ended = true
 					return endEvent(), nil
 				}
+			default:
+				if p.c.settings.unknownEvents {
+					return &Event{Type: EventUnknown, Raw: append(json.RawMessage(nil), data...)}, nil
+				}
+				// Unknown event types are ignored by default; enabling
+				// WithUnknownEvents surfaces them verbatim instead.
 			}
 		}
 	}
+}
+
+// CountTokens asks Anthropic for the exact prompt token count
+// (POST /v1/messages/count_tokens). It is the authoritative alternative to
+// the local heuristic for models where the tokenizer is not available.
+func (p *anthropicProvider) CountTokens(ctx context.Context, req *ChatRequest) (int, error) {
+	const method = http.MethodPost
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/messages/count_tokens"))
+	pl := p.plan(req)
+	payload, _, err := p.buildPayload(req, false, pl)
+	if err != nil {
+		return 0, err
+	}
+	// The endpoint takes the Messages body but max_tokens and stream are
+	// meaningless there; some gateways reject them.
+	delete(payload, "max_tokens")
+	delete(payload, "stream")
+	hdr := p.headers(false)
+	if beta := p.betaHeaders(); beta != "" {
+		hdr.Set("anthropic-beta", beta)
+	}
+	hdr.Set("Idempotency-Key", idempotencyKey(req))
+	call := &httpx.Call{
+		Method:      method,
+		URL:         url,
+		Header:      hdr,
+		Body:        func() ([]byte, error) { return json.Marshal(payload) },
+		RetryPolicy: httpx.RetryIdempotent,
+	}
+	resp, err := p.c.call(ctx, call)
+	if err != nil {
+		return 0, transport(err, method, url)
+	}
+	body, rerr := readBody(resp, method, url, bodyLimit)
+	if rerr != nil {
+		return 0, rerr
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, withRetryAfter(parseAnthropicError(resp.StatusCode, body, method, url, requestID(resp.Header)), resp.Header)
+	}
+	var out struct {
+		InputTokens jsonx.FlexInt64 `json:"input_tokens"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, fmt.Errorf("%w: count_tokens response: %w", ErrUpstreamMalformed, err)
+	}
+	return int(out.InputTokens.Value), nil
 }
 
 // ListModels queries GET /v1/models, following the has_more/after_id
@@ -911,7 +1038,7 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 // carry no capability metadata.
 func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	const method = http.MethodGet
-	base := joinEndpoint(p.c.settings.endpoint, "/models")
+	base := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/models"))
 	parsed, err := url.Parse(base)
 	if err != nil {
 		return nil, fmt.Errorf("rosetta: invalid endpoint %q: %w", displayEndpoint(base), err)
@@ -929,7 +1056,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		parsed.RawQuery = q.Encode()
 		pageURL := parsed.String()
 		call := &httpx.Call{Method: method, URL: pageURL, Header: p.headers(false)}
-		resp, err := p.c.http.Do(ctx, call)
+		resp, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, pageURL)
 		}
@@ -1007,6 +1134,12 @@ type anthroUsage struct {
 	OutputTokens             jsonx.FlexInt64 `json:"output_tokens"`
 	CacheReadInputTokens     jsonx.FlexInt64 `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens jsonx.FlexInt64 `json:"cache_creation_input_tokens"`
+	// CacheCreation splits the write count by TTL tier. Present on newer
+	// API versions; absent fields stay zero.
+	CacheCreation *struct {
+		Ephemeral5mInputTokens jsonx.FlexInt64 `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1hInputTokens jsonx.FlexInt64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
 }
 
 func (u *anthroUsage) toUsage() Usage {
@@ -1017,13 +1150,18 @@ func (u *anthroUsage) toUsage() Usage {
 	cached := u.CacheReadInputTokens.Value
 	creation := u.CacheCreationInputTokens.Value
 	input := u.InputTokens.Value + cached + creation
-	return Usage{
+	out := Usage{
 		InputTokens:          input,
 		OutputTokens:         u.OutputTokens.Value,
 		TotalTokens:          input + u.OutputTokens.Value,
 		CachedInputTokens:    cached,
 		CachedCreationTokens: creation,
 	}
+	if u.CacheCreation != nil {
+		out.CacheCreation5mTokens = u.CacheCreation.Ephemeral5mInputTokens.Value
+		out.CacheCreation1hTokens = u.CacheCreation.Ephemeral1hInputTokens.Value
+	}
+	return out
 }
 
 type anthroErrorBody struct {
@@ -1050,6 +1188,10 @@ type anthroChunk struct {
 		Type string `json:"type"`
 		ID   string `json:"id"`
 		Name string `json:"name"`
+		// Data carries the opaque payload of a redacted_thinking block.
+		// It has no streaming delta of its own: the whole block arrives in
+		// content_block_start, so dropping this field loses it entirely.
+		Data string `json:"data"`
 	} `json:"content_block"`
 	Delta *struct {
 		Type        string  `json:"type"`
@@ -1122,7 +1264,15 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 				Arguments:  string(blk.Input),
 			})
 		default:
-			// unknown content types are skipped
+			// Server tool use/results (server_tool_use,
+			// web_search_tool_result, ...) and any future block type are
+			// preserved instead of skipped, so a gateway can forward them.
+			if raw, err := json.Marshal(blk); err == nil {
+				out.Unknown = append(out.Unknown, Block{
+					Type: BlockType("unknown:" + blk.Type),
+					Raw:  raw,
+				})
+			}
 		}
 	}
 	switch {

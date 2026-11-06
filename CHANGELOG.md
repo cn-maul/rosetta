@@ -1,6 +1,85 @@
 # 更新日志
 
-## v1.2.0 (未发布)
+## v1.3.0 (未发布)
+
+能力面从「三协议最小公共子集」推进到可支撑结构化输出与 Agent 工具链路，并补齐了
+生产接入所需的观测与扩展点。Go 层 API 全部向后兼容，仅 Anthropic 适配器的出站行为
+跟随上游版本变化（见下方「破坏性变更」）。
+
+### 破坏性变更
+
+- **Anthropic 对齐 `2026-10-21` 版本**：`anthropic-version` 从 `2023-06-01` 升级到最新版。
+  新版移除了 `temperature` / `top_p` / `top_k` / `stop_sequences` / `service_tier` 五个请求
+  参数（传了直接 400），Anthropic 适配器因此不再发送它们——统一请求上的同名字段保留不变，
+  但走 `ProtoAnthropic` 时这些采样设置将不再生效（以 debug 日志提示）。
+- 未使用 Anthropic 协议的调用方不受影响。若需要沿用旧的采样语义，可固定到 v1.2.x。
+
+### 新增
+
+- **`ChatRequest.ResponseFormat`**：`text` / `json_object` / `json_schema` 三态，按协议映射到 Chat 的
+  `response_format`、Responses 的 `text.format`、Anthropic 的 `output_config.format`。Anthropic
+  没有 `json_object`，显式返回 `ErrNotSupported`。
+- **`ChatRequest.ToolChoice` / `ParallelToolCalls` / `ToolDefinition.Strict`**：工具选择与并行开关有了
+  类型面。`required` 映射为 Anthropic 的 `any`；thinking 与强制工具冲突在本地报
+  `ErrInvalidRequest`，不再等上游 400。
+- **`ToolDefinition.Kind` / `Config`**：服务端内置工具（`web_search`、`file_search`、
+  `code_interpreter`、`computer_use`、`mcp` 等）可以直接表达，`Config` 原样并入工具对象。
+  `Extra["tools"]` 从「整体拒绝」改为逐条追加。
+- **`ChatResponse.Unknown` / `Block.Raw` / `EventUnknown` / `WithUnknownEvents`**：未建模的输出项
+  与流式事件不再静默丢弃；`Raw` 保留上游原始 JSON，供网关透传。默认行为不变。
+- **请求扩展点**：`WithHeader` / `WithHeaders` / `WithBeta` / `WithQueryParam` / `WithPathPrefix` /
+  `WithOrganization` / `WithProject`。Azure OpenAI（`api-key` + `api-version` + 路径）、OpenRouter
+  归因头、`traceparent` 透传都能直接配置。
+- **`ThinkingConfig.Summary` / `Include`**：Responses 的 `reasoning.summary` 与
+  `include:["reasoning.encrypted_content"]` 不再需要重写整个 `reasoning` 对象。
+- **采样参数与响应元数据**：`Seed`、`TopK`、`PresencePenalty`、`FrequencyPenalty`、`Logprobs`、
+  `TopLogprobs`、`User`、`ServiceTier`、`Store`、`PreviousResponseID`、`Verbosity`；
+  `ChatResponse` 补 `SystemFingerprint` / `ServiceTier` / `Logprobs`。
+- **多模态可控性**：`Block.ImageDetail`（OpenAI 的 `detail`）、`Block.ResultBlocks`
+  （Anthropic 多段 tool_result，computer use 截图的标准写法）、`Block.Citations`
+  （Anthropic document citations）。
+- **usage 字段**：audio / prediction / Anthropic 5m·1h 缓存拆分 / DeepSeek 前缀缓存命中与未命中 /
+  OpenAI `cache_write_tokens`（映射为 `CachedCreationTokens`）与 `cache_write_tokens_details` 的
+  30m·12h TTL 拆分（`CacheCreation30mTokens` / `CacheCreation12hTokens`），`UsageTracker` 聚合同步扩展。
+- **OpenAI 缓存控制**：`ChatRequest.PromptCacheKey` 与 `PromptCacheOptions`（`ttl` / `mode`），
+  映射到 Chat 与 Responses 的 `prompt_cache_key` / `prompt_cache_options`；`Block.PromptCacheBreakpoint`
+  在内容块上打显式缓存断点（`prompt_cache_breakpoint`，Anthropic `CacheControl` 的 OpenAI 对等能力）。
+- **Anthropic 自适应思考**：`ThinkingConfig.Adaptive`（`type: adaptive`），由模型自行决定思考
+  预算；移除已 GA 的 `extended-cache-ttl` / `interleaved-thinking` beta 头自动发送
+  （`WithInterleavedThinking` 保留为 no-op 以兼容旧代码）；新增「assistant 消息里不得直接放
+  document 块」的本地校验，提前报错而不是等上游 400。
+- **可观测性**：`UsageRecord` 增加 `Latency` / `Attempts` / `StatusCode` / `RequestID` / `Err`；
+  `WithHooks` 观测每次 HTTP 调用（含重试与辅助 API），`WithRequestIDFunc` 注入 `X-Request-Id`。
+- **精确 token 计数**：`WithTokenCounter` 注入真实 tokenizer（影响上下文校验与
+  `Client.EstimateTokens`）；`Client.CountTokens` 接 Anthropic `/v1/messages/count_tokens`，
+  其他协议返回 `ErrNotSupported`。
+- **Files API**：`UploadFile` / `ListFiles` / `GetFile` / `DeleteFile`，OpenAI 与 Anthropic 统一，
+  Anthropic 自动带 `files-api-2025-04-14` beta，返回的 `File` 归一两家字段。
+- **`ChatRequest.IdempotencyKey`**：跨进程重试可以复用稳定 key。
+- **`ErrResponseTooLarge`**：外部可分类的响应体超限哨兵；SSE 超限映射到 `ErrStreamOverflow`。
+- **治理与示例**：`SECURITY.md`、`CONTRIBUTING.md`、`docs/stability.md`、`Makefile`、release
+  workflow、4 个可运行的 godoc 示例；CI 扩到三平台矩阵并增加 govulncheck 与模块卫生检查。
+
+### 修复
+
+- **Responses 非流式丢弃拒答**：`refusal` 输出项与 message 内的 refusal part 现在都会被保留。
+- **Anthropic 流式丢弃 `redacted_thinking`**：新增 `EventRedactedThinkingDelta`，累积为
+  `BlockRedactedThinking`，`Partial()`/`Collect()` 可原样回放。
+- **Chat `n>1` 静默只回第一条**：请求侧直接拒绝，不再产生「按 n 计费只回一条」的账单陷阱。
+- **文档反向指路**：`WithStreamIdleTimeout` 在指南、流式文档、CHANGELOG、godoc 与接口注释中
+  被一致地描述为已内建；Rerank godoc 不再声称兼容 Voyage/DashScope。
+
+## v1.2.1 (2026-11-06)
+
+补丁版本，仅含一项修复：
+
+- **无密封载荷的 Responses reasoning 仍会回放**：部分 Responses 兼容上游只返回可读 summary
+  和 item id、不返回 `encrypted_content`，但下一轮仍要求把 reasoning item 带回；此前编码器
+  因 `Sealed == ""` 整块丢弃，第二轮会报 `The reasoning_content in the thinking mode must be
+  passed back to the API`。现在 summary/id 与密封载荷可独立回放，空的
+  `encrypted_content` 不再写出。
+
+## v1.2.0 (2026-11-06)
 
 Responses 流式路径现在保留 reasoning item 的 `encrypted_content`，多轮 reasoning 对话在流式
 路径下不再断裂。同时修正了三个相关的块归属与回放顺序缺陷。
@@ -17,11 +96,6 @@ Responses 流式路径现在保留 reasoning item 的 `encrypted_content`，多�
 
 ### 修复
 
-- **无密封载荷的 Responses reasoning 仍会回放**：部分 Responses 兼容上游只返回
-  可读 summary 和 item id、不返回 `encrypted_content`，但下一轮仍要求把 reasoning
-  item 带回；此前编码器因 `Sealed == ""` 整块丢弃，第二轮会报
-  `The reasoning_content in the thinking mode must be passed back to the API`。
-  现在 summary/id 与密封载荷可独立回放，空的 `encrypted_content` 不再写出。
 - **流式 Responses 保留 sealed reasoning**：`response.output_item.done` 与终结
   `response.completed` 里的 reasoning item 现在会被折叠进 `Partial()` / `Collect()`。
   此前 `output_item.done` 的类型 switch 只处理 `function_call` 与 `message`，reasoning
@@ -149,8 +223,10 @@ Responses 流式路径现在保留 reasoning item 的 `encrypted_content`，多�
   已因自身错误结束，**迟到的 `Abort` 是空操作**——不会把干净结束误报成超时。
   `Abort(nil)` 退化为 `ErrStreamAborted`。
 
-  SDK 仍**不内建**空闲计时器（`WithTimeout` 依旧只约束非流式调用）：不同上游合理静默
-  上限差异很大，计时策略属于调用方。官方范式见 `docs/streaming.md` 的「看门狗」一节。
+  SDK 同时提供内建的空闲看门狗 `WithStreamIdleTimeout`（默认关闭）：`WithTimeout`
+  仍只约束非流式调用，而该选项按每次读计时，上游静默超过窗口即以
+  `ErrStreamIdleTimeout` 中止。需要自定义计时策略时仍可用 `Abort` 手写看门狗，
+  见 `docs/streaming.md` 的「看门狗」一节。
 
 - **`APIError.Category`（`ErrorCategory`）与 `AffectsModel`**：错误归因提示，免去每个
   调用方重新解析 provider 错误体。

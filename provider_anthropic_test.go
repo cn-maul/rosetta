@@ -76,8 +76,16 @@ func TestAnthropicBuildPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pl["max_tokens"] != 4096 || pl["temperature"] != 0.5 || pl["stop_sequences"] == nil {
+	if pl["max_tokens"] != 4096 {
 		t.Fatalf("payload = %v", pl)
+	}
+	// temperature / stop_sequences were removed in API 2026-10-21 and must
+	// not reach the wire.
+	if _, has := pl["temperature"]; has {
+		t.Fatal("temperature must be omitted (removed in 2026-10-21)")
+	}
+	if _, has := pl["stop_sequences"]; has {
+		t.Fatal("stop_sequences must be omitted (removed in 2026-10-21)")
 	}
 	if _, has := pl["thinking"]; has {
 		t.Fatal("thinking must be absent when not requested")
@@ -118,6 +126,38 @@ func TestAnthropicBuildPayload(t *testing.T) {
 	}
 	if pl["system"] != "be nice\n\nalso this" {
 		t.Fatalf("system = %v", pl["system"])
+	}
+}
+
+func TestAnthropicAdaptiveThinking(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+	req := &ChatRequest{Model: "m", Messages: []Message{User("hi")},
+		Thinking: &ThinkingConfig{Adaptive: true}}
+	pl, _, err := p.buildPayload(req, false, p.plan(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	th := pl["thinking"].(map[string]any)
+	if th["type"] != "adaptive" {
+		t.Fatalf("adaptive thinking = %v", th)
+	}
+	if _, has := th["budget_tokens"]; has {
+		t.Fatal("adaptive mode must not send budget_tokens")
+	}
+}
+
+// API 2026-10-21 rejects a document block placed directly in an assistant
+// message; the adapter surfaces it locally instead of as an upstream 400.
+func TestAnthropicDocumentInAssistantRejected(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+	req := &ChatRequest{Model: "m", Messages: []Message{
+		User("hi"),
+		{Role: RoleAssistant, Blocks: []Block{{Type: BlockFile, FileName: "d.pdf", FileData: "AAAA"}}},
+	}}
+	if _, _, err := p.buildPayload(req, false, p.plan(req)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("document in assistant message must error, got %v", err)
 	}
 }
 
@@ -470,5 +510,58 @@ func TestAnthropicInBandErrorKeepsRequestContext(t *testing.T) {
 	}
 	if apiErr.Method != "POST" || apiErr.URL == "" || apiErr.RequestID != "req-1" {
 		t.Fatalf("in-band error lost request context: %+v", apiErr)
+	}
+}
+
+// RG-05b: redacted_thinking arrives whole in content_block_start (it has no
+// delta stream). The streaming path used to accept only tool_use and drop
+// the block, so a multi-turn thinking conversation lost the opaque state
+// the unary path already preserved. This covers both the raw event and the
+// accumulated block that Partial/Collect hands back for replay.
+func TestAnthropicStreamRedactedThinking(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+
+	body := "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"OPAQUE\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+	next := p.streamEvents(tBody(body))
+	ev, err := next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Type != EventRedactedThinkingDelta || ev.Text != "OPAQUE" || ev.BlockIndex != 1 {
+		t.Fatalf("event = %+v, want a redacted-thinking delta", ev)
+	}
+
+	// The block must materialize as BlockRedactedThinking, not
+	// BlockThinking: a thinking block without a signature is dropped on
+	// replay, which would silently lose the payload.
+	st := newStream(p.streamEvents(tBody(body)), nil)
+	resp, err := st.Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Content) != 1 || resp.Content[0].Type != BlockRedactedThinking || resp.Content[0].Thinking != "OPAQUE" {
+		t.Fatalf("collected content = %+v, want one redacted_thinking block", resp.Content)
+	}
+
+	// And the collected block must replay as redacted_thinking on the wire.
+	req := &ChatRequest{
+		Model: "claude-sonnet-4-5",
+		Messages: []Message{
+			User("hi"),
+			{Role: RoleAssistant, Blocks: resp.Content},
+		},
+	}
+	pl, _, err := p.buildPayload(req, false, p.plan(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := pl["messages"].([]map[string]any)
+	content := msgs[1]["content"].([]map[string]any)
+	if content[0]["type"] != "redacted_thinking" || content[0]["data"] != "OPAQUE" {
+		t.Fatalf("replayed block = %v", content[0])
 	}
 }

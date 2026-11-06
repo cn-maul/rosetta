@@ -2,6 +2,7 @@ package rosetta
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,14 +19,28 @@ const (
 	EventMessageStart  EventType = "message_start"
 	EventTextDelta     EventType = "text_delta"
 	EventThinkingDelta EventType = "thinking_delta"
-	EventToolCall      EventType = "tool_call" // incremental tool-call fragment
-	EventMessageEnd    EventType = "message_end"
+	// EventRedactedThinkingDelta carries Anthropic's opaque
+	// `redacted_thinking` payload in Text. It is a distinct type, not a
+	// thinking delta, because the two accumulate into different block
+	// kinds: a thinking block needs a signature to be replayed, while a
+	// redacted block must be replayed verbatim as `redacted_thinking`.
+	// Folding the payload into EventThinkingDelta would make the
+	// accumulated block unreplayable.
+	EventRedactedThinkingDelta EventType = "redacted_thinking_delta"
+	EventToolCall              EventType = "tool_call" // incremental tool-call fragment
+	EventMessageEnd            EventType = "message_end"
+	// EventUnknown carries a provider event the SDK does not model. It is
+	// emitted only when WithUnknownEvents is enabled, and its Raw field
+	// holds the original SSE data verbatim.
+	EventUnknown EventType = "unknown"
 )
 
 // Event is one unified streaming event. Meaningful fields depend on Type:
 //
 //   - EventMessageStart: ID, Model
 //   - EventTextDelta / EventThinkingDelta: Text
+//   - EventRedactedThinkingDelta: Text carries the opaque payload; it
+//     accumulates into a redacted_thinking block, not a thinking block
 //   - EventToolCall: ToolIndex, ToolID, ToolName, ArgumentsDelta (fragments
 //     concatenate into a complete JSON arguments string)
 //   - EventMessageEnd: StopReason, Usage
@@ -61,6 +76,11 @@ type Event struct {
 	ArgumentsDelta string
 	Usage          *Usage
 	StopReason     StopReason
+	// Raw is the provider's original SSE data, populated on EventUnknown
+	// (WithUnknownEvents). Known events keep their typed fields instead;
+	// this is the escape hatch for event types added upstream after this
+	// release, so a gateway can forward them unchanged.
+	Raw json.RawMessage
 }
 
 // Stream is a pull-based iterator over unified stream events. Next must
@@ -79,18 +99,19 @@ type Event struct {
 //	}
 //	if err := stream.Err(); err != nil { return err }
 //
-// # Watchdog timeouts
+// # Idle timeouts
 //
-// The SDK applies no timeout to an established stream (WithTimeout is
-// unary-only); a stalled provider would block Next forever. The supported
-// pattern is a watchdog goroutine that aborts the stream after an idle
-// interval:
+// WithTimeout is unary-only: it bounds a unary call's total duration, never a
+// stream's — a legitimately long generation must not be cut. What a stream
+// needs instead is an inactivity bound: a silent provider would otherwise
+// block Next forever. Enable the built-in watchdog with
+// WithStreamIdleTimeout, which aborts with ErrStreamIdleTimeout when no
+// event arrives within the window:
 //
-//	st, _ := client.ChatStream(ctx, req)
-//	watch := time.AfterFunc(30*time.Second, func() { st.Abort(rosetta.ErrStreamIdleTimeout) })
-//	defer watch.Stop()
-//	// reset the timer on every delivered event, e.g. inside the Next loop:
-//	//   watch.Reset(30*time.Second)
+//	client, _ := rosetta.NewClient(..., rosetta.WithStreamIdleTimeout(30*time.Second))
+//
+// A caller-side watchdog calling Abort is the escape hatch for a custom
+// policy; do not run both, since the two would time out on different rules.
 //
 // Abort differs from Close in one decisive way: Close is the caller walking
 // away (Err stays nil, usage is not recorded); Abort records why the stream
@@ -127,6 +148,10 @@ type Stream interface {
 	// stream is a no-op.
 	Abort(cause error)
 }
+
+// Compile-time contract check: the concrete stream must keep satisfying the
+// public interface, including after method-set changes.
+var _ Stream = (*streamCore)(nil)
 
 // streamCore is the shared Stream implementation. Protocol adapters supply
 // a next func producing unified events; this type accumulates the partial
@@ -231,7 +256,7 @@ func bufferedStream(cr *ChatResponse) Stream {
 				BlockIndex: i,
 			})
 		case BlockRedactedThinking:
-			events = append(events, &Event{Type: EventThinkingDelta, Text: b.Thinking, BlockIndex: i})
+			events = append(events, &Event{Type: EventRedactedThinkingDelta, Text: b.Thinking, BlockIndex: i})
 		case BlockToolCall:
 			events = append(events, &Event{Type: EventToolCall, ToolID: b.ToolCallID, ToolName: b.ToolName, ArgumentsDelta: b.Arguments, ToolIndex: i})
 		}
@@ -584,6 +609,19 @@ func (s *streamCore) apply(ev *Event) {
 			}
 			s.contentDirty = true
 		}
+	case EventRedactedThinkingDelta:
+		// Accumulates into a redacted_thinking block so Partial()/Collect()
+		// can replay it verbatim on the next turn. Anthropic's
+		// redacted_thinking payload has no signature and must not be
+		// mistaken for a thinking block (which the encoder drops when
+		// unsigned).
+		if b := s.blockFor(&s.thinkPos, ev.BlockIndex, BlockRedactedThinking, len(ev.Text)); b != nil {
+			b.thinking.WriteString(ev.Text)
+			if ev.OutputIndex != nil {
+				b.setOrder(*ev.OutputIndex)
+			}
+			s.contentDirty = true
+		}
 	case EventToolCall:
 		if b := s.blockFor(&s.toolPos, ev.ToolIndex, BlockToolCall, len(ev.ArgumentsDelta)); b != nil {
 			if ev.ToolID != "" {
@@ -726,6 +764,10 @@ func (s *streamCore) buildContent() []Block {
 		case BlockThinking:
 			out[i] = Block{Type: BlockThinking, Thinking: b.thinking.String(),
 				Signature: b.signature, Sealed: b.sealed, SealedBy: b.sealedBy, ReasoningID: b.reasoningID}
+		case BlockRedactedThinking:
+			// The payload rides in Thinking, matching the unary decoder and
+			// what Block.validate expects.
+			out[i] = Block{Type: BlockRedactedThinking, Thinking: b.thinking.String()}
 		case BlockToolCall:
 			out[i] = Block{Type: BlockToolCall, ToolCallID: b.toolID, ToolName: b.toolName, Arguments: b.args.String()}
 		}

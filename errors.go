@@ -45,6 +45,10 @@ var (
 	// bounds memory against a hostile or buggy provider. The partial response
 	// stays available via Stream.Partial; match with errors.Is.
 	ErrStreamOverflow = errors.New("rosetta: stream accumulation exceeded safety limits")
+	// ErrResponseTooLarge is returned when a unary response body exceeds
+	// the SDK's size cap. The transport-level sentinel lives in an internal
+	// package and is not importable, so callers match this one.
+	ErrResponseTooLarge = errors.New("rosetta: response body too large")
 	// ErrUpstreamMalformed is returned when the upstream answered with a
 	// success status (or a 200-equivalent) but its response body could not be
 	// decoded into the shape the protocol requires — a truncated body, an HTML
@@ -90,12 +94,13 @@ var (
 	// body itself — so wrapping them does not put response content into logs;
 	// the malformed bytes are deliberately not attached.
 	ErrUpstreamMalformed = errors.New("rosetta: upstream response could not be decoded")
-	// ErrStreamIdleTimeout is the recommended cause for Stream.Abort when a
-	// watchdog aborts a stream that delivered no event within its idle
-	// window. The SDK never raises it itself — WithTimeout is unary-only
-	// and an established stream is governed by the caller — so matching it
-	// always means a caller-side watchdog fired. The partial response
-	// stays available via Stream.Partial.
+	// ErrStreamIdleTimeout is raised when a stream delivers no event within
+	// the window configured by WithStreamIdleTimeout. It is also the
+	// recommended cause for Stream.Abort when a caller-side watchdog aborts
+	// a silent stream. WithTimeout is unary-only and bounds a unary call's
+	// total duration; this sentinel is about inactivity, so a slow-but-alive
+	// stream is never cut. The partial response stays available via
+	// Stream.Partial.
 	ErrStreamIdleTimeout = errors.New("rosetta: stream idle timeout (caller watchdog)")
 	// ErrStreamAborted is the default cause used when Stream.Abort is
 	// called with a nil error. Matching it means the caller aborted the
@@ -381,8 +386,11 @@ func readBody(resp *http.Response, method, url string, limit int64) ([]byte, err
 	resp.Body.Close()
 	if err != nil {
 		if errors.Is(err, httpx.ErrBodyTooLarge) {
-			return nil, fmt.Errorf("rosetta: %s %s response body exceeds %d bytes: %w",
-				method, displayEndpoint(url), limit, err)
+			// Two %w verbs: callers match ErrResponseTooLarge (this
+			// package), and an internal test can still reach the transport
+			// sentinel.
+			return nil, fmt.Errorf("%w: %s %s response body exceeds %d bytes: %w",
+				ErrResponseTooLarge, method, displayEndpoint(url), limit, err)
 		}
 		return nil, transport(err, method, url)
 	}

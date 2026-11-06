@@ -10,8 +10,11 @@ import (
 
 // RerankRequest scores a list of documents against a query, most relevant
 // first in the reply. It rides on the Cohere rerank wire format
-// (POST /rerank), spoken by Cohere, Jina, SiliconFlow, Voyage, DashScope
-// and vLLM. Usage accounting is best-effort: vendors disagree on where
+// (POST /rerank), spoken by Cohere, Jina, SiliconFlow and vLLM. Voyage
+// (`top_k`/`data[]`) and DashScope (a different path with nested
+// request/response shapes) are NOT wire-compatible with this format and are
+// not adapted — do not point this method at them. Usage accounting is
+// best-effort: vendors disagree on where
 // token counts live (Cohere reports billed units, Jina a total), so Usage
 // carries whatever was found and may be zero.
 type RerankRequest struct {

@@ -4,9 +4,38 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
+
+// RequestInfo describes an outgoing HTTP call to a hook.
+type RequestInfo struct {
+	Method string
+	URL    string
+	Header http.Header
+}
+
+// ResponseInfo describes the outcome of an outgoing call. Latency is the
+// round-trip time through the transport; for streams it stops at the
+// response headers, not at the end of the body.
+type ResponseInfo struct {
+	Method     string
+	URL        string
+	StatusCode int
+	Latency    time.Duration
+	RequestID  string
+	Err        error
+}
+
+// Hooks observe every HTTP call. Both callbacks run on the request path and
+// must not block: use them for metrics, tracing and logging, never for
+// retries. RequestInfo.Header carries the credentials the request will
+// send, so redact before logging.
+type Hooks struct {
+	OnRequest  func(RequestInfo)
+	OnResponse func(ResponseInfo)
+}
 
 // Quirks adjusts for third-party services whose OpenAI compatibility is
 // imperfect. Most services need nothing; set quirks when a vendor is known
@@ -48,14 +77,26 @@ type settings struct {
 	logger           *slog.Logger
 	thinkingFallback bool
 	thinkingRectify  bool
-	// interleavedThinking is tri-state: nil lets the provider decide from the
-	// payload (thinking + tools), non-nil pins the beta header on or off.
+	// interleavedThinking is retained for API compatibility only: the
+	// interleaved-thinking beta went GA in Anthropic API 2026-10-21, so the
+	// value is no longer read by the adapter. WithInterleavedThinking still
+	// compiles and is a no-op.
 	interleavedThinking *bool
 	maxTokensField      string
 	anthropicBearer     bool
 	strictContext       bool
 	extraOverrides      bool
+	unknownEvents       bool
+	headers             http.Header
+	betas               []string
+	queryParams         url.Values
+	pathPrefix          string
+	organization        string
+	project             string
 	estimates           MultimediaTokenEstimates
+	tokenCounter        func(string) int
+	hooks               Hooks
+	requestIDFunc       func() string
 	quirks              Quirks
 	modelsFile          string
 	manualModels        []ModelInfo
@@ -91,6 +132,81 @@ func WithEndpoint(v string) Option {
 // on OpenAI protocols and "x-api-key" on Anthropic.
 func WithAPIKey(v string) Option {
 	return func(s *settings) { s.apiKey = strings.TrimSpace(v) }
+}
+
+// WithHeader sets a request header on every call. Headers set here win over
+// the SDK's defaults, which is what makes gateway-specific auth (Azure's
+// api-key, OpenRouter's HTTP-Referer/X-Title) and trace propagation
+// (traceparent) reachable.
+func WithHeader(k, v string) Option {
+	return func(s *settings) {
+		if s.headers == nil {
+			s.headers = http.Header{}
+		}
+		s.headers.Set(k, v)
+	}
+}
+
+// WithHeaders merges a header set into the same layer as WithHeader. Later
+// options win over earlier ones.
+func WithHeaders(h http.Header) Option {
+	return func(s *settings) {
+		if s.headers == nil {
+			s.headers = http.Header{}
+		}
+		for k, vs := range h {
+			s.headers[k] = append([]string(nil), vs...)
+		}
+	}
+}
+
+// WithBeta appends Anthropic beta flags to the ones the SDK derives from the
+// payload. Values are comma-joined into anthropic-beta; duplicates are left
+// alone because the header is idempotent upstream.
+func WithBeta(flags ...string) Option {
+	return func(s *settings) {
+		for _, f := range flags {
+			if f = strings.TrimSpace(f); f != "" {
+				s.betas = append(s.betas, f)
+			}
+		}
+	}
+}
+
+// WithQueryParam appends a query parameter to every request URL. This is how
+// Azure OpenAI's required ?api-version= is supplied; endpoints themselves
+// still reject a query string, so credentials cannot hide there.
+func WithQueryParam(k, v string) Option {
+	return func(s *settings) {
+		if s.queryParams == nil {
+			s.queryParams = url.Values{}
+		}
+		s.queryParams.Add(k, v)
+	}
+}
+
+// WithPathPrefix prepends a path segment to every request URL, for gateways
+// that mount the API under a sub-path (Azure's /openai, a reverse proxy's
+// /llm, ...).
+func WithPathPrefix(p string) Option {
+	return func(s *settings) {
+		p = strings.TrimSpace(p)
+		if p == "" || p == "/" {
+			s.pathPrefix = ""
+			return
+		}
+		s.pathPrefix = "/" + strings.Trim(p, "/")
+	}
+}
+
+// WithOrganization sends OpenAI-Organization on OpenAI-family requests.
+func WithOrganization(id string) Option {
+	return func(s *settings) { s.organization = strings.TrimSpace(id) }
+}
+
+// WithProject sends OpenAI-Project on OpenAI-family requests.
+func WithProject(id string) Option {
+	return func(s *settings) { s.project = strings.TrimSpace(id) }
 }
 
 // WithEmbeddingEndpoint overrides the base URL used for Embed and Rerank
@@ -230,19 +346,13 @@ func WithThinkingRectify(v bool) Option {
 	return func(s *settings) { s.thinkingRectify = v }
 }
 
-// WithInterleavedThinking pins the Anthropic "interleaved-thinking-2025-05-14"
-// beta header on or off. Interleaved thinking is what lets Claude reason
-// between tool calls inside one assistant turn; the beta header is how the
-// models that still need it are told to do so.
+// WithInterleavedThinking is a no-op as of Anthropic API version 2026-10-21:
+// interleaved thinking (reasoning between tool calls) went GA and no longer
+// needs the "interleaved-thinking-2025-05-14" beta header. It is kept so
+// existing call sites keep compiling; the value is ignored.
 //
-// Left unset (the default) the SDK decides per request: the header is sent
-// when the outgoing payload both enables extended thinking and declares
-// tools, which is exactly the scope Anthropic documents for the beta.
-//
-// Pin it to false when the endpoint forwards to Amazon Bedrock or Google
-// Cloud Vertex AI: those platforms reject the header on models outside
-// Anthropic's list, while the Claude API itself accepts it on any model and
-// ignores it where unsupported.
+// Deprecated: the SDK now always targets 2026-10-21, where this toggle has
+// no effect.
 func WithInterleavedThinking(v bool) Option {
 	return func(s *settings) { s.interleavedThinking = &v }
 }
@@ -267,6 +377,29 @@ func WithAnthropicBearerAuth(v bool) Option {
 	return func(s *settings) { s.anthropicBearer = v }
 }
 
+// WithHooks installs per-call observation callbacks. They fire for every
+// HTTP call, including retries and auxiliary APIs.
+func WithHooks(h Hooks) Option {
+	return func(s *settings) { s.hooks = h }
+}
+
+// WithRequestIDFunc injects an X-Request-Id header on every outgoing call,
+// so one logical request can be correlated across a gateway and the
+// provider. An explicitly configured X-Request-Id (WithHeader) wins; an
+// empty return leaves the header unset.
+func WithRequestIDFunc(fn func() string) Option {
+	return func(s *settings) { s.requestIDFunc = fn }
+}
+
+// WithUnknownEvents makes streams emit EventUnknown for provider events the
+// SDK does not model, with the original SSE payload in Event.Raw. It is off
+// by default because enabling it changes the event sequence a consumer
+// sees; turn it on in a gateway that must forward new upstream events
+// without waiting for an SDK release.
+func WithUnknownEvents(v bool) Option {
+	return func(s *settings) { s.unknownEvents = v }
+}
+
 // WithExtraOverrides lets ChatRequest/EmbeddingRequest/RerankRequest.Extra
 // keys override SDK-managed payload fields ("model", "messages", "stream",
 // output caps, ...). By default such collisions are rejected with
@@ -275,6 +408,15 @@ func WithAnthropicBearerAuth(v bool) Option {
 // fields for a provider quirk.
 func WithExtraOverrides(v bool) Option {
 	return func(s *settings) { s.extraOverrides = v }
+}
+
+// WithTokenCounter plugs a real tokenizer into the local estimator. It is
+// used by the context-window check and Client.EstimateTokens, replacing the
+// built-in heuristic (CJK ≈1 token, ASCII ≈4 chars). nil restores the
+// heuristic. The SDK deliberately ships no tokenizer: tiktoken and friends
+// are large, model-specific, and would break the zero-dependency guarantee.
+func WithTokenCounter(fn func(string) int) Option {
+	return func(s *settings) { s.tokenCounter = fn }
 }
 
 // WithMultimediaTokenEstimates overrides the flat per-block token

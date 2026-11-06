@@ -646,3 +646,40 @@ func TestOpenAIChatStreamEventsErrors(t *testing.T) {
 		t.Fatalf("err after truncated end = %v, want ErrStreamTruncated", err)
 	}
 }
+
+// RG-05c: n>1 is reachable only through Extra because ChatRequest exposes no
+// n field. Honoring it would bill for choices the SDK never returns, so it
+// must be rejected before the request is sent instead of truncating to
+// choices[0] after the fact.
+func TestOpenAIChatRejectsN(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoOpenAIChat))
+	p := c.provider.(*openaiChatProvider)
+
+	req := &ChatRequest{Model: "gpt-4o", Messages: []Message{User("hi")}, Extra: map[string]any{"n": 3}}
+	_, err := p.buildPayload(req, false, p.initialState("gpt-4o"))
+	if !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("err = %v, want ErrNotSupported", err)
+	}
+
+	// n=1 is legal and must pass through untouched.
+	req.Extra = map[string]any{"n": 1}
+	pl, err := p.buildPayload(req, false, p.initialState("gpt-4o"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl["n"] != 1 {
+		t.Fatalf("n = %v, want 1", pl["n"])
+	}
+}
+
+// A multi-choice unary reply means the upstream ignored the request-side
+// guard; truncating to the first choice would silently drop billed output.
+func TestOpenAIChatUnaryRejectsMultipleChoices(t *testing.T) {
+	_, err := decodeOpenAIChatResponse([]byte(`{"choices":[
+		{"message":{"content":"a"},"finish_reason":"stop"},
+		{"message":{"content":"b"},"finish_reason":"stop"}
+	]}`))
+	if !errors.Is(err, ErrNotSupported) {
+		t.Fatalf("err = %v, want ErrNotSupported", err)
+	}
+}

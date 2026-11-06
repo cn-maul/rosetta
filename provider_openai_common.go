@@ -64,6 +64,13 @@ func openAIHeaders(c *Client, accept string) http.Header {
 	if c.settings.apiKey != "" {
 		h.Set("Authorization", "Bearer "+c.settings.apiKey)
 	}
+	if c.settings.organization != "" {
+		h.Set("OpenAI-Organization", c.settings.organization)
+	}
+	if c.settings.project != "" {
+		h.Set("OpenAI-Project", c.settings.project)
+	}
+	c.applyHeaders(h)
 	return h
 }
 
@@ -72,9 +79,9 @@ func openAIHeaders(c *Client, accept string) http.Header {
 // metadata (Known=false).
 func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 	const method = http.MethodGet
-	url := joinEndpoint(c.settings.endpoint, "/models")
+	url := c.decorateURL(joinEndpoint(c.settings.endpoint, "/models"))
 	call := &httpx.Call{Method: method, URL: url, Header: openAIHeaders(c, "application/json")}
-	resp, err := c.http.Do(ctx, call)
+	resp, err := c.call(ctx, call)
 	if err != nil {
 		return nil, transport(err, method, url)
 	}

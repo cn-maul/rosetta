@@ -3,6 +3,7 @@ package rosetta
 import (
 	"errors"
 	"io"
+	"reflect"
 	"testing"
 )
 
@@ -301,7 +302,7 @@ func TestBufferedStreamKeepsBlockIdentity(t *testing.T) {
 		t.Errorf("ID = %q, want %q", got.ID, cr.ID)
 	}
 	for i := range want {
-		if got.Content[i] != want[i] {
+		if !reflect.DeepEqual(got.Content[i], want[i]) {
 			t.Errorf("block %d = %+v, want %+v", i, got.Content[i], want[i])
 		}
 	}

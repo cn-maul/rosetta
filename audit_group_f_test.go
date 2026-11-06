@@ -109,9 +109,11 @@ func TestAuditMaxTokensFieldWhitelist(t *testing.T) {
 	}
 }
 
-// C7: reserved-key sets are per protocol — a key no adapter emits
-// ("tool_choice") is settable via Extra everywhere, while each protocol still
-// guards exactly its own SDK-managed fields.
+// C7: reserved-key sets are per protocol — each protocol guards exactly the
+// fields its adapter emits. tool_choice became SDK-managed on all three when
+// the adapters learned to translate it (RG-02); parallel_tool_calls is
+// emitted by the two OpenAI protocols only, since Anthropic spells it inside
+// tool_choice.
 func TestAuditPerProtocolReservedKeys(t *testing.T) {
 	sets := map[string]map[string]bool{
 		"chat":      openaiChatReservedPayloadKeys,
@@ -119,9 +121,15 @@ func TestAuditPerProtocolReservedKeys(t *testing.T) {
 		"anthropic": anthropicReservedPayloadKeys,
 	}
 	for name, set := range sets {
-		if set["tool_choice"] {
-			t.Errorf("%s must not reserve tool_choice (no adapter emits it)", name)
+		if !set["tool_choice"] {
+			t.Errorf("%s must reserve tool_choice (its adapter emits it)", name)
 		}
+	}
+	if !openaiChatReservedPayloadKeys["parallel_tool_calls"] || !openaiResponsesReservedPayloadKeys["parallel_tool_calls"] {
+		t.Error("the OpenAI protocols must reserve parallel_tool_calls")
+	}
+	if anthropicReservedPayloadKeys["parallel_tool_calls"] {
+		t.Error("anthropic must not reserve parallel_tool_calls (it uses tool_choice.disable_parallel_tool_use)")
 	}
 	if !openaiResponsesReservedPayloadKeys["input"] {
 		t.Error("responses must reserve input")
@@ -135,10 +143,14 @@ func TestAuditPerProtocolReservedKeys(t *testing.T) {
 	if !openaiChatReservedPayloadKeys["stop"] || openaiChatReservedPayloadKeys["stop_sequences"] {
 		t.Error("chat must reserve stop, not stop_sequences")
 	}
-	// End-to-end through mergeExtra.
+	// End-to-end through mergeExtra: tool_choice is SDK-managed now.
 	payload := map[string]any{"model": "m"}
-	if err := mergeExtra(payload, map[string]any{"tool_choice": "any"}, false, anthropicReservedPayloadKeys); err != nil {
-		t.Fatalf("anthropic Extra[tool_choice] rejected: %v", err)
+	if err := mergeExtra(payload, map[string]any{"tool_choice": "any"}, false, anthropicReservedPayloadKeys); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("anthropic Extra[tool_choice] must be rejected, got %v", err)
+	}
+	// A key no adapter emits stays settable through Extra.
+	if err := mergeExtra(payload, map[string]any{"future_field": "x"}, false, anthropicReservedPayloadKeys); err != nil {
+		t.Fatalf("unknown Extra key rejected: %v", err)
 	}
 	if err := mergeExtra(payload, map[string]any{"model": "x"}, false, anthropicReservedPayloadKeys); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("anthropic Extra[model] must still be rejected, got %v", err)

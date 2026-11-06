@@ -51,22 +51,33 @@ const (
 //   - BlockThinking: Thinking, Signature (Anthropic passthrough), and
 //     optionally Sealed/SealedBy for an opaque provider-sealed payload
 type Block struct {
-	Type        BlockType
-	Text        string
-	ImageURL    string
+	Type     BlockType
+	Text     string
+	ImageURL string
+	// ImageDetail controls the OpenAI image resolution/cost trade-off:
+	// "auto", "low" or "high". Ignored by Anthropic, which has no field.
+	ImageDetail string
 	AudioData   string // base64 payload without the data: prefix
 	AudioFormat string // "wav" or "mp3"
 	FileName    string
 	MimeType    string // e.g. "application/pdf"; derived when empty
 	FileData    string // raw base64, data: URL or http(s) URL
 	FileID      string // provider file id (uploaded reference)
-	ToolCallID  string
-	ToolName    string
-	Arguments   string
-	Content     string
-	IsError     bool
-	Thinking    string
-	Signature   string
+	// Citations asks Anthropic to return citations for this document;
+	// nil leaves the provider default (off).
+	Citations  *bool
+	ToolCallID string
+	ToolName   string
+	Arguments  string
+	Content    string
+	IsError    bool
+	// ResultBlocks lets a tool_result carry structured content (text plus
+	// images), which is how computer-use screenshots come back. Anthropic
+	// only; when set it takes precedence over Content. The OpenAI protocols
+	// have no multi-part tool output and use Content.
+	ResultBlocks []Block
+	Thinking     string
+	Signature    string
 	// Sealed carries an opaque reasoning payload that the provider produced
 	// and expects back verbatim, and SealedBy names the API family that
 	// sealed it ("openai-responses" or "anthropic"). It is what keeps a
@@ -96,6 +107,25 @@ type Block struct {
 	// block (text, image, document, tool_result, tool_use). Ignored by the
 	// OpenAI protocols, which cache prefixes automatically.
 	CacheControl *CacheControl
+	// PromptCacheBreakpoint marks an explicit OpenAI prompt-cache breakpoint
+	// on this content block (prompt_cache_breakpoint). It is the OpenAI
+	// counterpart to CacheControl; ignored by Anthropic.
+	PromptCacheBreakpoint *PromptCacheBreakpoint
+	// Raw is the provider's original JSON for an output item the SDK does
+	// not model. It is set only on ChatResponse.Unknown entries, so a
+	// gateway can forward or inspect the content instead of losing it; it
+	// is never replayed by an encoder.
+	Raw json.RawMessage
+}
+
+// withPromptCacheBreakpoint attaches an explicit OpenAI prompt-cache
+// breakpoint to a content part when the block carries one. It is a no-op
+// otherwise, so every encoder can call it unconditionally.
+func withPromptCacheBreakpoint(part map[string]any, b Block) map[string]any {
+	if bp := b.PromptCacheBreakpoint.toWire(); bp != nil {
+		part["prompt_cache_breakpoint"] = bp
+	}
+	return part
 }
 
 // Message is one conversation turn composed of content blocks.
@@ -297,6 +327,11 @@ func (b Block) validate() error {
 		if err := validateImageURL(b.ImageURL); err != nil {
 			return err
 		}
+		switch b.ImageDetail {
+		case "", "auto", "low", "high":
+		default:
+			return fmt.Errorf("image detail %q unsupported (auto, low or high)", b.ImageDetail)
+		}
 	case BlockAudio:
 		if b.AudioData == "" {
 			return fmt.Errorf("audio block has no AudioData")
@@ -336,6 +371,15 @@ func (b Block) validate() error {
 	case BlockToolResult:
 		if b.ToolCallID == "" {
 			return fmt.Errorf("tool_result block needs ToolCallID")
+		}
+		for i := range b.ResultBlocks {
+			rb := &b.ResultBlocks[i]
+			if rb.Type != BlockText && rb.Type != BlockImage {
+				return fmt.Errorf("tool_result content blocks must be text or image, got %q", rb.Type)
+			}
+			if err := rb.validate(); err != nil {
+				return fmt.Errorf("tool_result content[%d]: %w", i, err)
+			}
 		}
 	case BlockThinking:
 		// A sealed payload is content even with no readable text: it is the

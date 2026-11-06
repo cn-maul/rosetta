@@ -4,11 +4,18 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
 )
+
+// tokenCounterProvider is implemented by protocols that expose an exact
+// prompt token count endpoint. Today only Anthropic does.
+type tokenCounterProvider interface {
+	CountTokens(ctx context.Context, req *ChatRequest) (int, error)
+}
 
 // protocolProvider is the internal adapter contract. One implementation
 // per wire protocol translates unified requests/responses/events.
@@ -194,6 +201,26 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, err
 	}
 	c.record(resp.Model, resp.Usage, resp.Usage.IsZero())
 	return resp, nil
+}
+
+// CountTokens asks the provider for an exact prompt token count. Only
+// Anthropic exposes a count_tokens endpoint; every other protocol returns
+// ErrNotSupported — use Client.EstimateTokens or WithTokenCounter there.
+func (c *Client) CountTokens(ctx context.Context, req *ChatRequest) (int, error) {
+	req, err := c.validated(req)
+	if err != nil {
+		return 0, err
+	}
+	tc, ok := c.provider.(tokenCounterProvider)
+	if !ok {
+		return 0, fmt.Errorf("%w: this protocol has no count_tokens endpoint; use Client.EstimateTokens or WithTokenCounter", ErrNotSupported)
+	}
+	if c.settings.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.settings.timeout)
+		defer cancel()
+	}
+	return tc.CountTokens(ctx, req)
 }
 
 // ChatStream starts a streaming completion. The returned Stream must be
@@ -422,7 +449,7 @@ func (c *Client) checkContext(req *ChatRequest) error {
 	if !ok || mi.ContextWindow <= 0 {
 		return nil
 	}
-	in := req.estimateInputTokens(c.settings.estimates)
+	in := c.estimateInputTokens(req)
 	out := c.effectiveMaxOutput(req)
 	if out <= 0 {
 		// Zero is "let the provider decide", but on Anthropic the provider
@@ -462,20 +489,40 @@ func (c *Client) Stats() UsageSnapshot {
 // is normalized to its canonical form first so an alias request and its
 // full-name twin are accounted under one key instead of being split across
 // two (M2).
-func (c *Client) record(model string, u Usage, missing bool) {
+// CallInfo carries per-call observability data the transport does not
+// otherwise expose. It is optional: record's variadic form keeps every
+// existing call site working.
+type CallInfo struct {
+	Latency    time.Duration
+	Attempts   int
+	StatusCode int
+	RequestID  string
+	Err        error
+}
+
+func (c *Client) record(model string, u Usage, missing bool, info ...CallInfo) {
 	if c.settings.tracker == nil {
 		return
 	}
-	if mi, ok := c.registry.Lookup(model); ok && mi.ID != "" {
+	mi, known := c.registry.Lookup(model)
+	if known && mi.ID != "" {
 		model = mi.ID
 	}
-	c.settings.tracker.Record(context.Background(), UsageRecord{
+	rec := UsageRecord{
 		Time:         time.Now(),
 		Protocol:     c.settings.protocol,
 		Model:        model,
 		Usage:        u,
 		UsageMissing: missing,
-	})
+	}
+	if len(info) > 0 {
+		rec.Latency = info[0].Latency
+		rec.Attempts = info[0].Attempts
+		rec.StatusCode = info[0].StatusCode
+		rec.RequestID = info[0].RequestID
+		rec.Err = info[0].Err
+	}
+	c.settings.tracker.Record(context.Background(), rec)
 }
 
 // effectiveMaxOutput resolves the output cap: request value, then the
@@ -492,10 +539,54 @@ func (c *Client) effectiveMaxOutput(req *ChatRequest) int {
 	return c.settings.defaultMaxOutput
 }
 
+// call is the single choke point for outgoing HTTP calls: it injects the
+// configured request id and fires the observation hooks. Every provider and
+// auxiliary API goes through it, so observation is uniform across
+// protocols.
+func (c *Client) call(ctx context.Context, call *httpx.Call) (*http.Response, error) {
+	if call.Header == nil {
+		call.Header = http.Header{}
+	}
+	if fn := c.settings.requestIDFunc; fn != nil && call.Header.Get("X-Request-Id") == "" {
+		if id := fn(); id != "" {
+			call.Header.Set("X-Request-Id", id)
+		}
+	}
+	if h := c.settings.hooks.OnRequest; h != nil {
+		h(RequestInfo{Method: call.Method, URL: call.URL, Header: call.Header.Clone()})
+	}
+	start := time.Now()
+	resp, err := c.http.Do(ctx, call)
+	if h := c.settings.hooks.OnResponse; h != nil {
+		info := ResponseInfo{
+			Method:  call.Method,
+			URL:     call.URL,
+			Latency: time.Since(start),
+			Err:     err,
+		}
+		if resp != nil {
+			info.StatusCode = resp.StatusCode
+			info.RequestID = resp.Header.Get("X-Request-Id")
+		}
+		h(info)
+	}
+	return resp, err
+}
+
 // newIdempotencyKey returns a fresh random key for an Idempotency-Key
 // header, unique per logical request so a transport-layer retry of the same
 // request can be deduplicated by the provider (M1). It is not used for
 // security, only for uniqueness, so math/rand is sufficient.
 func newIdempotencyKey() string {
 	return fmt.Sprintf("rosetta-%016x-%016x", rand.Uint64(), rand.Uint64())
+}
+
+// idempotencyKey returns the caller's stable key when one is set, so a
+// retry after a crash or a process restart can be deduplicated upstream;
+// otherwise it falls back to a fresh random key.
+func idempotencyKey(req *ChatRequest) string {
+	if req != nil && req.IdempotencyKey != "" {
+		return req.IdempotencyKey
+	}
+	return newIdempotencyKey()
 }

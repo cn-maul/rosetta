@@ -60,11 +60,22 @@ func EstimateTokens(text string) int {
 // end, rather than calling EstimateTokens per block: rounding up each small
 // block and summing would systematically overestimate a prompt made of many
 // short blocks (M8).
-func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
+func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates, counters ...func(string) int) int {
 	est = est.resolve()
+	var counter func(string) int
+	if len(counters) > 0 && counters[0] != nil {
+		counter = counters[0]
+	}
 	total := 0
 	ascii, other := 0, 0
 	addText := func(s string) {
+		// A caller-supplied tokenizer is authoritative per text segment;
+		// the rune-based rounding below is skipped entirely so a real
+		// counter is never re-rounded or mixed with the heuristic.
+		if counter != nil {
+			total += counter(s)
+			return
+		}
 		a, o := tokenCounts(s)
 		ascii += a
 		other += o
@@ -146,8 +157,25 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates) int {
 			addText(string(b))
 		}
 	}
-	total += (ascii+3)/4 + other
+	if counter == nil {
+		total += (ascii+3)/4 + other
+	}
 	return total
+}
+
+// EstimateTokens counts text with the tokenizer configured by
+// WithTokenCounter, falling back to the package heuristic.
+func (c *Client) EstimateTokens(text string) int {
+	if c.settings.tokenCounter != nil {
+		return c.settings.tokenCounter(text)
+	}
+	return EstimateTokens(text)
+}
+
+// estimateInputTokens approximates a request's prompt size, using the
+// configured tokenizer when present.
+func (c *Client) estimateInputTokens(r *ChatRequest) int {
+	return r.estimateInputTokens(c.settings.estimates, c.settings.tokenCounter)
 }
 
 // tokenCounts returns the raw ASCII and non-ASCII rune counts of text,

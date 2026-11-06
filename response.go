@@ -27,6 +27,21 @@ type ChatResponse struct {
 	StopReason StopReason
 	Usage      Usage
 	Raw        json.RawMessage
+	// SystemFingerprint identifies the backend configuration that served
+	// the request (OpenAI protocols; empty elsewhere).
+	SystemFingerprint string
+	// ServiceTier echoes the service tier the provider actually used.
+	ServiceTier string
+	// Logprobs is the provider's raw log-probability payload when
+	// requested. It is deliberately not modelled: the shape differs per
+	// protocol and per provider, and losing it entirely is worse.
+	Logprobs json.RawMessage
+	// Unknown holds provider output items the SDK does not model — server
+	// tool calls and results (web_search_call, code_interpreter_call,
+	// server_tool_use, *_tool_result), image generation results, and any
+	// future item type. Each entry keeps the provider's raw JSON in Raw,
+	// so a gateway can forward it rather than silently dropping it.
+	Unknown []Block
 }
 
 // Text concatenates all text blocks of the response.

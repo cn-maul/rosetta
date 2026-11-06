@@ -117,7 +117,7 @@ func (p *openaiResponsesProvider) sanitize(st *respSendState, apiErr *APIError, 
 // Chat performs a non-streaming completion.
 func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(p.c.settings.endpoint, "/responses")
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/responses"))
 	st := p.initialState(req.Model)
 	sanitizes := 0
 	for {
@@ -130,7 +130,7 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 		if p.c.settings.quirks.NoIdempotencyKey {
 			retry = httpx.RetryDefault
 		} else {
-			hdr.Set("Idempotency-Key", newIdempotencyKey())
+			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
 			Method:      method,
@@ -139,7 +139,7 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 			Body:        func() ([]byte, error) { return json.Marshal(payload) },
 			RetryPolicy: retry,
 		}
-		resp, err := p.c.http.Do(ctx, call)
+		resp, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
@@ -162,7 +162,7 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 // StreamChat starts a streaming completion.
 func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stream, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(p.c.settings.endpoint, "/responses")
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/responses"))
 	st := p.initialState(req.Model)
 	sanitizes := 0
 	for {
@@ -175,7 +175,7 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 		if p.c.settings.quirks.NoIdempotencyKey {
 			retry = httpx.RetryDefault
 		} else {
-			hdr.Set("Idempotency-Key", newIdempotencyKey())
+			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
 			Method:      method,
@@ -184,7 +184,7 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 			Body:        func() ([]byte, error) { return json.Marshal(payload) },
 			RetryPolicy: retry,
 		}
-		resp, err := p.c.http.Do(ctx, call)
+		resp, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
@@ -256,8 +256,17 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st
 		// The guard is defensive: non-nil Thinking never yields an empty
 		// value thanks to the medium default.
 		if eff := req.effortWire(); eff != "" {
-			payload["reasoning"] = map[string]any{"effort": eff}
+			reasoning := map[string]any{"effort": eff}
+			if req.Thinking.Summary != "" {
+				reasoning["summary"] = req.Thinking.Summary
+			}
+			payload["reasoning"] = reasoning
 			emitReasoning = true
+		}
+		if len(req.Thinking.Include) > 0 {
+			// include is top-level; "reasoning.encrypted_content" is what
+			// makes a stateless replay possible.
+			payload["include"] = req.Thinking.Include
 		}
 	}
 	if emitReasoning {
@@ -274,30 +283,113 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st
 		if req.TopP != nil {
 			payload["top_p"] = *req.TopP
 		}
+		if req.PresencePenalty != nil {
+			payload["presence_penalty"] = *req.PresencePenalty
+		}
+		if req.FrequencyPenalty != nil {
+			payload["frequency_penalty"] = *req.FrequencyPenalty
+		}
 	}
 	if len(req.StopSequences) > 0 {
 		p.c.settings.logger.Debug("responses: stop sequences are not supported by this protocol; dropping them")
 	}
+	if req.Seed != nil {
+		payload["seed"] = *req.Seed
+	}
+	if req.Logprobs != nil {
+		payload["logprobs"] = *req.Logprobs
+	}
+	if req.TopLogprobs != nil {
+		payload["top_logprobs"] = *req.TopLogprobs
+	}
+	if req.User != "" {
+		payload["user"] = req.User
+	}
+	if req.ServiceTier != "" {
+		payload["service_tier"] = req.ServiceTier
+	}
+	if req.PromptCacheKey != "" {
+		payload["prompt_cache_key"] = req.PromptCacheKey
+	}
+	if opts := req.PromptCacheOptions.toWire(); opts != nil {
+		payload["prompt_cache_options"] = opts
+	}
+	if req.Store != nil {
+		payload["store"] = *req.Store
+	}
+	if req.PreviousResponseID != "" {
+		payload["previous_response_id"] = req.PreviousResponseID
+	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			if t.Kind != "" && t.Kind != "function" {
+				tool, err := serverToolWire(t)
+				if err != nil {
+					return nil, err
+				}
+				tools = append(tools, tool)
+				continue
+			}
 			params := t.Parameters
 			if len(params) == 0 {
 				params = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
-			tools = append(tools, map[string]any{
+			tool := map[string]any{
 				"type":        "function",
 				"name":        t.Name,
 				"description": t.Description,
 				"parameters":  params,
-			})
+			}
+			if t.Strict != nil {
+				tool["strict"] = *t.Strict
+			}
+			tools = append(tools, tool)
 		}
 		payload["tools"] = tools
+	}
+	if tc := req.ToolChoice; tc != nil {
+		switch tc.Mode {
+		case ToolChoiceAuto:
+			payload["tool_choice"] = "auto"
+		case ToolChoiceNone:
+			payload["tool_choice"] = "none"
+		case ToolChoiceRequired:
+			payload["tool_choice"] = "required"
+		case ToolChoiceTool:
+			// Responses uses the flat function object, unlike Chat's
+			// nested {"function": {...}} form.
+			payload["tool_choice"] = map[string]any{"type": "function", "name": tc.Name}
+		}
+	}
+	if parallel, ok := parallelToolCalls(req); ok {
+		payload["parallel_tool_calls"] = parallel
+	}
+	if rf := req.ResponseFormat; rf != nil || req.Verbosity != "" {
+		// Responses puts the schema under text.format and, unlike Chat,
+		// flattens name/schema/strict into the format object itself.
+		// Verbosity rides the same text object.
+		text := map[string]any{}
+		if rf != nil {
+			format := map[string]any{"type": rf.Type}
+			if rf.Type == "json_schema" {
+				format["name"] = rf.Name
+				format["schema"] = rf.Schema
+				if rf.Strict != nil {
+					format["strict"] = *rf.Strict
+				}
+			}
+			text["format"] = format
+		}
+		if req.Verbosity != "" {
+			text["verbosity"] = req.Verbosity
+		}
+		payload["text"] = text
 	}
 	if stream {
 		payload["stream"] = true
 	}
-	if err := mergeExtra(payload, req.Extra, p.c.settings.extraOverrides, openaiResponsesReservedPayloadKeys); err != nil {
+	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.extraOverrides, openaiResponsesReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	return payload, nil
@@ -424,6 +516,11 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 		case BlockImage, BlockAudio, BlockFile:
 			multimodal = true
 		}
+		// A prompt-cache breakpoint needs the content-parts array form (a
+		// string content cannot carry one), so it forces the parts path.
+		if b.PromptCacheBreakpoint != nil {
+			multimodal = true
+		}
 		if multimodal {
 			break
 		}
@@ -437,10 +534,10 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 		switch b.Type {
 		case BlockText:
 			if b.Text != "" {
-				parts = append(parts, map[string]any{"type": "input_text", "text": b.Text})
+				parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "input_text", "text": b.Text}, b))
 			}
 		case BlockImage:
-			parts = append(parts, map[string]any{"type": "input_image", "image_url": b.ImageURL})
+			parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "input_image", "image_url": b.ImageURL}, b))
 		case BlockAudio:
 			// The official Responses input content union carries text,
 			// image and file parts only; input_audio is a Chat
@@ -449,14 +546,14 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 			return nil, fmt.Errorf("%w: responses protocol does not support audio input; use Chat Completions (ProtoOpenAIChat) for audio", ErrInvalidRequest)
 		case BlockFile:
 			if b.FileID != "" {
-				parts = append(parts, map[string]any{"type": "input_file", "file_id": b.FileID})
+				parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "input_file", "file_id": b.FileID}, b))
 				continue
 			}
 			// The official Responses file input carries inline data via
 			// file_data and remote files via file_url; only Chat
 			// Completions lacks the URL form.
 			if strings.HasPrefix(b.FileData, "http://") || strings.HasPrefix(b.FileData, "https://") {
-				parts = append(parts, map[string]any{"type": "input_file", "file_url": b.FileData})
+				parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "input_file", "file_url": b.FileData}, b))
 				continue
 			}
 			du, err := fileDataURL(b)
@@ -467,7 +564,7 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 			if b.FileName != "" {
 				part["filename"] = b.FileName
 			}
-			parts = append(parts, part)
+			parts = append(parts, withPromptCacheBreakpoint(part, b))
 		}
 	}
 	item["content"] = parts
@@ -632,6 +729,9 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 			}
 			ssev, err := sc.Next()
 			if err != nil {
+				if errors.Is(err, sse.ErrTooLarge) {
+					return nil, fmt.Errorf("%w: %v", ErrStreamOverflow, err)
+				}
 				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
 				// covers a real HTTP truncation (chunked stream cut before the
 				// final zero chunk, gateway timeout). Both mean the terminal
@@ -910,7 +1010,12 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				apiErr.Method, apiErr.URL, apiErr.RequestID = method, url, requestID
 				return nil, apiErr
 			default:
-				// in_progress, content_part.*, *_done, output_item.done, ... are ignored
+				if p.c.settings.unknownEvents {
+					return &Event{Type: EventUnknown, Raw: append(json.RawMessage(nil), data...)}, nil
+				}
+				// in_progress, content_part.*, *_done, output_item.done, ...
+				// are ignored by default; WithUnknownEvents surfaces them
+				// verbatim instead.
 			}
 		}
 	}
@@ -953,10 +1058,19 @@ type oaRespUsage struct {
 	OutputTokens       jsonx.FlexInt64 `json:"output_tokens"`
 	TotalTokens        jsonx.FlexInt64 `json:"total_tokens"`
 	InputTokensDetails *struct {
-		CachedTokens jsonx.FlexInt64 `json:"cached_tokens"`
+		CachedTokens            jsonx.FlexInt64 `json:"cached_tokens"`
+		AudioTokens             jsonx.FlexInt64 `json:"audio_tokens"`
+		CacheWriteTokens        jsonx.FlexInt64 `json:"cache_write_tokens"`
+		CacheWriteTokensDetails *struct {
+			TTL30mTokens jsonx.FlexInt64 `json:"ttl_30m_tokens"`
+			TTL12hTokens jsonx.FlexInt64 `json:"ttl_12h_tokens"`
+		} `json:"cache_write_tokens_details"`
 	} `json:"input_tokens_details"`
 	OutputTokensDetails *struct {
-		ReasoningTokens jsonx.FlexInt64 `json:"reasoning_tokens"`
+		ReasoningTokens          jsonx.FlexInt64 `json:"reasoning_tokens"`
+		AudioTokens              jsonx.FlexInt64 `json:"audio_tokens"`
+		AcceptedPredictionTokens jsonx.FlexInt64 `json:"accepted_prediction_tokens"`
+		RejectedPredictionTokens jsonx.FlexInt64 `json:"rejected_prediction_tokens"`
 	} `json:"output_tokens_details"`
 }
 
@@ -972,9 +1086,18 @@ func (u *oaRespUsage) toUsage() Usage {
 	}
 	if u.InputTokensDetails != nil {
 		out.CachedInputTokens = u.InputTokensDetails.CachedTokens.Value
+		out.AudioInputTokens = u.InputTokensDetails.AudioTokens.Value
+		out.CachedCreationTokens = u.InputTokensDetails.CacheWriteTokens.Value
+		if u.InputTokensDetails.CacheWriteTokensDetails != nil {
+			out.CacheCreation30mTokens = u.InputTokensDetails.CacheWriteTokensDetails.TTL30mTokens.Value
+			out.CacheCreation12hTokens = u.InputTokensDetails.CacheWriteTokensDetails.TTL12hTokens.Value
+		}
 	}
 	if u.OutputTokensDetails != nil {
 		out.ReasoningTokens = u.OutputTokensDetails.ReasoningTokens.Value
+		out.AudioOutputTokens = u.OutputTokensDetails.AudioTokens.Value
+		out.AcceptedPredictionTokens = u.OutputTokensDetails.AcceptedPredictionTokens.Value
+		out.RejectedPredictionTokens = u.OutputTokensDetails.RejectedPredictionTokens.Value
 	}
 	return out
 }
@@ -994,9 +1117,16 @@ type oaRespOutputItem struct {
 	// OpenAI requires it back, unchanged, for the conversation to continue
 	// across turns; it is never interpreted.
 	EncryptedContent string `json:"encrypted_content"`
-	Content          []struct {
-		Type string `json:"type"` // output_text | reasoning_text
+	// Refusal is the top-level refusal output item's text
+	// ({"type":"refusal","refusal":"..."}). It is a separate output item
+	// from a message, so it is not reachable through Content.
+	Refusal string `json:"refusal"`
+	Content []struct {
+		Type string `json:"type"` // output_text | refusal | reasoning_text
 		Text string `json:"text"`
+		// Refusal carries the message-part form of a refusal
+		// ({"type":"refusal","refusal":"..."} inside a message's content).
+		Refusal string `json:"refusal"`
 	} `json:"content"`
 	Summary []struct {
 		Type string `json:"type"` // summary_text
@@ -1008,6 +1138,8 @@ type oaRespResponse struct {
 	ID                string `json:"id"`
 	Model             string `json:"model"`
 	Status            string `json:"status"`
+	SystemFingerprint string `json:"system_fingerprint"`
+	ServiceTier       string `json:"service_tier"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
@@ -1053,7 +1185,13 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 		attachRequest(apiErr, rc)
 		return nil, apiErr
 	}
-	out := &ChatResponse{ID: r.ID, Model: r.Model, Raw: truncateBody(body)}
+	out := &ChatResponse{
+		ID:                r.ID,
+		Model:             r.Model,
+		Raw:               truncateBody(body),
+		SystemFingerprint: r.SystemFingerprint,
+		ServiceTier:       r.ServiceTier,
+	}
 	var sawToolCall bool
 	for _, item := range r.Output {
 		switch item.Type {
@@ -1062,6 +1200,20 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 				if part.Type == "output_text" && part.Text != "" {
 					out.Content = append(out.Content, Block{Type: BlockText, Text: part.Text})
 				}
+				// A refusal may arrive as a message content part instead of
+				// its own output item. It renders as text, matching the Chat
+				// adapter's treatment of `message.refusal`, so a refusal is
+				// never silently dropped from the preserved reply.
+				if part.Type == "refusal" && part.Refusal != "" {
+					out.Content = append(out.Content, Block{Type: BlockText, Text: part.Refusal})
+				}
+			}
+		case "refusal":
+			// The documented shape is a top-level output item with the text
+			// in `refusal`. The unary decoder used to handle only message
+			// items, so the entire refusal text was lost.
+			if item.Refusal != "" {
+				out.Content = append(out.Content, Block{Type: BlockText, Text: item.Refusal})
 			}
 		case "reasoning":
 			var th strings.Builder
@@ -1105,6 +1257,17 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 				ToolName:   item.Name,
 				Arguments:  item.Arguments.Value,
 			})
+		default:
+			// Server-side tool calls/results (web_search_call,
+			// code_interpreter_call, mcp_call, ...) and any future item
+			// type are preserved instead of skipped. Raw is reconstructed
+			// from the decoded item, so a gateway can forward it.
+			if raw, err := json.Marshal(item); err == nil {
+				out.Unknown = append(out.Unknown, Block{
+					Type: BlockType("unknown:" + item.Type),
+					Raw:  raw,
+				})
+			}
 		}
 	}
 	out.StopReason = mapResponsesStop(r.Status, r.IncompleteReason())

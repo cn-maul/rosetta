@@ -45,6 +45,7 @@ func auxHeaders(c *Client) http.Header {
 	if key := c.embedKey(); key != "" {
 		h.Set("Authorization", "Bearer "+key)
 	}
+	c.applyHeaders(h)
 	return h
 }
 
@@ -53,7 +54,7 @@ func auxHeaders(c *Client) http.Header {
 // embedding vector per input), so the read cap is generous.
 func postAuxJSON(ctx context.Context, c *Client, path string, payload map[string]any) ([]byte, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(c.embedBase(), path)
+	url := c.decorateURL(joinEndpoint(c.embedBase(), path))
 	call := &httpx.Call{
 		Method:      method,
 		URL:         url,
@@ -61,7 +62,7 @@ func postAuxJSON(ctx context.Context, c *Client, path string, payload map[string
 		Body:        func() ([]byte, error) { return json.Marshal(payload) },
 		RetryPolicy: httpx.RetryIdempotent,
 	}
-	resp, err := c.http.Do(ctx, call)
+	resp, err := c.call(ctx, call)
 	if err != nil {
 		return nil, transport(err, method, url)
 	}

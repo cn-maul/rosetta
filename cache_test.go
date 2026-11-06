@@ -182,85 +182,35 @@ func TestAnthropicSystemWireShape(t *testing.T) {
 
 // scanAnthropicPayload must see a 1h breakpoint in every container shape the
 // builders and Extra can produce.
-func TestScanPayloadExtendedCacheTTL(t *testing.T) {
-	hourly := map[string]any{"type": "ephemeral", "ttl": "1h"}
+// In API version 2026-10-21 the 1-hour cache TTL and interleaved thinking
+// went GA, so the adapter no longer derives their beta headers from the
+// payload. Only explicit WithBeta values reach the anthropic-beta header.
+func TestAnthropicNoAutoBetaHeaders(t *testing.T) {
 	tests := []struct {
 		name string
-		v    any
-		want bool
+		req  *ChatRequest
+		opt  []Option
+		want string
 	}{
-		{"nil", nil, false},
-		{"bare string", "1h", false},
-		{"messages []map", map[string]any{"messages": []map[string]any{
-			{"content": []map[string]any{{"cache_control": hourly}}},
-		}}, true},
-		{"nested []any", map[string]any{"system": []any{
-			map[string]any{"cache_control": map[string]any{"ttl": "1h"}},
-		}}, true},
-		{"ttl 5m only", map[string]any{"tools": []map[string]any{
-			{"cache_control": map[string]any{"type": "ephemeral", "ttl": "5m"}},
-		}}, false},
-		{"ttl not a string", map[string]any{"tools": []map[string]any{
-			{"cache_control": map[string]any{"ttl": 1}},
-		}}, false},
-		{"cache_control not an object", map[string]any{"system": []any{
-			map[string]any{"cache_control": "ephemeral"},
-		}}, false},
-	}
-	for _, tc := range tests {
-		if got := scanAnthropicPayload(tc.v).needsExtendedTTL; got != tc.want {
-			t.Errorf("%s: needsExtendedTTL = %v, want %v", tc.name, got, tc.want)
-		}
-	}
-}
-
-// R3: the beta header must follow the payload, so a 1h breakpoint written
-// through Extra is not sent without it (which Anthropic rejects with a 400).
-func TestAnthropicExtendedCacheTTLBetaHeader(t *testing.T) {
-	hourlyCC := map[string]any{"type": "ephemeral", "ttl": "1h"}
-	shortCC := map[string]any{"type": "ephemeral", "ttl": "5m"}
-	textBlock := func(cc *CacheControl) *ChatRequest {
-		return &ChatRequest{Model: "claude-x", Messages: []Message{{
-			Role:   RoleUser,
-			Blocks: []Block{{Type: BlockText, Text: "seg", CacheControl: cc}},
-		}}}
-	}
-
-	tests := []struct {
-		name      string
-		req       func() *ChatRequest
-		overrides bool
-		want      bool
-	}{
-		{"no breakpoint", func() *ChatRequest { return textBlock(nil) }, false, false},
-		{"ephemeral 5m", func() *ChatRequest { return textBlock(EphemeralCache()) }, false, false},
-		{"extended typed block", func() *ChatRequest { return textBlock(ExtendedCache()) }, false, true},
-		{"extended typed tool", func() *ChatRequest {
-			return &ChatRequest{Model: "claude-x", Messages: []Message{User("hi")},
-				Tools: []ToolDefinition{{Name: "t", CacheControl: ExtendedCache()}}}
-		}, false, true},
-		{"extra system []any", func() *ChatRequest {
-			return &ChatRequest{Model: "claude-x", Messages: []Message{User("hi")},
-				Extra: map[string]any{"system": []any{
-					map[string]any{"type": "text", "text": "s", "cache_control": hourlyCC},
-				}}}
-		}, true, true},
-		{"extra tools []map", func() *ChatRequest {
-			return &ChatRequest{Model: "claude-x", Messages: []Message{User("hi")},
-				Extra: map[string]any{"tools": []map[string]any{{
-					"name":          "t",
-					"input_schema":  map[string]any{"type": "object"},
-					"cache_control": hourlyCC,
-				}}}}
-		}, true, true},
-		{"extra 5m only", func() *ChatRequest {
-			return &ChatRequest{Model: "claude-x", Messages: []Message{User("hi")},
-				Extra: map[string]any{"tools": []map[string]any{{
-					"name":          "t",
-					"input_schema":  map[string]any{"type": "object"},
-					"cache_control": shortCC,
-				}}}}
-		}, true, false},
+		{
+			"extended cache no longer advertises a beta",
+			&ChatRequest{Model: "claude-x", Messages: []Message{{Role: RoleUser, Blocks: []Block{
+				{Type: BlockText, Text: "seg", CacheControl: ExtendedCache()},
+			}}}},
+			nil, "",
+		},
+		{
+			"thinking plus tools no longer advertises a beta",
+			&ChatRequest{Model: "claude-x", Messages: []Message{User("hi")},
+				Thinking: &ThinkingConfig{BudgetTokens: 2048},
+				Tools:    []ToolDefinition{{Name: "t"}}},
+			nil, "",
+		},
+		{
+			"explicit WithBeta still rides through",
+			&ChatRequest{Model: "claude-x", Messages: []Message{User("hi")}},
+			[]Option{WithBeta("some-beta-2026-01-01")}, "some-beta-2026-01-01",
+		},
 	}
 
 	for _, tc := range tests {
@@ -268,23 +218,15 @@ func TestAnthropicExtendedCacheTTLBetaHeader(t *testing.T) {
 			var betas []string
 			var mu sync.Mutex
 			srv := recordingAnthropicServer(t, &betas, &mu)
-			var opts []Option
-			if tc.overrides {
-				opts = append(opts, WithExtraOverrides(true))
-			}
-			c := newCacheTestClient(t, srv, opts...)
-			if _, err := c.Chat(context.Background(), tc.req()); err != nil {
+			c := newCacheTestClient(t, srv, tc.opt...)
+			if _, err := c.Chat(context.Background(), tc.req); err != nil {
 				t.Fatalf("chat: %v", err)
 			}
 			mu.Lock()
 			got := betas[len(betas)-1]
 			mu.Unlock()
-			want := ""
-			if tc.want {
-				want = extendedCacheTTLBeta
-			}
-			if got != want {
-				t.Fatalf("anthropic-beta = %q, want %q", got, want)
+			if got != tc.want {
+				t.Fatalf("anthropic-beta = %q, want %q", got, tc.want)
 			}
 		})
 	}

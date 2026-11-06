@@ -17,12 +17,12 @@ func TestResponsesBuildPayload(t *testing.T) {
 	p := c.provider.(*openaiResponsesProvider)
 
 	req := &ChatRequest{
-		Model:           "gpt-5",
-		Messages:        []Message{User("hi")},
-		MaxOutputTokens: 200,
-		Temperature:     Float(0.7),
-		Tools:           []ToolDefinition{{Name: "fn", Description: "d"}},
-		Extra:           map[string]any{"previous_response_id": "resp_0"},
+		Model:              "gpt-5",
+		Messages:           []Message{User("hi")},
+		MaxOutputTokens:    200,
+		Temperature:        Float(0.7),
+		Tools:              []ToolDefinition{{Name: "fn", Description: "d"}},
+		PreviousResponseID: "resp_0",
 	}
 	pl, err := p.buildPayload(req, false, p.initialState("gpt-5"))
 	if err != nil {
@@ -1122,4 +1122,35 @@ func inputItems(t *testing.T, got map[string]any) []map[string]any {
 		out = append(out, m)
 	}
 	return out
+}
+
+// RG-05a: a refusal must survive the unary decoder. It used to accept only
+// output_text, dropping the refusal text entirely while the streaming path
+// surfaced it. Both documented shapes are covered: a top-level refusal
+// output item and a refusal content part inside a message.
+func TestResponsesUnaryKeepsRefusal(t *testing.T) {
+	resp, err := decodeResponsesResponse([]byte(`{
+		"id":"resp_1","model":"gpt-5","status":"completed",
+		"output":[
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]},
+			{"type":"refusal","refusal":"I can't help with that"}
+		]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Text(); got != "partial\nI can't help with that" {
+		t.Fatalf("Text() = %q, want both content and refusal", got)
+	}
+
+	resp, err = decodeResponsesResponse([]byte(`{
+		"id":"resp_2","model":"gpt-5","status":"completed",
+		"output":[{"type":"message","role":"assistant","content":[
+			{"type":"refusal","refusal":"no"}
+		]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Text(); got != "no" {
+		t.Fatalf("message-part refusal dropped: %q", got)
+	}
 }

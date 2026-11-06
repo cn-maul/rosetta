@@ -125,27 +125,97 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 		if req.TopP != nil {
 			pl["top_p"] = *req.TopP
 		}
+		// Reasoning models reject these alongside temperature/top_p, so
+		// they ride the same branch.
+		if req.PresencePenalty != nil {
+			pl["presence_penalty"] = *req.PresencePenalty
+		}
+		if req.FrequencyPenalty != nil {
+			pl["frequency_penalty"] = *req.FrequencyPenalty
+		}
 	}
 	if len(req.StopSequences) > 0 {
 		pl["stop"] = req.StopSequences
 	}
+	if req.Seed != nil {
+		pl["seed"] = *req.Seed
+	}
+	if req.Logprobs != nil {
+		pl["logprobs"] = *req.Logprobs
+	}
+	if req.TopLogprobs != nil {
+		pl["top_logprobs"] = *req.TopLogprobs
+	}
+	if req.User != "" {
+		pl["user"] = req.User
+	}
+	if req.ServiceTier != "" {
+		pl["service_tier"] = req.ServiceTier
+	}
+	if req.PromptCacheKey != "" {
+		pl["prompt_cache_key"] = req.PromptCacheKey
+	}
+	if opts := req.PromptCacheOptions.toWire(); opts != nil {
+		pl["prompt_cache_options"] = opts
+	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			if t.Kind != "" && t.Kind != "function" {
+				tool, err := serverToolWire(t)
+				if err != nil {
+					return nil, err
+				}
+				tools = append(tools, tool)
+				continue
+			}
 			params := t.Parameters
 			if len(params) == 0 {
 				params = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
-			tools = append(tools, map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        t.Name,
-					"description": t.Description,
-					"parameters":  params,
-				},
-			})
+			fn := map[string]any{
+				"name":        t.Name,
+				"description": t.Description,
+				"parameters":  params,
+			}
+			if t.Strict != nil {
+				fn["strict"] = *t.Strict
+			}
+			tools = append(tools, map[string]any{"type": "function", "function": fn})
 		}
 		pl["tools"] = tools
+	}
+	if tc := req.ToolChoice; tc != nil {
+		switch tc.Mode {
+		case ToolChoiceAuto:
+			pl["tool_choice"] = "auto"
+		case ToolChoiceNone:
+			pl["tool_choice"] = "none"
+		case ToolChoiceRequired:
+			pl["tool_choice"] = "required"
+		case ToolChoiceTool:
+			pl["tool_choice"] = map[string]any{
+				"type":     "function",
+				"function": map[string]any{"name": tc.Name},
+			}
+		}
+	}
+	if parallel, ok := parallelToolCalls(req); ok {
+		pl["parallel_tool_calls"] = parallel
+	}
+	if rf := req.ResponseFormat; rf != nil {
+		switch rf.Type {
+		case "text":
+			pl["response_format"] = map[string]any{"type": "text"}
+		case "json_object":
+			pl["response_format"] = map[string]any{"type": "json_object"}
+		case "json_schema":
+			spec := map[string]any{"name": rf.Name, "schema": rf.Schema}
+			if rf.Strict != nil {
+				spec["strict"] = *rf.Strict
+			}
+			pl["response_format"] = map[string]any{"type": "json_schema", "json_schema": spec}
+		}
 	}
 	if stream {
 		pl["stream"] = true
@@ -153,8 +223,16 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 			pl["stream_options"] = map[string]any{"include_usage": true}
 		}
 	}
-	if err := mergeExtra(pl, req.Extra, p.c.settings.extraOverrides, openaiChatReservedPayloadKeys); err != nil {
+	if err := mergeExtraWithTools(pl, req.Extra, p.c.settings.extraOverrides, openaiChatReservedPayloadKeys); err != nil {
 		return nil, err
+	}
+	// The unified response models a single assistant turn, and
+	// ChatRequest exposes no n field — n>1 is reachable only through
+	// Extra. Honoring it would bill for choices the SDK never surfaces,
+	// so it is rejected before the request is sent rather than silently
+	// truncated to choices[0] afterwards.
+	if n, ok := wireInt(pl["n"]); ok && n > 1 {
+		return nil, fmt.Errorf("%w: n>1 is not supported (the unified response is a single choice; requested n=%d)", ErrNotSupported, n)
 	}
 	return pl, nil
 }
@@ -243,6 +321,11 @@ func encodeOpenAIUser(m Message) (map[string]any, error) {
 		case BlockImage, BlockAudio, BlockFile:
 			multimodal = true
 		}
+		// A prompt-cache breakpoint needs the content-parts array form (a
+		// string content cannot carry one), so it forces the parts path.
+		if b.PromptCacheBreakpoint != nil {
+			multimodal = true
+		}
 		if multimodal {
 			break
 		}
@@ -256,13 +339,14 @@ func encodeOpenAIUser(m Message) (map[string]any, error) {
 		switch b.Type {
 		case BlockText:
 			if b.Text != "" {
-				parts = append(parts, map[string]any{"type": "text", "text": b.Text})
+				parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "text", "text": b.Text}, b))
 			}
 		case BlockImage:
-			parts = append(parts, map[string]any{
-				"type":      "image_url",
-				"image_url": map[string]any{"url": b.ImageURL},
-			})
+			img := map[string]any{"url": b.ImageURL}
+			if b.ImageDetail != "" {
+				img["detail"] = b.ImageDetail
+			}
+			parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "image_url", "image_url": img}, b))
 		case BlockAudio:
 			if b.AudioData == "" {
 				return nil, fmt.Errorf("%w: audio block has no AudioData", ErrInvalidRequest)
@@ -270,10 +354,10 @@ func encodeOpenAIUser(m Message) (map[string]any, error) {
 			if b.AudioFormat != "wav" && b.AudioFormat != "mp3" {
 				return nil, fmt.Errorf("%w: audio format %q unsupported (wav or mp3)", ErrInvalidRequest, b.AudioFormat)
 			}
-			parts = append(parts, map[string]any{
+			parts = append(parts, withPromptCacheBreakpoint(map[string]any{
 				"type":        "input_audio",
 				"input_audio": map[string]any{"data": b.AudioData, "format": b.AudioFormat},
-			})
+			}, b))
 		case BlockFile:
 			f := map[string]any{}
 			if b.FileID != "" {
@@ -288,7 +372,7 @@ func encodeOpenAIUser(m Message) (map[string]any, error) {
 			if b.FileName != "" {
 				f["filename"] = b.FileName
 			}
-			parts = append(parts, map[string]any{"type": "file", "file": f})
+			parts = append(parts, withPromptCacheBreakpoint(map[string]any{"type": "file", "file": f}, b))
 		}
 	}
 	mm["content"] = parts
@@ -386,7 +470,7 @@ func (p *openaiChatProvider) sanitize(st *oaSendState, apiErr *APIError, model s
 // Chat performs a non-streaming completion.
 func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(p.c.settings.endpoint, "/chat/completions")
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/chat/completions"))
 	st := p.initialState(req.Model)
 	sanitizes := 0
 	for {
@@ -399,7 +483,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 		if p.c.settings.quirks.NoIdempotencyKey {
 			retry = httpx.RetryDefault
 		} else {
-			hdr.Set("Idempotency-Key", newIdempotencyKey())
+			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
 			Method:      method,
@@ -408,7 +492,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 			Body:        func() ([]byte, error) { return json.Marshal(payload) },
 			RetryPolicy: retry,
 		}
-		resp, err := p.c.http.Do(ctx, call)
+		resp, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
@@ -431,7 +515,7 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 // StreamChat starts a streaming completion.
 func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (Stream, error) {
 	const method = http.MethodPost
-	url := joinEndpoint(p.c.settings.endpoint, "/chat/completions")
+	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/chat/completions"))
 	st := p.initialState(req.Model)
 	sanitizes := 0
 	var resp *http.Response
@@ -445,7 +529,7 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 		if p.c.settings.quirks.NoIdempotencyKey {
 			retry = httpx.RetryDefault
 		} else {
-			hdr.Set("Idempotency-Key", newIdempotencyKey())
+			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
 			Method:      method,
@@ -454,7 +538,7 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 			Body:        func() ([]byte, error) { return json.Marshal(payload) },
 			RetryPolicy: retry,
 		}
-		r, err := p.c.http.Do(ctx, call)
+		r, err := p.c.call(ctx, call)
 		if err != nil {
 			return nil, transport(err, method, url)
 		}
@@ -540,6 +624,12 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 			}
 			ssev, err := sc.Next()
 			if err != nil {
+				if errors.Is(err, sse.ErrTooLarge) {
+					// The SSE cap is a stream-structure violation, not a
+					// transport fault: map it onto the stream sentinel so a
+					// caller can classify it.
+					return nil, fmt.Errorf("%w: %v", ErrStreamOverflow, err)
+				}
 				// io.EOF covers a clean server-side close; io.ErrUnexpectedEOF
 				// covers a real HTTP truncation (chunked stream cut before the
 				// final zero chunk, gateway timeout).
@@ -611,6 +701,9 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 					// The unified event stream models a single assistant
 					// turn; extra choices (n>1) would interleave their text
 					// and clobber the stop reason, so only choice 0 maps.
+					// buildPayload rejects n>1 before the request is sent,
+					// so this only fires if an upstream emits extra choices
+					// unprompted.
 					continue
 				}
 				d := &choice.Delta
@@ -649,6 +742,12 @@ func (p *openaiChatProvider) streamEvents(body io.Reader, method, url, requestID
 				ev := pending[0]
 				pending = pending[1:]
 				return ev, nil
+			}
+			// A chunk that mapped to nothing (a keep-alive, or a field this
+			// release does not model) is dropped by default. With
+			// WithUnknownEvents it is surfaced verbatim.
+			if p.c.settings.unknownEvents {
+				return &Event{Type: EventUnknown, Raw: append(json.RawMessage(nil), data...)}, nil
 			}
 		}
 	}
@@ -710,14 +809,23 @@ func decodeJSONString(raw json.RawMessage) string {
 }
 
 type oaUsage struct {
-	PromptTokens        jsonx.FlexInt64 `json:"prompt_tokens"`
-	CompletionTokens    jsonx.FlexInt64 `json:"completion_tokens"`
-	TotalTokens         jsonx.FlexInt64 `json:"total_tokens"`
-	PromptTokensDetails *struct {
-		CachedTokens jsonx.FlexInt64 `json:"cached_tokens"`
+	PromptTokens     jsonx.FlexInt64 `json:"prompt_tokens"`
+	CompletionTokens jsonx.FlexInt64 `json:"completion_tokens"`
+	TotalTokens      jsonx.FlexInt64 `json:"total_tokens"`
+	// DeepSeek's prefix-cache split. CachedInputTokens mirrors the hit
+	// count when the OpenAI-style details object is absent.
+	PromptCacheHitTokens  jsonx.FlexInt64 `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTokens jsonx.FlexInt64 `json:"prompt_cache_miss_tokens"`
+	PromptTokensDetails   *struct {
+		CachedTokens     jsonx.FlexInt64 `json:"cached_tokens"`
+		AudioTokens      jsonx.FlexInt64 `json:"audio_tokens"`
+		CacheWriteTokens jsonx.FlexInt64 `json:"cache_write_tokens"`
 	} `json:"prompt_tokens_details"`
 	CompletionTokensDetails *struct {
-		ReasoningTokens jsonx.FlexInt64 `json:"reasoning_tokens"`
+		ReasoningTokens          jsonx.FlexInt64 `json:"reasoning_tokens"`
+		AudioTokens              jsonx.FlexInt64 `json:"audio_tokens"`
+		AcceptedPredictionTokens jsonx.FlexInt64 `json:"accepted_prediction_tokens"`
+		RejectedPredictionTokens jsonx.FlexInt64 `json:"rejected_prediction_tokens"`
 	} `json:"completion_tokens_details"`
 }
 
@@ -727,15 +835,28 @@ func (u *oaUsage) toUsage() Usage {
 		total = u.PromptTokens.Value + u.CompletionTokens.Value
 	}
 	out := Usage{
-		InputTokens:  u.PromptTokens.Value,
-		OutputTokens: u.CompletionTokens.Value,
-		TotalTokens:  total,
+		InputTokens:     u.PromptTokens.Value,
+		OutputTokens:    u.CompletionTokens.Value,
+		TotalTokens:     total,
+		CacheHitTokens:  u.PromptCacheHitTokens.Value,
+		CacheMissTokens: u.PromptCacheMissTokens.Value,
 	}
 	if u.PromptTokensDetails != nil {
 		out.CachedInputTokens = u.PromptTokensDetails.CachedTokens.Value
+		out.AudioInputTokens = u.PromptTokensDetails.AudioTokens.Value
+		out.CachedCreationTokens = u.PromptTokensDetails.CacheWriteTokens.Value
+	}
+	// DeepSeek reports the split at the top level instead of in
+	// prompt_tokens_details; prefer the explicit cached_tokens figure when
+	// both are present.
+	if out.CachedInputTokens == 0 {
+		out.CachedInputTokens = u.PromptCacheHitTokens.Value
 	}
 	if u.CompletionTokensDetails != nil {
 		out.ReasoningTokens = u.CompletionTokensDetails.ReasoningTokens.Value
+		out.AudioOutputTokens = u.CompletionTokensDetails.AudioTokens.Value
+		out.AcceptedPredictionTokens = u.CompletionTokensDetails.AcceptedPredictionTokens.Value
+		out.RejectedPredictionTokens = u.CompletionTokensDetails.RejectedPredictionTokens.Value
 	}
 	return out
 }
@@ -778,9 +899,11 @@ type oaChunk struct {
 }
 
 type oaResponse struct {
-	ID      string `json:"id"`
-	Model   string `json:"model"`
-	Choices []struct {
+	ID                string `json:"id"`
+	Model             string `json:"model"`
+	SystemFingerprint string `json:"system_fingerprint"`
+	ServiceTier       string `json:"service_tier"`
+	Choices           []struct {
 		Message struct {
 			Content          jsonx.ContentString `json:"content"`
 			ReasoningContent jsonx.ContentString `json:"reasoning_content"`
@@ -789,6 +912,7 @@ type oaResponse struct {
 			FunctionCall     *oaFunctionCall     `json:"function_call"`
 		} `json:"message"`
 		FinishReason jsonx.FlexString `json:"finish_reason"`
+		Logprobs     json.RawMessage  `json:"logprobs"`
 	} `json:"choices"`
 	Usage *oaUsage     `json:"usage"`
 	Error *oaErrorBody `json:"error"`
@@ -824,9 +948,11 @@ func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) 
 		return nil, apiErr
 	}
 	out := &ChatResponse{
-		ID:    r.ID,
-		Model: r.Model,
-		Raw:   truncateBody(body),
+		ID:                r.ID,
+		Model:             r.Model,
+		Raw:               truncateBody(body),
+		SystemFingerprint: r.SystemFingerprint,
+		ServiceTier:       r.ServiceTier,
 	}
 	if r.Usage != nil {
 		out.Usage = r.Usage.toUsage()
@@ -839,7 +965,14 @@ func decodeOpenAIChatResponse(body []byte, rc ...string) (*ChatResponse, error) 
 		out.StopReason = StopEnd
 		return out, nil
 	}
+	if len(r.Choices) > 1 {
+		// The request side rejects n>1, so this means the upstream (or a
+		// relay) produced multiple choices on its own. Returning the first
+		// silently would drop billed output, so surface it instead.
+		return nil, fmt.Errorf("%w: upstream returned %d choices; the unified response supports one", ErrNotSupported, len(r.Choices))
+	}
 	choice := &r.Choices[0]
+	out.Logprobs = choice.Logprobs
 	msg := &choice.Message
 	if msg.ReasoningContent.Set && msg.ReasoningContent.Value != "" {
 		out.Content = append(out.Content, Block{Type: BlockThinking, Thinking: msg.ReasoningContent.Value})

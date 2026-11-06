@@ -2,6 +2,7 @@ package rosetta
 
 import (
 	"errors"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -54,6 +55,45 @@ func trimTrailingSlash(s string) string {
 }
 
 func parseURL(raw string) (*url.URL, error) { return url.Parse(raw) }
+
+// decorateURL applies the client's path prefix and query parameters to a
+// fully-joined request URL. The configured endpoint itself never carries a
+// query (see validateEndpoint); these are injected afterwards so a
+// credential cannot hide in the endpoint string.
+func (c *Client) decorateURL(raw string) string {
+	if c.settings.pathPrefix == "" && len(c.settings.queryParams) == 0 {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if c.settings.pathPrefix != "" {
+		u.Path = c.settings.pathPrefix + u.Path
+	}
+	if len(c.settings.queryParams) > 0 {
+		q := u.Query()
+		for k, vs := range c.settings.queryParams {
+			for _, v := range vs {
+				q.Add(k, v)
+			}
+		}
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// applyHeaders layers caller-supplied headers onto a built header set. A
+// caller header replaces the SDK default of the same name, which is what
+// makes gateway auth (x-api-key, api-key) and trace propagation work.
+func (c *Client) applyHeaders(h http.Header) {
+	for k, vs := range c.settings.headers {
+		h.Del(k)
+		for _, v := range vs {
+			h.Add(k, v)
+		}
+	}
+}
 
 func joinEndpoint(base, path string) string {
 	b := trimTrailingSlash(base)
