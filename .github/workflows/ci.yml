@@ -5,9 +5,20 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -24,6 +35,7 @@ jobs:
           # with go.mod, and re-verify staticcheck locally after doing so.
           go-version: '1.27.1'
       - name: Format
+        if: runner.os == 'Linux'
         run: |
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
@@ -33,17 +45,33 @@ jobs:
         run: go build ./...
       - name: Vet
         run: go vet ./...
-      - name: Staticcheck
-        # Compiled and run against the pinned toolchain above; -checks=all
-        # keeps the run honest about which analyzers actually executed.
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all ./...
       - name: Test
+        run: go test ./...
+      - name: Race and coverage
+        if: runner.os == 'Linux'
         run: go test ./... -race -coverprofile=coverage.out
       - name: Coverage
+        if: runner.os == 'Linux'
         run: go tool cover -func=coverage.out
       - name: Coverage gate
+        if: runner.os == 'Linux'
         run: |
           total=$(go tool cover -func=coverage.out | grep '^total:' | awk '{print $NF}' | tr -d '%')
           if [ "$(echo "$total < 75" | bc)" = "1" ]; then
             echo "coverage $total% below 75% gate"; exit 1
           fi
+      - name: Module hygiene
+        if: runner.os == 'Linux'
+        run: |
+          go mod tidy -diff
+          if grep -q '^require' go.mod; then
+            echo "zero-dependency invariant broken: go.mod has a require block"; exit 1
+          fi
+      - name: Staticcheck
+        if: runner.os == 'Linux'
+        # Compiled and run against the pinned toolchain above; -checks=all
+        # keeps the run honest about which analyzers actually executed.
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all ./...
+      - name: Vulnerability scan
+        if: runner.os == 'Linux'
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

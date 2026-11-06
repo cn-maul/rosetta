@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+      - name: Verify Version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          declared=$(grep -E '^const Version = ' rosetta.go | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tag" != "$declared" ]; then
+            echo "tag v$tag does not match rosetta.Version $declared"; exit 1
+          fi
+      - name: Verify CHANGELOG has an entry
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          grep -q "^## v$tag" CHANGELOG.md || { echo "CHANGELOG missing v$tag"; exit 1; }
+      - name: Test
+        run: go test -race ./...
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk -v tag="v${GITHUB_REF_NAME#v}" '
+            $0 ~ "^## " tag { found=1; next }
+            found && /^## v/ { exit }
+            found { print }
+          ' CHANGELOG.md)
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$notes"
