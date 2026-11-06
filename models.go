@@ -1,5 +1,7 @@
 package rosetta
 
+import "encoding/json"
+
 // Model type constants for ModelInfo.Type. Declare a model's type through
 // WithModelInfo or the models file; OpenAI-family /models listings carry
 // no type data, so the SDK never guesses it.
@@ -66,4 +68,49 @@ type ModelInfo struct {
 	Protocol Protocol `json:"protocol,omitempty"`
 	// Aliases are alternate ids resolving to this model.
 	Aliases []string `json:"aliases,omitempty"`
+}
+
+// ModelCapabilityParser inspects one raw /models entry and returns the
+// capability fields to attach to that entry's ModelInfo. It is installed
+// via WithModelCapabilityParser; without it ListModels keeps the no-guessing
+// default and parses only id (and display name where the protocol has one).
+//
+// The SDK owns identity and provenance: ID, DisplayName, Protocol and Known
+// are set by the SDK and ignored in the returned value. The parser fills the
+// capability subset — ContextWindow, MaxOutputTokens, SupportsThinking,
+// DisableThinking, EffortLevels, Type and Aliases. Entries stay Known=false
+// (they are still remote-discovered), so SDK-side capability gating does not
+// change; a caller that wants the parsed fields to gate must merge them into
+// manual config (WithModelInfo / WithModelsFile).
+//
+// The parser runs for every protocol, including Anthropic — whose /v1/models
+// returns no capability fields, so mapping from model id to a known profile
+// is the only way to fill them there.
+type ModelCapabilityParser func(modelID string, raw json.RawMessage) ModelInfo
+
+// applyModelCapability overlays a parser's capability fields onto a
+// remote-discovered entry. Identity and provenance stay SDK-owned and are
+// deliberately not copied from cap.
+func applyModelCapability(dst *ModelInfo, cap ModelInfo) {
+	if cap.ContextWindow != 0 {
+		dst.ContextWindow = cap.ContextWindow
+	}
+	if cap.MaxOutputTokens != 0 {
+		dst.MaxOutputTokens = cap.MaxOutputTokens
+	}
+	if cap.SupportsThinking {
+		dst.SupportsThinking = true
+	}
+	if cap.DisableThinking {
+		dst.DisableThinking = true
+	}
+	if len(cap.EffortLevels) > 0 {
+		dst.EffortLevels = cap.EffortLevels
+	}
+	if cap.Type != "" {
+		dst.Type = cap.Type
+	}
+	if len(cap.Aliases) > 0 {
+		dst.Aliases = cap.Aliases
+	}
 }

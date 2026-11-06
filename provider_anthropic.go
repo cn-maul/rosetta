@@ -21,7 +21,13 @@ import (
 // (POST /v1/messages), including thinking budgets and their constraints.
 type anthropicProvider struct{ c *Client }
 
-const anthropicVersion = "2026-10-21"
+// AnthropicVersion is the Anthropic Messages API version this SDK targets.
+// It is exported so callers that hand-roll Anthropic HTTP outside the SDK
+// (protocol probes, balance checks, admin tooling) can reuse a single source
+// of truth instead of hardcoding a value that silently goes stale.
+const AnthropicVersion = "2026-10-21"
+
+const anthropicVersion = AnthropicVersion
 
 // maxCacheBreakpoints is Anthropic's hard limit on cache_control blocks per
 // request; exceeding it is a 400 upstream, so it is caught locally first.
@@ -1068,12 +1074,9 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 			return nil, withRetryAfter(parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header)), resp.Header)
 		}
 		var list struct {
-			Data *[]struct {
-				ID          string `json:"id"`
-				DisplayName string `json:"display_name"`
-			} `json:"data"`
-			HasMore bool   `json:"has_more"`
-			LastID  string `json:"last_id"`
+			Data    *[]json.RawMessage `json:"data"`
+			HasMore bool               `json:"has_more"`
+			LastID  string             `json:"last_id"`
 		}
 		if err := json.Unmarshal(body, &list); err != nil {
 			// /models catalog decode failure: upstream fault — see
@@ -1094,11 +1097,20 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		if list.Data == nil {
 			return nil, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 		}
-		for _, m := range *list.Data {
-			if m.ID == "" {
+		parser := p.c.settings.modelCapability
+		for _, raw := range *list.Data {
+			var entry struct {
+				ID          string `json:"id"`
+				DisplayName string `json:"display_name"`
+			}
+			if err := json.Unmarshal(raw, &entry); err != nil || entry.ID == "" {
 				continue
 			}
-			models = append(models, ModelInfo{ID: m.ID, DisplayName: m.DisplayName, Protocol: ProtoAnthropic})
+			mi := ModelInfo{ID: entry.ID, DisplayName: entry.DisplayName, Protocol: ProtoAnthropic}
+			if parser != nil {
+				applyModelCapability(&mi, parser(entry.ID, raw))
+			}
+			models = append(models, mi)
 		}
 		if !list.HasMore || page > 100 {
 			return models, nil

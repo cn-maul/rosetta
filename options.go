@@ -100,6 +100,7 @@ type settings struct {
 	quirks              Quirks
 	modelsFile          string
 	manualModels        []ModelInfo
+	modelCapability     ModelCapabilityParser
 }
 
 // defaultUnaryTimeout bounds unary calls (Chat, ListModels, Embed, Rerank)
@@ -242,6 +243,18 @@ func WithModelInfo(infos ...ModelInfo) Option {
 // WithModelInfo values; explicit values win on duplicate ids.
 func WithModelsFile(path string) Option {
 	return func(s *settings) { s.modelsFile = path }
+}
+
+// WithModelCapabilityParser installs a hook that fills ModelInfo capability
+// fields from raw /models entries during ListModels. Without it ListModels
+// parses only id (and display name where the protocol has one), keeping the
+// no-guessing default for custom models.
+//
+// The parser runs on every remote entry for every protocol. Anthropic's
+// /v1/models returns no capability fields, so the parser is the only way to
+// populate them there (typically by mapping the model id to a known profile).
+func WithModelCapabilityParser(fn ModelCapabilityParser) Option {
+	return func(s *settings) { s.modelCapability = fn }
 }
 
 // WithStrictContextCheck turns context-window overruns into

@@ -59,6 +59,17 @@
 - **`ErrResponseTooLarge`**：外部可分类的响应体超限哨兵；SSE 超限映射到 `ErrStreamOverflow`。
 - **治理与示例**：`SECURITY.md`、`CONTRIBUTING.md`、`docs/stability.md`、`Makefile`、release
   workflow、4 个可运行的 godoc 示例；CI 扩到三平台矩阵并增加 govulncheck 与模块卫生检查。
+- **OpenAI Chat thinking 回放**：`encodeMessages` 的 assistant 分支把 `BlockThinking` 的
+  `Thinking` 文本编码为同一条 assistant 消息的 `reasoning_content`（DeepSeek / Qwen / vLLM
+  要求与 `content` / `tool_calls` 同轮）。`BlockRedactedThinking`（无文本）仍跳过；只有
+  thinking、无 content 也无 tool_calls 的轮维持 `ErrInvalidRequest`；普通请求不新增字段，
+  出站 wire 与现状一致。
+- **`AnthropicVersion` 导出**：Anthropic 目标 API 版本（`2026-10-21`）导出为常量，供绕过
+  SDK 手搓 Anthropic HTTP 的调用方复用同一事实来源，避免硬编码过期版本。
+- **`WithModelCapabilityParser`**：可选钩子，把 `/models` 原始条目解析成 `ModelInfo` 能力
+  字段（`ContextWindow` / `MaxOutputTokens` / `SupportsThinking` / `EffortLevels` 等）。默认
+  仍 no-guessing（只解析 id 与 display name）；钩子对每协议生效（含 Anthropic，其 `/v1/models`
+  不返回能力字段，只能靠 id→档案映射）。条目仍 `Known=false`，SDK 侧能力门控不变。
 
 ### 修复
 

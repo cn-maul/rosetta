@@ -259,36 +259,48 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 			if t := m.text(); t != "" {
 				mm["content"] = t
 			}
+			var reasoning strings.Builder
 			var tcs []map[string]any
 			hadThinking := false
 			for _, b := range m.Blocks {
-				if b.Type == BlockThinking || b.Type == BlockRedactedThinking {
+				switch b.Type {
+				case BlockThinking:
 					hadThinking = true
-					continue // thinking/redacted-thinking blocks are not replayable here
+					// DeepSeek / Qwen / vLLM and similar OpenAI-compatible
+					// upstreams demand the thinking text back verbatim as
+					// reasoning_content, on the same assistant message as
+					// content and tool_calls. The Anthropic signature has no
+					// counterpart on this wire format and is not carried.
+					reasoning.WriteString(b.Thinking)
+				case BlockRedactedThinking:
+					hadThinking = true // no text to replay, but see G6 below
+				case BlockToolCall:
+					tcs = append(tcs, map[string]any{
+						"id":   b.ToolCallID,
+						"type": "function",
+						"function": map[string]any{
+							"name":      b.ToolName,
+							"arguments": b.Arguments,
+						},
+					})
 				}
-				if b.Type != BlockToolCall {
-					continue
-				}
-				tcs = append(tcs, map[string]any{
-					"id":   b.ToolCallID,
-					"type": "function",
-					"function": map[string]any{
-						"name":      b.ToolName,
-						"arguments": b.Arguments,
-					},
-				})
+			}
+			if reasoning.Len() > 0 {
+				mm["reasoning_content"] = reasoning.String()
 			}
 			if len(tcs) > 0 {
 				mm["tool_calls"] = tcs
 			}
-			if len(mm) == 1 && hadThinking {
+			_, hasContent := mm["content"]
+			if !hasContent && len(tcs) == 0 && hadThinking {
 				// The assistant turn has no replayable content and carried
-				// thinking or redacted-thinking blocks, which this protocol
-				// cannot replay. Emit a clear error instead of a degenerate
-				// empty message that strict gateways reject (G6).
+				// thinking/redacted-thinking blocks. DeepSeek and friends
+				// require a content field alongside reasoning_content, so a
+				// thinking-only turn cannot be replayed here: emit a clear
+				// error instead of a degenerate message (G6).
 				return nil, fmt.Errorf("%w: assistant turn has only thinking/redacted-thinking blocks, which the OpenAI chat protocol cannot replay", ErrInvalidRequest)
 			}
-			if len(mm) == 1 {
+			if !hasContent && len(tcs) == 0 {
 				mm["content"] = ""
 			}
 			out = append(out, mm)

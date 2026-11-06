@@ -93,9 +93,7 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		return nil, withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 	}
 	var list struct {
-		Data *[]struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data *[]json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &list); err != nil {
 		// /models catalog decode failure: the upstream body is not the shape
@@ -121,12 +119,20 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 	if list.Data == nil {
 		return nil, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 	}
+	parser := c.settings.modelCapability
 	models := make([]ModelInfo, 0, len(*list.Data))
-	for _, m := range *list.Data {
-		if m.ID == "" {
+	for _, raw := range *list.Data {
+		var entry struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &entry); err != nil || entry.ID == "" {
 			continue
 		}
-		models = append(models, ModelInfo{ID: m.ID, Protocol: c.settings.protocol})
+		mi := ModelInfo{ID: entry.ID, Protocol: c.settings.protocol}
+		if parser != nil {
+			applyModelCapability(&mi, parser(entry.ID, raw))
+		}
+		models = append(models, mi)
 	}
 	return models, nil
 }
