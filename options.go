@@ -245,14 +245,16 @@ func WithModelsFile(path string) Option {
 	return func(s *settings) { s.modelsFile = path }
 }
 
-// WithModelCapabilityParser installs a hook that fills ModelInfo capability
-// fields from raw /models entries during ListModels. Without it ListModels
-// parses only id (and display name where the protocol has one), keeping the
-// no-guessing default for custom models.
+// WithModelCapabilityParser installs a hook that fully replaces the built-in
+// /models capability parser. Without it, ListModels uses parseModelCapabilities
+// — the SDK's loose field-name normalization that fills ContextWindow /
+// MaxOutputTokens / EffortLevels / SupportsThinking from whatever the vendor
+// reported. Install a custom parser only when the built-in one is not enough.
 //
 // The parser runs on every remote entry for every protocol. Anthropic's
-// /v1/models returns no capability fields, so the parser is the only way to
-// populate them there (typically by mapping the model id to a known profile).
+// /v1/models returns no capability fields, so the built-in parser yields
+// nothing there — a custom parser that maps model id to a known profile is the
+// only way to fill them for Anthropic.
 func WithModelCapabilityParser(fn ModelCapabilityParser) Option {
 	return func(s *settings) { s.modelCapability = fn }
 }

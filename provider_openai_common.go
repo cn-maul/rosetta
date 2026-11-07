@@ -75,22 +75,41 @@ func openAIHeaders(c *Client, accept string) http.Header {
 }
 
 // listOpenAIModels queries GET /models (shape shared by both OpenAI
-// protocols and most compatible services). Entries carry no capability
-// metadata (Known=false).
+// protocols and most compatible services), trying the candidate paths in
+// order and falling back only on a "path does not exist" answer.
 func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 	const method = http.MethodGet
-	url := c.decorateURL(joinEndpoint(c.settings.endpoint, "/models"))
+	var lastErr error
+	for _, rawURL := range c.modelListURLs() {
+		models, fallback, err := listOpenAIModelsOnce(ctx, c, method, rawURL)
+		if err == nil {
+			return models, nil
+		}
+		lastErr = err
+		if !fallback {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// listOpenAIModelsOnce fetches and decodes one /models URL. fallback reports
+// whether the answer was a 404/410 ("this path does not exist"), which should
+// trigger the next candidate path. Any other status, a transport error or a
+// malformed body must not — that is an upstream fault, not a routing one.
+func listOpenAIModelsOnce(ctx context.Context, c *Client, method, url string) ([]ModelInfo, bool, error) {
 	call := &httpx.Call{Method: method, URL: url, Header: openAIHeaders(c, "application/json")}
 	resp, err := c.call(ctx, call)
 	if err != nil {
-		return nil, transport(err, method, url)
+		return nil, false, transport(err, method, url)
 	}
 	body, err := readBody(resp, method, url, bodyLimit)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
+		fallback := resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone
+		return nil, fallback, withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 	}
 	var list struct {
 		Data *[]json.RawMessage `json:"data"`
@@ -99,7 +118,7 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		// /models catalog decode failure: the upstream body is not the shape
 		// this protocol requires — an upstream fault (see
 		// ErrUpstreamMalformed), not a caller mistake.
-		return nil, fmt.Errorf("%w: model list: %w", ErrUpstreamMalformed, err)
+		return nil, false, fmt.Errorf("%w: model list: %w", ErrUpstreamMalformed, err)
 	}
 	// A 200 with no "data" field (or an explicit null) is a malformed catalog,
 	// not an empty one. Treating it as empty would let SetRemote wipe every
@@ -117,7 +136,7 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 	// stretching it to "decoded but semantically unacceptable" would make
 	// errors.Is(ErrUpstreamMalformed) useless as a failover signal.
 	if list.Data == nil {
-		return nil, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
+		return nil, false, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 	}
 	parser := c.settings.modelCapability
 	models := make([]ModelInfo, 0, len(*list.Data))
@@ -131,8 +150,10 @@ func listOpenAIModels(ctx context.Context, c *Client) ([]ModelInfo, error) {
 		mi := ModelInfo{ID: entry.ID, Protocol: c.settings.protocol}
 		if parser != nil {
 			applyModelCapability(&mi, parser(entry.ID, raw))
+		} else {
+			applyModelCapability(&mi, parseModelCapabilities(raw))
 		}
 		models = append(models, mi)
 	}
-	return models, nil
+	return models, false, nil
 }

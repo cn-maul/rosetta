@@ -100,8 +100,8 @@ func TestAnthropicVersionExported(t *testing.T) {
 	}
 }
 
-// P2: ListModels fills capabilities only when a parser is installed; the
-// default stays no-guessing. The parser runs for every protocol.
+// P2: ListModels fills capabilities via the built-in parser by default, and a
+// custom parser fully replaces it. Entries stay Known=false either way.
 func TestModelCapabilityParser(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" && r.URL.Path != "/v1/models" {
@@ -113,49 +113,46 @@ func TestModelCapabilityParser(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// Default: no guessing, capability fields stay zero.
+	// Default: the built-in parser reads the vendor-reported fields.
 	c := newTestClient(t, WithProtocol(ProtoOpenAIChat), WithEndpoint(srv.URL))
 	models, err := c.ListModels(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0].ID != "deepseek-chat" || models[0].ContextWindow != 0 || models[0].MaxOutputTokens != 0 {
-		t.Fatalf("default models = %+v", models)
+	if len(models) != 1 || models[0].ContextWindow != 65536 || models[0].MaxOutputTokens != 8192 {
+		t.Fatalf("built-in parsed models = %+v", models)
+	}
+	if models[0].Known {
+		t.Fatal("remote entries must not become Known via the built-in parser")
 	}
 
-	parse := func(_ string, raw json.RawMessage) ModelInfo {
-		var m struct {
-			Ctx int `json:"context_length"`
-			Max int `json:"max_output_tokens"`
-		}
-		_ = json.Unmarshal(raw, &m)
-		return ModelInfo{ContextWindow: m.Ctx, MaxOutputTokens: m.Max}
-	}
-
-	// With parser on the OpenAI-compat protocol.
-	c2 := newTestClient(t, WithProtocol(ProtoOpenAIChat), WithEndpoint(srv.URL), WithModelCapabilityParser(parse))
+	// A custom parser fully replaces the built-in one.
+	c2 := newTestClient(t, WithProtocol(ProtoOpenAIChat), WithEndpoint(srv.URL),
+		WithModelCapabilityParser(func(_ string, _ json.RawMessage) ModelInfo {
+			return ModelInfo{ContextWindow: 999}
+		}))
 	models2, err := c2.ListModels(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := models2[0]
-	if m.ContextWindow != 65536 || m.MaxOutputTokens != 8192 {
-		t.Fatalf("parsed models = %+v", m)
+	if m.ContextWindow != 999 || m.MaxOutputTokens != 0 {
+		t.Fatalf("custom parser must override built-in, got %+v", m)
 	}
 	if m.ID != "deepseek-chat" {
 		t.Fatalf("ID must stay SDK-owned, got %q", m.ID)
 	}
 	if m.Known {
-		t.Fatal("remote entries must not become Known via the parser")
+		t.Fatal("remote entries must not become Known via the custom parser")
 	}
 
-	// With parser on the Anthropic protocol (generic hook + pagination).
-	c3 := newTestClient(t, WithProtocol(ProtoAnthropic), WithEndpoint(srv.URL), WithModelCapabilityParser(parse))
+	// The built-in parser runs for Anthropic too (generic hook + pagination).
+	c3 := newTestClient(t, WithProtocol(ProtoAnthropic), WithEndpoint(srv.URL))
 	models3, err := c3.ListModels(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(models3) != 1 || models3[0].ContextWindow != 65536 {
-		t.Fatalf("anthropic parsed models = %+v", models3)
+		t.Fatalf("anthropic built-in parsed models = %+v", models3)
 	}
 }

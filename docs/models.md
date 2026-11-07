@@ -13,7 +13,10 @@
 - 手动层内部，`WithModelInfo` 与 `WithModelsFile` 的条目合并；id 冲突时 `WithModelInfo` 显式条目优先。
 - 布尔字段遵循 OR 语义：手动条目声明 `SupportsThinking: true` 后，远端条目无法撤销它；反向撤销用手动条目的 `DisableThinking: true`（例如远端目录错误地声明了 thinking 支持时）。`DisableThinking` 是显式撤销开关：无论是否发生跨层合并，只要条目声明了它，合并结果强制 `SupportsThinking=false`。
 - **别名冲突即报错**：同一别名解析到多个规范 ID（同层、跨层或遮蔽其他模型 ID）时，`NewClient` / `ListModels` 直接报错，而不是按 map 顺序随机归属。
-- **Known 语义**（原则：自定义模型不猜测）：手动配置 `Known=true`；仅靠 `/models` 发现的条目 `Known=false`，不推断任何能力。thinking 门控与上下文校验只对 `Known=true` 的条目生效。
+- **Known 语义**（原则：读上游、不猜测）：手动配置 `Known=true`；仅靠 `/models` 发现的条目 `Known=false`。`/models` 条目会解析上游**显式报告**的能力字段（`ContextWindow` / `MaxOutputTokens` / `EffortLevels` / `SupportsThinking`，按宽松字段名匹配，含 OpenRouter 的 `top_provider` 与 `reasoning` 对象形态）——这是「读」，不是「猜」：上游没报的字段保持未知。thinking 门控与上下文校验只对 `Known=true` 的条目生效，`/models` 解析出的能力字段**不改变门控**。
+- **三态 thinking**：`ThinkingReported` 区分「上游没报」与「上游明说不支持」。`ThinkingReported=false` 表示未知，调用方不能据此剥思考；`ThinkingReported=true` 且 `SupportsThinking=false` 才是「明确不支持」。
+- **内置解析可覆盖**：`WithModelCapabilityParser(fn)` 完全替换内置解析器（内置不够用、或需要按模型 id 映射档案时才用——Anthropic 的 `/v1/models` 不返回能力字段，只能靠 id→档案映射）。
+- **`/models` 路径回退**：域根 endpoint 先试 `/v1/models`，收到 404/410 再退回 `/models`；只对「路径不存在」回退，5xx / 超时 / 畸形响应不回退。
 - 别名：手动条目可声明 `Aliases`，查询时自动归一到规范 ID。请求发出前 SDK 也会把别名解析为规范 ID 再上 wire（未知模型原样透传，不触发 `/models` 探测）——上游按 model 隔离前缀缓存，别名与全名混用必然 miss 一侧；记账同理归并。
 - **声明的元数据参与请求门控**：`ContextWindow` 用于上下文校验；`MaxOutputTokens` 在请求未显式给出输出上限时作为输出上限生效（回退链：请求值 → 注册表 → `WithDefaultMaxOutputTokens`）。
 - **`Type` 分类**：`chat`（默认假设）/ `embedding` / `rerank`。OpenAI 系 `/models` 不声明模型类型，SDK 不会猜测——需要区分时通过手动配置声明；它目前用于目录标注，`Embed` / `Rerank` 调用本身不依赖它。

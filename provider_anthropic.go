@@ -1039,15 +1039,33 @@ func (p *anthropicProvider) CountTokens(ctx context.Context, req *ChatRequest) (
 	return int(out.InputTokens.Value), nil
 }
 
-// ListModels queries GET /v1/models, following the has_more/after_id
-// pagination (the catalog is served in pages of ~20 by default). Entries
-// carry no capability metadata.
+// ListModels queries GET /models, following the has_more/after_id pagination
+// (the catalog is served in pages of ~20 by default). Entries carry whatever
+// capability fields the vendor reported (see parseModelCapabilities).
 func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	var lastErr error
+	for _, base := range p.c.modelListURLs() {
+		models, fallback, err := p.listAnthropicModelsOnce(ctx, base)
+		if err == nil {
+			return models, nil
+		}
+		lastErr = err
+		if !fallback {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// listAnthropicModelsOnce fetches the paginated catalog from one base URL.
+// fallback reports whether the first page answered 404/410 ("this path does
+// not exist"), which should trigger the next candidate path; any other
+// status, a transport error or a malformed body must not.
+func (p *anthropicProvider) listAnthropicModelsOnce(ctx context.Context, base string) ([]ModelInfo, bool, error) {
 	const method = http.MethodGet
-	base := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/models"))
 	parsed, err := url.Parse(base)
 	if err != nil {
-		return nil, fmt.Errorf("rosetta: invalid endpoint %q: %w", displayEndpoint(base), err)
+		return nil, false, fmt.Errorf("rosetta: invalid endpoint %q: %w", displayEndpoint(base), err)
 	}
 	var models []ModelInfo
 	after := ""
@@ -1064,14 +1082,15 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		call := &httpx.Call{Method: method, URL: pageURL, Header: p.headers(false)}
 		resp, err := p.c.call(ctx, call)
 		if err != nil {
-			return nil, transport(err, method, pageURL)
+			return nil, false, transport(err, method, pageURL)
 		}
 		body, rerr := readBody(resp, method, pageURL, bodyLimit)
 		if rerr != nil {
-			return nil, rerr
+			return nil, false, rerr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, withRetryAfter(parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header)), resp.Header)
+			fallback := page == 0 && (resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone)
+			return nil, fallback, withRetryAfter(parseAnthropicError(resp.StatusCode, body, method, pageURL, requestID(resp.Header)), resp.Header)
 		}
 		var list struct {
 			Data    *[]json.RawMessage `json:"data"`
@@ -1083,7 +1102,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 			// ErrUpstreamMalformed. Same classification as the OpenAI-compat
 			// catalog decoder in provider_openai_common.go so a caller sees
 			// one behaviour regardless of which protocol it probed.
-			return nil, fmt.Errorf("%w: model list: %w", ErrUpstreamMalformed, err)
+			return nil, false, fmt.Errorf("%w: model list: %w", ErrUpstreamMalformed, err)
 		}
 		// Missing/null "data" is a malformed catalog, not an empty one:
 		// treating it as empty would wipe the previously learned remote
@@ -1095,7 +1114,7 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 		// from a body that failed to parse at all. Content checks that run on a
 		// body which DID decode to the required shape stay untagged.
 		if list.Data == nil {
-			return nil, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
+			return nil, false, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 		}
 		parser := p.c.settings.modelCapability
 		for _, raw := range *list.Data {
@@ -1109,18 +1128,20 @@ func (p *anthropicProvider) ListModels(ctx context.Context) ([]ModelInfo, error)
 			mi := ModelInfo{ID: entry.ID, DisplayName: entry.DisplayName, Protocol: ProtoAnthropic}
 			if parser != nil {
 				applyModelCapability(&mi, parser(entry.ID, raw))
+			} else {
+				applyModelCapability(&mi, parseModelCapabilities(raw))
 			}
 			models = append(models, mi)
 		}
 		if !list.HasMore || page > 100 {
-			return models, nil
+			return models, false, nil
 		}
 		if next := list.LastID; next != "" && len(*list.Data) > 0 {
 			after = next
 			continue
 		}
 		// has_more without a usable cursor: stop rather than loop forever.
-		return models, nil
+		return models, false, nil
 	}
 }
 

@@ -18,8 +18,11 @@ const (
 // ModelInfo describes a model's identity and capability metadata. It comes
 // from two sources in priority order: manual configuration (WithModelInfo
 // / WithModelsFile) and remote discovery (ListModels). Manual entries have
-// Known=true; entries learned from /models have Known=false and carry no
-// inferred capability data (no guessing for custom models).
+// Known=true. Entries learned from /models have Known=false but now carry
+// whatever capability fields the vendor reported (parsed by the built-in
+// parser; see parseModelCapabilities) — that is reading, not guessing: a
+// field the vendor did not send stays unknown rather than inferred, and
+// SDK-side capability gating still only applies to Known=true entries.
 type ModelInfo struct {
 	// ID is the provider model id used in requests.
 	ID string `json:"id"`
@@ -32,9 +35,20 @@ type ModelInfo struct {
 	ContextWindow int `json:"context_window,omitempty"`
 	// MaxOutputTokens is the per-request output cap.
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
-	// SupportsThinking reports whether the model can reason. Meaningful
-	// only when Known is true.
+	// SupportsThinking reports whether the model can reason. For manual
+	// entries (Known=true) it is authoritative; for remote /models entries
+	// it reflects what the vendor reported. When ThinkingReported is false
+	// the value carries no information and must not be read as "does not
+	// support thinking" — that reading would strip reasoning from every
+	// model whose vendor simply omitted the field.
 	SupportsThinking bool `json:"supports_thinking,omitempty"`
+	// ThinkingReported reports whether SupportsThinking reflects an explicit
+	// source declaration rather than a zero-value default. It preserves the
+	// three-way distinction "unknown / supports / does not support":
+	// ThinkingReported=false means the source said nothing (unknown), while
+	// ThinkingReported=true with SupportsThinking=false is an explicit
+	// "does not support".
+	ThinkingReported bool `json:"thinking_reported,omitempty"`
 	// DisableThinking explicitly revokes a thinking claim inherited from a
 	// lower-priority layer: a sparse manual entry cannot unset a remote
 	// entry's SupportsThinking=true (merge uses OR semantics), so set this
@@ -72,16 +86,17 @@ type ModelInfo struct {
 
 // ModelCapabilityParser inspects one raw /models entry and returns the
 // capability fields to attach to that entry's ModelInfo. It is installed
-// via WithModelCapabilityParser; without it ListModels keeps the no-guessing
-// default and parses only id (and display name where the protocol has one).
+// via WithModelCapabilityParser and, when present, fully replaces the
+// built-in parser (parseModelCapabilities). Without it ListModels uses the
+// built-in field-name normalization.
 //
 // The SDK owns identity and provenance: ID, DisplayName, Protocol and Known
 // are set by the SDK and ignored in the returned value. The parser fills the
 // capability subset — ContextWindow, MaxOutputTokens, SupportsThinking,
-// DisableThinking, EffortLevels, Type and Aliases. Entries stay Known=false
-// (they are still remote-discovered), so SDK-side capability gating does not
-// change; a caller that wants the parsed fields to gate must merge them into
-// manual config (WithModelInfo / WithModelsFile).
+// ThinkingReported, DisableThinking, EffortLevels, Type and Aliases. Entries
+// stay Known=false (they are still remote-discovered), so SDK-side capability
+// gating does not change; a caller that wants the parsed fields to gate must
+// merge them into manual config (WithModelInfo / WithModelsFile).
 //
 // The parser runs for every protocol, including Anthropic — whose /v1/models
 // returns no capability fields, so mapping from model id to a known profile
@@ -100,6 +115,9 @@ func applyModelCapability(dst *ModelInfo, cap ModelInfo) {
 	}
 	if cap.SupportsThinking {
 		dst.SupportsThinking = true
+	}
+	if cap.ThinkingReported {
+		dst.ThinkingReported = true
 	}
 	if cap.DisableThinking {
 		dst.DisableThinking = true

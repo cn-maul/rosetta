@@ -16,9 +16,10 @@ import (
 // lower ones field by field; empty fields inherit from the layer below.
 //
 // Following the "custom models are not guessed" principle: entries
-// learned purely from /models carry Known=false and no inferred
-// capability data, so thinking gating and context validation only apply
-// to what was explicitly declared.
+// learned purely from /models carry Known=false, and any capability fields
+// they show are what the vendor reported (read, not guessed). Thinking
+// gating and context validation still only apply to what was explicitly
+// declared manually.
 //
 // Installed and returned ModelInfo values are snapshots: Aliases slices
 // are copied on the way in and on the way out, so callers can never
@@ -222,6 +223,9 @@ func mergeInfo(high, low ModelInfo) ModelInfo {
 	}
 	if !out.SupportsThinking {
 		out.SupportsThinking = low.SupportsThinking
+	}
+	if !out.ThinkingReported {
+		out.ThinkingReported = low.ThinkingReported
 	}
 	if len(out.Aliases) == 0 {
 		out.Aliases = low.Aliases

@@ -109,3 +109,22 @@ func joinEndpoint(base, path string) string {
 	}
 	return b + path
 }
+
+// modelListURLs returns the candidate /models endpoint paths for ListModels,
+// most likely first. It is deliberately narrower than joinEndpoint (which
+// serves every request path): only the model catalog benefits from a fallback.
+//
+// A domain-root endpoint (no path, or just "/") tries /v1/models first —
+// the de-facto standard for OpenAI-family services — and falls back to
+// /models. An endpoint that already carries a path (versioned or proxied) is
+// used as-is with /models appended, exactly like joinEndpoint.
+func (c *Client) modelListURLs() []string {
+	base := trimTrailingSlash(c.settings.endpoint)
+	if u, err := parseURL(base); err == nil && u.Scheme != "" && u.Host != "" && (u.Path == "" || u.Path == "/") {
+		return []string{
+			c.decorateURL(base + "/v1/models"),
+			c.decorateURL(base + "/models"),
+		}
+	}
+	return []string{c.decorateURL(base + "/models")}
+}

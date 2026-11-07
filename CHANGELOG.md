@@ -66,10 +66,20 @@
   出站 wire 与现状一致。
 - **`AnthropicVersion` 导出**：Anthropic 目标 API 版本（`2026-10-21`）导出为常量，供绕过
   SDK 手搓 Anthropic HTTP 的调用方复用同一事实来源，避免硬编码过期版本。
-- **`WithModelCapabilityParser`**：可选钩子，把 `/models` 原始条目解析成 `ModelInfo` 能力
-  字段（`ContextWindow` / `MaxOutputTokens` / `SupportsThinking` / `EffortLevels` 等）。默认
-  仍 no-guessing（只解析 id 与 display name）；钩子对每协议生效（含 Anthropic，其 `/v1/models`
-  不返回能力字段，只能靠 id→档案映射）。条目仍 `Known=false`，SDK 侧能力门控不变。
+- **`/models` 内置能力解析**：`ListModels` 默认用内置的 `parseModelCapabilities` 按宽松字段名
+  解析上游显式报告的能力字段（`context_length`/`context_window`/`max_input_tokens`、
+  `max_completion_tokens`/`max_output_tokens`、`reasoning_supported_efforts`/
+  `supported_reasoning`/`supported_efforts`/`effort_levels`、`supports_reasoning`/
+  `supports_thinking`、以及 OpenRouter 的嵌套 `top_provider.*` 与 `reasoning` 对象形态）。
+  这是「读上游报告」，不是「猜」：没报的字段保持未知，`Known=false` 与能力门控不变。
+- **三态 `SupportsThinking`**：新增 `ModelInfo.ThinkingReported`，区分「上游没报」（未知，别剥
+  思考）与「上游明说 false」（明确不支持）。未改变 `SupportsThinking` 的现有类型，避免破坏
+  已发布的公开字段。
+- **`/models` 路径回退**：域根 endpoint 先试 `/v1/models`，收到 404/410 再退回 `/models`；只对
+  「路径不存在」回退，5xx / 超时 / 畸形响应不回退。仅作用于 `ListModels`，`joinEndpoint` 不变。
+- **`WithModelCapabilityParser` 降级为覆盖**：内置解析器默认生效；安装自定义钩子则完全替换内置
+  解析（内置不够用、或需要按模型 id 映射档案时才用——Anthropic 的 `/v1/models` 不返回能力
+  字段，只能靠 id→档案映射）。
 
 ### 修复
 
