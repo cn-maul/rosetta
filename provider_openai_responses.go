@@ -389,7 +389,7 @@ func (p *openaiResponsesProvider) buildPayload(req *ChatRequest, stream bool, st
 	if stream {
 		payload["stream"] = true
 	}
-	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.extraOverrides, openaiResponsesReservedPayloadKeys); err != nil {
+	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.canExtraOverride, openaiResponsesReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	return payload, nil

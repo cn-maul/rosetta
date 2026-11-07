@@ -323,7 +323,7 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 	if stream {
 		payload["stream"] = true
 	}
-	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.extraOverrides, anthropicReservedPayloadKeys); err != nil {
+	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.canExtraOverride, anthropicReservedPayloadKeys); err != nil {
 		return nil, anthroPayloadScan{}, err
 	}
 	scan := scanAnthropicPayload(payload)

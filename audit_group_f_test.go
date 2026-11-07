@@ -145,14 +145,14 @@ func TestAuditPerProtocolReservedKeys(t *testing.T) {
 	}
 	// End-to-end through mergeExtra: tool_choice is SDK-managed now.
 	payload := map[string]any{"model": "m"}
-	if err := mergeExtra(payload, map[string]any{"tool_choice": "any"}, false, anthropicReservedPayloadKeys); !errors.Is(err, ErrInvalidRequest) {
+	if err := mergeExtra(payload, map[string]any{"tool_choice": "any"}, func(string) bool { return false }, anthropicReservedPayloadKeys); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("anthropic Extra[tool_choice] must be rejected, got %v", err)
 	}
 	// A key no adapter emits stays settable through Extra.
-	if err := mergeExtra(payload, map[string]any{"future_field": "x"}, false, anthropicReservedPayloadKeys); err != nil {
+	if err := mergeExtra(payload, map[string]any{"future_field": "x"}, func(string) bool { return false }, anthropicReservedPayloadKeys); err != nil {
 		t.Fatalf("unknown Extra key rejected: %v", err)
 	}
-	if err := mergeExtra(payload, map[string]any{"model": "x"}, false, anthropicReservedPayloadKeys); !errors.Is(err, ErrInvalidRequest) {
+	if err := mergeExtra(payload, map[string]any{"model": "x"}, func(string) bool { return false }, anthropicReservedPayloadKeys); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("anthropic Extra[model] must still be rejected, got %v", err)
 	}
 }

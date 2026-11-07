@@ -101,21 +101,22 @@ func (c *Client) Rerank(ctx context.Context, req *RerankRequest) (*RerankRespons
 	if req.ReturnDocuments {
 		payload["return_documents"] = true
 	}
-	if err := mergeExtra(payload, req.Extra, c.settings.extraOverrides, rerankReservedPayloadKeys); err != nil {
+	if err := mergeExtra(payload, req.Extra, c.settings.canExtraOverride, rerankReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	body, err := postAuxJSON(ctx, c, "/rerank", payload)
 	if err != nil {
 		return nil, err
 	}
-	// WithExtraOverrides(true) lets Extra replace documents; validate the
+	// An allowed override (WithExtraOverrides, or a whitelisted key via
+	// WithExtraOverrideKeys) lets Extra replace documents; validate the
 	// reply against what is actually on the wire. Normalize through JSON so
 	// an override of any shape is read, and reject an override to an empty
 	// list rather than skipping the index range check (audit C20). When no
 	// override is in play the SDK's own []string is authoritative, so the
 	// expensive JSON round-trip is skipped.
 	expectedDocs := len(req.Documents)
-	if c.settings.extraOverrides && len(req.Extra) > 0 {
+	if c.settings.canExtraOverride("documents") && len(req.Extra) > 0 {
 		if n, ok := wireSliceLen(payload["documents"]); ok {
 			if n == 0 {
 				return nil, fmt.Errorf("%w: rerank documents is empty after Extra override", ErrInvalidRequest)

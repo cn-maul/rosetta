@@ -90,14 +90,15 @@ func (c *Client) Embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingRe
 	if req.User != "" {
 		payload["user"] = req.User
 	}
-	if err := mergeExtra(payload, req.Extra, c.settings.extraOverrides, embeddingsReservedPayloadKeys); err != nil {
+	if err := mergeExtra(payload, req.Extra, c.settings.canExtraOverride, embeddingsReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	body, err := postAuxJSON(ctx, c, "/embeddings", payload)
 	if err != nil {
 		return nil, err
 	}
-	// WithExtraOverrides(true) lets Extra replace input/dimensions; the
+	// An allowed override (WithExtraOverrides, or a whitelisted key via
+	// WithExtraOverrideKeys) lets Extra replace input/dimensions; the
 	// response must then be validated against what is actually on the
 	// wire, not the original request fields. Normalize through JSON so an
 	// override of any shape ([]any, float64) is read, not just the SDK's
@@ -106,7 +107,7 @@ func (c *Client) Embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingRe
 	// own []string/int is authoritative, so the expensive JSON round-trip is
 	// skipped.
 	expected := len(req.Input)
-	if c.settings.extraOverrides && len(req.Extra) > 0 {
+	if c.settings.canExtraOverride("input") && len(req.Extra) > 0 {
 		if n, ok := wireSliceLen(payload["input"]); ok {
 			if n == 0 {
 				return nil, fmt.Errorf("%w: embeddings input is empty after Extra override", ErrInvalidRequest)
@@ -115,7 +116,7 @@ func (c *Client) Embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingRe
 		}
 	}
 	dimensions := req.Dimensions
-	if c.settings.extraOverrides && len(req.Extra) > 0 {
+	if c.settings.canExtraOverride("dimensions") && len(req.Extra) > 0 {
 		if v, ok := wireInt(payload["dimensions"]); ok {
 			dimensions = v
 		}

@@ -1,5 +1,16 @@
 # 更新日志
 
+## v1.3.1 (2026-11-07)
+
+### 新增
+
+- **`WithExtraOverrideKeys(keys...)`**：`Extra` 覆盖的按键白名单。默认（全关）与
+  `WithExtraOverrides(true)`（全开）之间的中间档——只放行列出的键可覆盖 SDK 管理字段，
+  其余保留键仍按各协议自己的 reserved 集合报 `ErrInvalidRequest`。空调用不放行任何键；
+  重复调用后值覆盖前者；与 `WithExtraOverrides(true)` 取并集。`tools` 的追加/替换语义
+  同步跟随：白名单含 `tools` 走替换、否则保持追加。embed/rerank 共用同一套判断（响应校验
+  也按 `input`/`dimensions`/`documents` 的放行情况决定是否按覆盖后的 wire 值重验）。
+
 ## v1.3.0 (2026-11-07)
 
 能力面从「三协议最小公共子集」推进到可支撑结构化输出与 Agent 工具链路，并补齐了

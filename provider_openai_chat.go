@@ -223,7 +223,7 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 			pl["stream_options"] = map[string]any{"include_usage": true}
 		}
 	}
-	if err := mergeExtraWithTools(pl, req.Extra, p.c.settings.extraOverrides, openaiChatReservedPayloadKeys); err != nil {
+	if err := mergeExtraWithTools(pl, req.Extra, p.c.settings.canExtraOverride, openaiChatReservedPayloadKeys); err != nil {
 		return nil, err
 	}
 	// The unified response models a single assistant turn, and

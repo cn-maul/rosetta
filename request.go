@@ -458,16 +458,15 @@ var (
 )
 
 // mergeExtra copies Extra into the payload, enforcing the reserved-key
-// rule for the given API family unless overrides are explicitly enabled.
-func mergeExtra(dst map[string]any, extra map[string]any, allowOverride bool, reserved map[string]bool) error {
+// rule for the given API family unless the key is allowed to override
+// (canOverride reports the per-key permission).
+func mergeExtra(dst map[string]any, extra map[string]any, canOverride func(string) bool, reserved map[string]bool) error {
 	if len(extra) == 0 {
 		return nil
 	}
-	if !allowOverride {
-		for k := range extra {
-			if reserved[k] {
-				return fmt.Errorf("%w: Extra key %q collides with an SDK-managed field (pass WithExtraOverrides(true) to override anyway)", ErrInvalidRequest, k)
-			}
+	for k := range extra {
+		if reserved[k] && !canOverride(k) {
+			return fmt.Errorf("%w: Extra key %q collides with an SDK-managed field (pass WithExtraOverrides(true) or WithExtraOverrideKeys(%q) to override)", ErrInvalidRequest, k, k)
 		}
 	}
 	maps.Copy(dst, extra)
@@ -477,15 +476,15 @@ func mergeExtra(dst map[string]any, extra map[string]any, allowOverride bool, re
 // mergeExtraWithTools is mergeExtra plus append semantics for Extra tools:
 // an Extra "tools" entry is appended to the SDK-built tool list rather than
 // rejected (the default) or replacing it, so a caller can add a server-side
-// tool without re-declaring every function. With WithExtraOverrides the
-// entry replaces the field wholesale, matching the option's contract.
-func mergeExtraWithTools(dst map[string]any, extra map[string]any, allowOverride bool, reserved map[string]bool) error {
+// tool without re-declaring every function. When "tools" is allowed to
+// override, the entry replaces the field wholesale, matching that contract.
+func mergeExtraWithTools(dst map[string]any, extra map[string]any, canOverride func(string) bool, reserved map[string]bool) error {
 	if len(extra) == 0 {
 		return nil
 	}
 	raw, hasTools := extra["tools"]
 	if !hasTools {
-		return mergeExtra(dst, extra, allowOverride, reserved)
+		return mergeExtra(dst, extra, canOverride, reserved)
 	}
 	rest := make(map[string]any, len(extra))
 	for k, v := range extra {
@@ -493,10 +492,10 @@ func mergeExtraWithTools(dst map[string]any, extra map[string]any, allowOverride
 			rest[k] = v
 		}
 	}
-	if err := mergeExtra(dst, rest, allowOverride, reserved); err != nil {
+	if err := mergeExtra(dst, rest, canOverride, reserved); err != nil {
 		return err
 	}
-	if allowOverride {
+	if canOverride("tools") {
 		dst["tools"] = raw
 		return nil
 	}

@@ -51,6 +51,7 @@ client, err := rosetta.NewClient(
 | `WithRequestIDFunc(fn)` | 无 | 给每个出站请求注入 `X-Request-Id`；显式 `WithHeader("X-Request-Id", ...)` 优先 |
 | `WithAnthropicBearerAuth(v)` | false | 额外发送 `Authorization: Bearer`（默认只发 `x-api-key`；仅认证方式只有 Bearer 的兼容网关需要） |
 | `WithExtraOverrides(v)` | false | 允许 `Extra` 覆盖 SDK 管理的负载字段（默认冲突即报 `ErrInvalidRequest`）。保留键按 API 族划分：chat（`model`/`messages`/`stream`/输出上限/采样/工具/thinking 等）、embeddings（`model`/`input`/`dimensions`/`user`/`encoding_format`）、rerank（`model`/`query`/`documents`/`top_n`/`return_documents`）——因此 `ChatRequest.Extra["user"]` 合法（chat 没有 user 字段），而 `EmbeddingRequest.Extra["user"]` 会被拒 |
+| `WithExtraOverrideKeys(keys...)` | 无 | 只放行**列出的键**可被 `Extra` 覆盖，其余保留键仍报 `ErrInvalidRequest`——`WithExtraOverrides` 全开与默认全关之间的中间档。空调用不放行任何键；重复调用后值覆盖前者；与 `WithExtraOverrides(true)` 取并集（后者仍全开） |
 | `WithMultimediaTokenEstimates(e)` | 1500/500/3000 | 上下文检查中图片/音频/文档块的平估 token 数 |
 | `WithQuirks(q)` | 无 | 声明第三方兼容性偏差（`LegacyMaxTokens` / `NoStreamUsage` / `NoIdempotencyKey`），见[协议与兼容](protocols.md) |
 
@@ -147,7 +148,7 @@ type ChatRequest struct {
 	ParallelToolCalls  *bool            // ToolChoice.DisableParallel 优先
 	Thinking           *ThinkingConfig  // nil = 协议默认（不思考）
 	IdempotencyKey     string           // 空 = 每次随机；跨进程重试时传入稳定值
-	Extra              map[string]any   // 逃生口：逐键合并；与 SDK 管理字段冲突时报错（WithExtraOverrides 放行）
+	Extra              map[string]any   // 逃生口：逐键合并；与 SDK 管理字段冲突时报错（WithExtraOverrides 全开 / WithExtraOverrideKeys 按键放行）
 }
 ```
 

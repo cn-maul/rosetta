@@ -86,6 +86,7 @@ type settings struct {
 	anthropicBearer     bool
 	strictContext       bool
 	extraOverrides      bool
+	extraOverrideKeys   map[string]bool
 	unknownEvents       bool
 	headers             http.Header
 	betas               []string
@@ -423,6 +424,32 @@ func WithUnknownEvents(v bool) Option {
 // fields for a provider quirk.
 func WithExtraOverrides(v bool) Option {
 	return func(s *settings) { s.extraOverrides = v }
+}
+
+// WithExtraOverrideKeys lets Extra override only the listed payload keys,
+// while every other SDK-managed (reserved) key keeps its collision check.
+// It is the middle ground between the default (nothing overridable) and
+// WithExtraOverrides(true) (everything overridable). The two compose as a
+// union: WithExtraOverrides(true) still overrides every key regardless of
+// the whitelist.
+//
+// An empty call — WithExtraOverrideKeys() — is a no-op that allows nothing,
+// the same as not calling it. Repeated calls replace the whitelist (last
+// call wins). The keys are logical field names; whether a key is reserved
+// is still decided per protocol (e.g. "top_k" is only reserved on
+// Anthropic), so the same key may be a no-op on protocols that never set it.
+func WithExtraOverrideKeys(keys ...string) Option {
+	m := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		m[k] = true
+	}
+	return func(s *settings) { s.extraOverrideKeys = m }
+}
+
+// canExtraOverride reports whether Extra may override the given payload key:
+// the all-or-nothing switch, or a key-scoped whitelist entry.
+func (s settings) canExtraOverride(key string) bool {
+	return s.extraOverrides || s.extraOverrideKeys[key]
 }
 
 // WithTokenCounter plugs a real tokenizer into the local estimator. It is
