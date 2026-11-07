@@ -33,7 +33,7 @@ client, err := rosetta.NewClient(
 | `WithLogger(l)` | 丢弃 | 接收 debug/warn 日志（重试、降级、告警） |
 | `WithThinkingFallback(v)` | false | 见 [thinking](#thinking-统一配置) |
 | `WithThinkingRectify(v)` | true | Anthropic 预算错误的响应式整流开关 |
-| `WithInterleavedThinking(v)` | 自动 | 强制开关 Anthropic 的 `interleaved-thinking-2025-05-14` beta 头。默认按 payload 是否**同时**含 thinking 与 tools 自动判定；端点经 Bedrock / Vertex 转发时设 `false`（这两家会拒绝白名单外模型的该头），见[协议与兼容](protocols.md) |
+| `WithInterleavedThinking(v)` | 自动 | 保留的兼容 no-op：交错思考已在 Anthropic API 2026-10-21 转正，SDK 不再发送 `interleaved-thinking` beta 头 |
 | `WithMaxTokensField(f)` | 自动探测 | 强制 OpenAI Chat 的输出上限字段（`max_completion_tokens` / `max_tokens`） |
 | `WithStrictContextCheck(v)` | false | 上下文超限从告警变为报错 |
 | `WithModelInfo(...)` | 无 | 手动注入模型元数据（可多次调用，与文件配置合并，id 冲突时优先），见[模型体系](models.md) |
@@ -41,7 +41,7 @@ client, err := rosetta.NewClient(
 | `WithEmbeddingEndpoint(url)` | 主 endpoint | Embed / Rerank 的独立基地址（chat 走主地址、embedding 走另一家时使用），见[嵌入与重排](#嵌入与重排) |
 | `WithEmbeddingAPIKey(key)` | 主 key | 嵌入端点的独立凭证 |
 | `WithHeader(k, v)` / `WithHeaders(h)` | 无 | 给每个请求加 header，同名覆盖 SDK 默认值。用于 Azure 的 `api-key`、OpenRouter 的 `HTTP-Referer`/`X-Title`、`traceparent` 透传 |
-| `WithBeta(flags...)` | 无 | 追加 Anthropic beta 标志，与 SDK 自动判定的（缓存 TTL、交错思考）逗号合并 |
+| `WithBeta(flags...)` | 无 | 追加调用方自选的 Anthropic beta 标志（如 `files-api-2025-04-14`）。SDK 不再自动判定 beta——缓存 TTL 与交错思考已转正 |
 | `WithQueryParam(k, v)` | 无 | 给每个请求 URL 追加 query 参数（如 Azure 的 `api-version`）。endpoint 本身仍禁止带 query |
 | `WithPathPrefix(p)` | 无 | 给每个请求 URL 加路径前缀（Azure 的 `/openai`、反代的 `/llm`） |
 | `WithOrganization(id)` / `WithProject(id)` | 无 | OpenAI 系的 `OpenAI-Organization` / `OpenAI-Project` |
@@ -127,12 +127,12 @@ type ChatRequest struct {
 	Messages           []Message        // 与 System 至少有一项
 	System             string           // 顶层系统提示
 	MaxOutputTokens    int              // 0 = 依次回退：注册表元数据 → WithDefaultMaxOutputTokens；Anthropic 兜底 4096
-	Temperature        *float64         // 指针，nil = 不发送；用 rosetta.Float(0.7) 构造
+	Temperature        *float64         // 指针，nil = 不发送；用 rosetta.Float(0.7) 构造（Anthropic 2026-10-21 起不再发送）
 	TopP               *float64
 	Seed               *int             // 可复现采样（OpenAI 系）
 	PresencePenalty    *float64         // reasoning 请求下与 temperature 一同丢弃
 	FrequencyPenalty   *float64
-	TopK               *int             // 仅 Anthropic；thinking 模式下丢弃
+	TopK               *int             // Anthropic 2026-10-21 起移除该参数，SDK 不再发送（其他协议无此字段）
 	Logprobs           *bool            // 原始载荷回填到 ChatResponse.Logprobs
 	TopLogprobs        *int
 	User               string           // OpenAI user / Anthropic metadata.user_id
@@ -140,7 +140,7 @@ type ChatRequest struct {
 	Store              *bool            // Responses：是否持久化
 	PreviousResponseID string           // Responses：续接已存储的对话
 	Verbosity          string           // Responses：text.verbosity
-	StopSequences      []string         // Responses 不支持，丢弃并记日志
+	StopSequences      []string         // Responses 不支持、Anthropic 2026-10-21 起移除，均丢弃并记日志
 	ResponseFormat     *ResponseFormat  // 结构化输出，三协议映射
 	Tools              []ToolDefinition // 仅透传，执行工具是你的事
 	ToolChoice         *ToolChoice      // auto / none / required / tool
@@ -206,11 +206,11 @@ Thinking: &rosetta.ThinkingConfig{Effort: rosetta.EffortMedium} // 低/中/高�
 |---|---|---|
 | OpenAI Chat | `reasoning_effort` | Effort 直传；显式 BudgetTokens 就近映射档位（≤4096 low，≤16384 medium，其余 high） |
 | OpenAI Responses | `reasoning.effort` | 同上 |
-| Anthropic | `thinking.budget_tokens` | Effort ≈ 2048/8192/32768；显式预算原样；两者都没给默认 medium |
+| Anthropic | `thinking.budget_tokens`（或 `Adaptive` → `type: adaptive`） | Effort ≈ 2048/8192/32768；显式预算原样；两者都没给默认 medium |
 
-Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；thinking 模式下丢弃 temperature/top_p；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。
+Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。`Adaptive: true` 时改发 `type: "adaptive"`（模型自定预算，与 `BudgetTokens`/`Effort` 互斥）。Anthropic 在 2026-10-21 版本移除了采样参数（`temperature`/`top_p`/`top_k`/`stop_sequences`），SDK 对 Anthropic 协议不再发送这些字段。
 
-**工具调用之间的推理（交错思考）**：请求同时带 `Thinking` 与 `Tools` 时，SDK 自动附上 `anthropic-beta: interleaved-thinking-2025-05-14`，让模型在收到每个工具结果后继续推理，而不是在轮次开头思考一次就不再思考。该头对 Claude API 无副作用（不支持的模型忽略它），但 **Bedrock / Vertex 会对白名单外的模型报错**——端点经这类网关转发时用 `WithInterleavedThinking(false)` 关闭自动发送。模型差异与完整规则见[协议与兼容](protocols.md)。
+**工具调用之间的推理（交错思考）**：交错思考已在 Anthropic API 2026-10-21 转正，SDK 不再需要、也不再自动发送 beta 头——请求同时带 `Thinking` 与 `Tools` 时即自然交错。旧的 `WithInterleavedThinking` 保留为 no-op 以兼容旧代码。
 
 **能力门控**：对已知的非思考模型（手动配置的 `ModelInfo.Known && !SupportsThinking`），请求 thinking 默认报 `ErrThinkingUnsupported`；`WithThinkingFallback(true)` 改为静默去掉 thinking 配置。未知模型不做猜测、原样透传。
 

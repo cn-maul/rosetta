@@ -11,7 +11,7 @@
 | system | `messages` 里的 system 角色 | `input` 里的 message item | 顶层 `system` 字段（与消息内 system 合并，`\n\n` 连接） |
 | 输出上限 | `max_completion_tokens`（探测）或 `max_tokens` | `max_output_tokens` | `max_tokens`（必填；兜底链：请求值 → 模型元数据 → WithDefaultMaxOutputTokens → 4096） |
 | thinking | `reasoning_effort` | `reasoning.effort` | `thinking.budget_tokens` |
-| stop | `stop` | 不支持（丢弃并记日志） | `stop_sequences` |
+| stop | `stop` | 不支持（丢弃并记日志） | 已移除（2026-10-21 版本不再接受，SDK 静默忽略并记日志） |
 | 工具定义 | `{type:"function", function:{...}}` | 扁平 `{type:"function", name, parameters}` | `{name, description, input_schema}` |
 | 消息形态 | `messages` | `input` items（message / function_call / function_call_output） | 角色严格交替；tool_result 归位 user 轮；连续同角色自动合并 |
 | 流式终止 | `data: [DONE]` | `response.completed` 事件 | `message_stop` 事件 |
@@ -116,26 +116,9 @@ req := &rosetta.ChatRequest{
 
 ## Anthropic beta 头
 
-Anthropic 把部分能力放在 `anthropic-beta` 请求头后面。SDK 按**已构建的 wire payload** 判定当前请求需要哪些 beta，再把它们**逗号连接成一个头**——多个 beta 同时成立时逐个 `Set` 会互相覆盖，导致靠后的那个静默丢失并被上游 400 拒绝。
+Anthropic 曾把部分能力放在 `anthropic-beta` 请求头后面。缓存 1 小时 TTL（`extended-cache-ttl-2025-04-11`）与交错思考（`interleaved-thinking-2025-05-14`）已在 Anthropic API **2026-10-21** 转正，SDK 不再自动判定、也不再发送这两个头。
 
-| beta | 触发条件 | 缺失的后果 |
-|---|---|---|
-| `extended-cache-ttl-2025-04-11` | payload 中任一断点带 `ttl:"1h"` | 上游对该请求 400 |
-| `interleaved-thinking-2025-05-14` | payload **同时**含 `thinking` 与 `tools` | 模型不在工具调用之间推理（能力降级，不报错） |
-
-判定基于 payload 而非类型化请求，因此经 `Extra`（`WithExtraOverrides(true)`）注入的字段同样生效。
-
-**交错思考的模型差异**（依据 Anthropic 官方 extended-thinking 文档）：Claude Opus 4.5 / Sonnet 4.5 及更早的 Claude 4 模型**需要**该头才启用；Opus 4.6+ / Sonnet 5 走自适应思考、该头已弃用且被安全忽略；Haiku 4.5 不支持，头被接受但忽略。
-
-**Claude API 与 AWS Claude Platform 对任何模型都接受该头**，不支持时忽略，所以默认自动发送是安全的。例外是 **Amazon Bedrock 与 Google Cloud Vertex AI：它们会拒绝**发给白名单外模型的该头。
-
-```go
-// 端点经 Bedrock / Vertex 转发时关掉自动发送
-rosetta.WithInterleavedThinking(false)
-
-// 或强制发送（默认由 payload 自动判定）
-rosetta.WithInterleavedThinking(true)
-```
+当前唯一会自动附加的 beta 是 Files API 的 `files-api-2025-04-14`（见[文件](guide.md#文件)）。其余 beta 由调用方通过 `WithBeta` 显式追加。
 
 ## Quirks
 
