@@ -4,12 +4,22 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/cn-maul/rosetta.svg)](https://pkg.go.dev/github.com/cn-maul/rosetta)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+> **v1.3.2** · Actively maintained · See [SECURITY.md](SECURITY.md) · 中文: [README.md](README.md)
+
 A zero-dependency Go SDK that speaks three LLM wire protocols behind one API:
 **OpenAI Chat Completions**, **OpenAI Responses**, and **Anthropic Messages** —
 plus the many compatible services (DeepSeek, Moonshot, Qwen, GLM, OpenRouter,
 vLLM, Ollama). Embeddings (OpenAI format) and rerank (Cohere format) ride on
 the same client. Auth headers, system-prompt placement, thinking parameters,
 stream events and usage field names are all absorbed by the SDK.
+
+## Recent changes
+
+- **v1.3.2**: the Anthropic adapter no longer drops `stop_sequences` / `service_tier` (both are still part of API `2026-10-21`); adds `ChatRequest.Speed`; validates `service_tier` / `speed` per protocol so a wrong vocabulary fails locally instead of as an upstream 400; Anthropic requests now send `Authorization: Bearer` alongside the legacy `x-api-key`.
+- **v1.3.1**: `WithExtraOverrideKeys(keys...)` allow-lists specific `Extra` overrides.
+- **v1.3.0**: structured output (`ResponseFormat`), tool choice and parallel calls, server-side tools, an escape hatch for unmodelled output (`ChatResponse.Unknown`), request extensions (`WithHeader` / `WithBeta` / `WithQueryParam` / `WithPathPrefix`).
+
+See [CHANGELOG.md](CHANGELOG.md) for the full diff.
 
 ## Install
 

@@ -70,6 +70,8 @@ func TestAnthropicBuildPayload(t *testing.T) {
 		Messages:      []Message{User("hi")},
 		Temperature:   Float(0.5),
 		StopSequences: []string{"END"},
+		ServiceTier:   "auto",
+		Speed:         "fast",
 		Tools:         []ToolDefinition{{Name: "fn", Description: "d"}},
 	}
 	pl, _, err := p.buildPayload(req, false, p.plan(req))
@@ -79,13 +81,24 @@ func TestAnthropicBuildPayload(t *testing.T) {
 	if pl["max_tokens"] != 4096 {
 		t.Fatalf("payload = %v", pl)
 	}
-	// temperature / stop_sequences were removed in API 2026-10-21 and must
-	// not reach the wire.
+	// Only temperature / top_p / top_k were removed in API 2026-10-21.
+	// stop_sequences and service_tier are still part of the Messages API
+	// and must reach the wire.
 	if _, has := pl["temperature"]; has {
 		t.Fatal("temperature must be omitted (removed in 2026-10-21)")
 	}
-	if _, has := pl["stop_sequences"]; has {
-		t.Fatal("stop_sequences must be omitted (removed in 2026-10-21)")
+	stop, has := pl["stop_sequences"]
+	if !has {
+		t.Fatal("stop_sequences must reach the wire (still supported in 2026-10-21)")
+	}
+	if got := stop.([]string); len(got) != 1 || got[0] != "END" {
+		t.Fatalf("stop_sequences = %v", stop)
+	}
+	if pl["service_tier"] != "auto" {
+		t.Fatalf("service_tier = %v", pl["service_tier"])
+	}
+	if pl["speed"] != "fast" {
+		t.Fatalf("speed = %v", pl["speed"])
 	}
 	if _, has := pl["thinking"]; has {
 		t.Fatal("thinking must be absent when not requested")
@@ -114,6 +127,14 @@ func TestAnthropicBuildPayload(t *testing.T) {
 	if _, has := pl["top_p"]; has {
 		t.Fatal("top_p must be dropped in thinking mode")
 	}
+	// The streaming path shares buildPayload: stop_sequences / service_tier
+	// must survive it too, so a future stream-only filter gets caught here.
+	if _, has := pl["stop_sequences"]; !has {
+		t.Fatal("stop_sequences must reach the wire on the streaming path")
+	}
+	if pl["service_tier"] != "auto" {
+		t.Fatalf("service_tier must reach the wire on the streaming path, got %v", pl["service_tier"])
+	}
 	if pl["stream"] != true {
 		t.Fatal("stream flag missing")
 	}
@@ -126,6 +147,48 @@ func TestAnthropicBuildPayload(t *testing.T) {
 	}
 	if pl["system"] != "be nice\n\nalso this" {
 		t.Fatalf("system = %v", pl["system"])
+	}
+}
+
+// ServiceTier / Speed carry protocol-specific vocabularies. On Anthropic an
+// unsupported value must fail locally: since these fields now reach the wire,
+// letting one through would turn a caller typo into an upstream 400.
+func TestAnthropicServiceTierAndSpeedVocabulary(t *testing.T) {
+	c := newTestClient(t, WithProtocol(ProtoAnthropic))
+	p := c.provider.(*anthropicProvider)
+	base := func() *ChatRequest {
+		return &ChatRequest{Model: "m", Messages: []Message{User("hi")}}
+	}
+
+	for _, v := range []string{"auto", "standard_only"} {
+		req := base()
+		req.ServiceTier = v
+		pl, _, err := p.buildPayload(req, false, p.plan(req))
+		if err != nil {
+			t.Fatalf("service_tier %q: %v", v, err)
+		}
+		if pl["service_tier"] != v {
+			t.Fatalf("service_tier %q not rendered: %v", v, pl["service_tier"])
+		}
+	}
+	for _, v := range []string{"default", "flex", "priority"} {
+		req := base()
+		req.ServiceTier = v
+		if _, _, err := p.buildPayload(req, false, p.plan(req)); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("service_tier %q must be rejected locally, got %v", v, err)
+		}
+	}
+
+	req := base()
+	req.Speed = "standard"
+	pl, _, err := p.buildPayload(req, false, p.plan(req))
+	if err != nil || pl["speed"] != "standard" {
+		t.Fatalf("speed standard: err=%v payload=%v", err, pl["speed"])
+	}
+	req = base()
+	req.Speed = "turbo"
+	if _, _, err := p.buildPayload(req, false, p.plan(req)); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("speed %q must be rejected locally, got %v", "turbo", err)
 	}
 }
 

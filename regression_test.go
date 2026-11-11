@@ -65,17 +65,17 @@ func TestAnthropicAuthHeaders(t *testing.T) {
 	p := c.provider.(*anthropicProvider)
 	h := p.headers(false)
 	if h.Get("x-api-key") != "k" {
-		t.Fatal("x-api-key must always be sent")
+		t.Fatal("x-api-key must still be sent: the API accepts the legacy header")
 	}
-	if h.Get("Authorization") != "" {
-		t.Fatal("Authorization must not be sent by default (credential scoping)")
+	if h.Get("Authorization") != "Bearer k" {
+		t.Fatal("Authorization: Bearer must be sent by default (Anthropic SDKs use it since 2026-10-21)")
 	}
 
-	c2 := newTestClient(t, WithProtocol(ProtoAnthropic), WithAnthropicBearerAuth(true))
+	c2 := newTestClient(t, WithProtocol(ProtoAnthropic), WithAnthropicBearerAuth(false))
 	p2 := c2.provider.(*anthropicProvider)
 	h2 := p2.headers(false)
-	if h2.Get("x-api-key") != "k" || h2.Get("Authorization") != "Bearer k" {
-		t.Fatalf("bearer opt-in headers = %v", h2)
+	if h2.Get("x-api-key") != "k" || h2.Get("Authorization") != "" {
+		t.Fatalf("bearer opt-out headers = %v", h2)
 	}
 }
 

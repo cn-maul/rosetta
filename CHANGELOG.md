@@ -1,5 +1,49 @@
 # 更新日志
 
+## v1.3.2 (2026-11-11)
+
+### 修复
+
+- **Anthropic 适配器恢复发送 `stop_sequences` 与 `service_tier`**。v1.3.0 把这两个字段
+  与 `temperature` / `top_p` / `top_k` 一并当成「2026-10-21 已移除」丢弃，导致停止序列与
+  服务等级**静默失效**：上游按默认行为生成到 `max_tokens`，`stop_reason` 从
+  `stop_sequence` 变成 `end_turn`，无任何报错。官方 Python SDK 的 `MIGRATION.md`（移除
+  清单只列三个采样参数）与 `MessageCreateParamsBase`（`stop_sequences` / `service_tier`
+  仍在，docstring 仍描述 `stop_reason: "stop_sequence"`）都表明这两个字段未被移除。
+- `anthropicReservedPayloadKeys` 补入 `service_tier` 与 `speed`：适配器现在渲染它们，按「保留集精确
+  覆盖适配器写入的顶层字段」的约定必须登记；`stop_sequences` 保持保留键不变。
+- `dropRemovedFields` 更名为 `dropRemovedSamplingFields`，只处理三个采样参数。
+- **`service_tier` / `speed` 增加协议级值域校验**：Anthropic 只接受
+  `auto` / `standard_only`（`speed`: `standard` / `fast`），其他值在本地返回
+  `ErrInvalidRequest`，不再等到上游 400。统一字段的 `ServiceTier` 沿用 OpenAI 词表
+  （`default` / `flex` / `priority`），跨协议复用时这是最容易被漏掉的一处。
+
+### 新增
+
+- **`ChatRequest.Speed`**：Anthropic 的推理速度模式（`standard` / `fast`）。`fast` 在部分模型上
+  需要 `fast-mode-2026-02-01` beta 头，用 `WithBeta` 显式追加；OpenAI 协议无对应字段，忽略。
+
+### 变更
+
+- **Anthropic 鉴权头默认发送 `Authorization: Bearer`**：对齐官方 SDK 自 API `2026-10-21` 起的做法，
+  同时保留旧版 `x-api-key`（API 两个都接受）。只需旧头的网关用
+  `WithAnthropicBearerAuth(false)` 关掉 Bearer。
+
+### 兼容性
+
+- 使用 Anthropic 协议且设置过 `StopSequences` / `ServiceTier` 的调用方：行为回到 v1.2.x，
+  这两个字段重新生效。
+- 若曾用 `WithExtraOverrideKeys("stop_sequences")` + `Extra` 手工补字段绕开该缺陷，请移除
+  该绕行——适配器现在自己渲染，叠加 `Extra` 会覆盖 SDK 写入值（`service_tier` 同理）。
+
+### 证据等级（如实标注）
+
+- 本修复依据官方 SDK 的 `MIGRATION.md`（移除清单只列 `temperature` / `top_p` / `top_k`）
+  与六套官方 SDK 的请求类型契约（`stop_sequences` / `service_tier` 仍在，且 Python 类型里
+  仍以现在时描述 `stop_reason: "stop_sequence"`）。
+- **未做官方端点实测**：核对环境直连 `api.anthropic.com` 返回区域限制 403。若某个上游
+  确实拒绝这两个字段，会得到**显式 400**（可按报文定位），不会退回静默丢弃。
+
 ## v1.3.1 (2026-11-07)
 
 ### 新增
@@ -23,6 +67,10 @@
   新版移除了 `temperature` / `top_p` / `top_k` / `stop_sequences` / `service_tier` 五个请求
   参数（传了直接 400），Anthropic 适配器因此不再发送它们——统一请求上的同名字段保留不变，
   但走 `ProtoAnthropic` 时这些采样设置将不再生效（以 debug 日志提示）。
+
+  > **更正（2026-11-11，见 v1.3.2）**：上述「五个请求参数」有误。`2026-10-21` 只移除了
+  > `temperature` / `top_p` / `top_k` 三个采样参数；`stop_sequences` 与 `service_tier`
+  > 仍在该版本 Messages API 的请求契约内。v1.3.2 已恢复发送这两个字段。详见 v1.3.2 条目。
 - 未使用 Anthropic 协议的调用方不受影响。若需要沿用旧的采样语义，可固定到 v1.2.x。
 
 ### 新增

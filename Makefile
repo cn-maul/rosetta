@@ -1,4 +1,4 @@
-.PHONY: all check fmt vet test race cover staticcheck tidy
+.PHONY: all check fmt vet test race cover staticcheck tidy work-test work-smoke
 
 all: check
 
@@ -24,5 +24,16 @@ staticcheck:
 
 tidy:
 	go mod tidy -diff
+
+# Work modules under work/ are their own modules: the root `go test ./...`
+# deliberately skips them, so a failing repro never reddens CI. Run them
+# on purpose.
+work-test:
+	cd work/anthropic-stopseq-repro && go test ./...
+
+# Live smoke against a real Anthropic-compatible endpoint. Needs
+# TIANTOKEN_KEY (and a reachable host in work/anthropic-live-check/main.go).
+work-smoke:
+	cd work/anthropic-live-check && go run .
 
 check: fmt vet test

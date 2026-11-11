@@ -42,9 +42,11 @@ func (p *anthropicProvider) headers(stream bool) http.Header {
 		h.Set("Accept", "application/json")
 	}
 	if key := p.c.settings.apiKey; key != "" {
-		// x-api-key is the Anthropic-native auth header and the default.
-		// WithAnthropicBearerAuth additionally sends Bearer for
-		// gateways that authenticate exclusively that way.
+		// Bearer is what Anthropic's own SDKs send since API version
+		// 2026-10-21; x-api-key is the legacy header the API still
+		// accepts and that most Anthropic-compatible gateways expect.
+		// Both carry the same credential by default;
+		// WithAnthropicBearerAuth(false) suppresses the Bearer one.
 		h.Set("x-api-key", key)
 		if p.c.settings.anthropicBearer {
 			h.Set("Authorization", "Bearer "+key)
@@ -164,11 +166,14 @@ func (p *anthropicProvider) resolvedMaxOutput(req *ChatRequest) int {
 	return p.plan(req).maxTokens
 }
 
-// dropRemovedFields logs the sampling/sequence/tier fields that Anthropic
-// removed in API 2026-10-21 and that the adapter therefore leaves off the
-// wire. The unified ChatRequest still carries these for the OpenAI protocols,
-// so this is a per-protocol ignore rather than a request-level rejection.
-func (p *anthropicProvider) dropRemovedFields(req *ChatRequest) {
+// dropRemovedSamplingFields logs the sampling fields that Anthropic removed
+// in API 2026-10-21 and that the adapter therefore leaves off the wire.
+// Only temperature / top_p / top_k were removed: stop_sequences and
+// service_tier are still part of the Messages API and are rendered by
+// buildPayload. The unified ChatRequest still carries all of them for the
+// OpenAI protocols, so this is a per-protocol ignore rather than a
+// request-level rejection.
+func (p *anthropicProvider) dropRemovedSamplingFields(req *ChatRequest) {
 	var dropped []string
 	if req.Temperature != nil {
 		dropped = append(dropped, "temperature")
@@ -179,14 +184,8 @@ func (p *anthropicProvider) dropRemovedFields(req *ChatRequest) {
 	if req.TopK != nil {
 		dropped = append(dropped, "top_k")
 	}
-	if len(req.StopSequences) > 0 {
-		dropped = append(dropped, "stop_sequences")
-	}
-	if req.ServiceTier != "" {
-		dropped = append(dropped, "service_tier")
-	}
 	if len(dropped) > 0 {
-		p.c.settings.logger.Debug("anthropic: dropping fields removed in API 2026-10-21",
+		p.c.settings.logger.Debug("anthropic: dropping sampling fields removed in API 2026-10-21",
 			"fields", strings.Join(dropped, ","))
 	}
 }
@@ -237,12 +236,40 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 			}
 		}
 	}
-	// Anthropic removed temperature / top_p / top_k / stop_sequences /
-	// service_tier in API version 2026-10-21: sending any of them is a 400
-	// even at the default value. The unified request still carries them for
-	// the OpenAI protocols, so the Anthropic adapter drops them (with a
-	// debug note) rather than forwarding them.
-	p.dropRemovedFields(req)
+	// Anthropic removed temperature / top_p / top_k in API version
+	// 2026-10-21: sending any of them is an error even at the default
+	// value. The unified request still carries them for the OpenAI
+	// protocols, so the Anthropic adapter drops them (with a debug note)
+	// rather than forwarding them. stop_sequences and service_tier were
+	// NOT removed and are rendered below.
+	p.dropRemovedSamplingFields(req)
+	if len(req.StopSequences) > 0 {
+		payload["stop_sequences"] = req.StopSequences
+	}
+	if req.ServiceTier != "" {
+		// The unified field carries the OpenAI vocabulary ("default",
+		// "flex", "priority"); Anthropic accepts only these two. Now that
+		// the value actually reaches the wire, an unsupported one would
+		// be a guaranteed 400 — reject it locally instead.
+		switch req.ServiceTier {
+		case "auto", "standard_only":
+			payload["service_tier"] = req.ServiceTier
+		default:
+			return nil, anthroPayloadScan{}, fmt.Errorf(
+				"%w: anthropic service_tier must be \"auto\" or \"standard_only\", got %q",
+				ErrInvalidRequest, req.ServiceTier)
+		}
+	}
+	if req.Speed != "" {
+		switch req.Speed {
+		case "standard", "fast":
+			payload["speed"] = req.Speed
+		default:
+			return nil, anthroPayloadScan{}, fmt.Errorf(
+				"%w: speed must be \"standard\" or \"fast\", got %q",
+				ErrInvalidRequest, req.Speed)
+		}
+	}
 	if req.User != "" {
 		payload["metadata"] = map[string]any{"user_id": req.User}
 	}

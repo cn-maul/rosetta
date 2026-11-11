@@ -13,7 +13,7 @@ client, err := rosetta.NewClient(
 
 - endpoint 与 API key 必须可用：显式给出，或使用所选协议的官方默认端点。
 - endpoint 规则：带版本路径（`/v1`、`/api/paas/v4`）原样保留；裸主机自动补 `/v1`；**不允许携带 query 串**（query 可能藏有凭据，会泄入错误信息与重试日志），携带时构建即报错。
-- 凭证发送方式由协议决定：OpenAI 系 `Authorization: Bearer`，Anthropic 默认只发 `x-api-key`（需要 Bearer 的兼容网关用 `WithAnthropicBearerAuth(true)` 显式开启）。
+- 凭证发送方式由协议决定：OpenAI 系 `Authorization: Bearer`；Anthropic 同时发 `Authorization: Bearer`（对齐官方 SDK 自 API 2026-10-21 起的做法）与旧版 `x-api-key`，API 两个都认。只需旧头的网关用 `WithAnthropicBearerAuth(false)` 关掉 Bearer。
 - `Client` 并发安全，可多 goroutine 共享；`Stream` 的 `Next` 须单 goroutine 驱动，`Err` / `Usage` / `Partial` / `Close` 可并发调用。
 
 ## 配置选项
@@ -49,7 +49,7 @@ client, err := rosetta.NewClient(
 | `WithTokenCounter(fn)` | 启发式 | 注入真实 tokenizer，用于上下文校验与 `Client.EstimateTokens`。SDK 不内置 tokenizer（零依赖） |
 | `WithHooks(h)` | 无 | 每次 HTTP 调用的 `OnRequest`/`OnResponse` 回调，带状态码、延迟、request-id；含重试与辅助 API |
 | `WithRequestIDFunc(fn)` | 无 | 给每个出站请求注入 `X-Request-Id`；显式 `WithHeader("X-Request-Id", ...)` 优先 |
-| `WithAnthropicBearerAuth(v)` | false | 额外发送 `Authorization: Bearer`（默认只发 `x-api-key`；仅认证方式只有 Bearer 的兼容网关需要） |
+| `WithAnthropicBearerAuth(v)` | true | 是否发送 `Authorization: Bearer`（默认发送，对齐官方 SDK 2026-10-21 起的做法；`false` 只发旧版 `x-api-key`） |
 | `WithExtraOverrides(v)` | false | 允许 `Extra` 覆盖 SDK 管理的负载字段（默认冲突即报 `ErrInvalidRequest`）。保留键按 API 族划分：chat（`model`/`messages`/`stream`/输出上限/采样/工具/thinking 等）、embeddings（`model`/`input`/`dimensions`/`user`/`encoding_format`）、rerank（`model`/`query`/`documents`/`top_n`/`return_documents`）——因此 `ChatRequest.Extra["user"]` 合法（chat 没有 user 字段），而 `EmbeddingRequest.Extra["user"]` 会被拒 |
 | `WithExtraOverrideKeys(keys...)` | 无 | 只放行**列出的键**可被 `Extra` 覆盖，其余保留键仍报 `ErrInvalidRequest`——`WithExtraOverrides` 全开与默认全关之间的中间档。空调用不放行任何键；重复调用后值覆盖前者；与 `WithExtraOverrides(true)` 取并集（后者仍全开） |
 | `WithMultimediaTokenEstimates(e)` | 1500/500/3000 | 上下文检查中图片/音频/文档块的平估 token 数 |
@@ -137,11 +137,12 @@ type ChatRequest struct {
 	Logprobs           *bool            // 原始载荷回填到 ChatResponse.Logprobs
 	TopLogprobs        *int
 	User               string           // OpenAI user / Anthropic metadata.user_id
-	ServiceTier        string           // "auto" / "default" / "flex" / "priority"
+	ServiceTier        string           // OpenAI：auto/default/flex/priority；Anthropic：仅 auto/standard_only（其他值本地报错）
+	Speed              string           // Anthropic：standard/fast（fast 部分模型需 fast-mode-2026-02-01 beta，用 WithBeta 加）
 	Store              *bool            // Responses：是否持久化
 	PreviousResponseID string           // Responses：续接已存储的对话
 	Verbosity          string           // Responses：text.verbosity
-	StopSequences      []string         // Responses 不支持、Anthropic 2026-10-21 起移除，均丢弃并记日志
+	StopSequences      []string         // Chat 发 stop、Anthropic 发 stop_sequences；Responses 不支持（丢弃并记日志）
 	ResponseFormat     *ResponseFormat  // 结构化输出，三协议映射
 	Tools              []ToolDefinition // 仅透传，执行工具是你的事
 	ToolChoice         *ToolChoice      // auto / none / required / tool
@@ -209,7 +210,7 @@ Thinking: &rosetta.ThinkingConfig{Effort: rosetta.EffortMedium} // 低/中/高�
 | OpenAI Responses | `reasoning.effort` | 同上 |
 | Anthropic | `thinking.budget_tokens`（或 `Adaptive` → `type: adaptive`） | Effort ≈ 2048/8192/32768；显式预算原样；两者都没给默认 medium |
 
-Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。`Adaptive: true` 时改发 `type: "adaptive"`（模型自定预算，与 `BudgetTokens`/`Effort` 互斥）。Anthropic 在 2026-10-21 版本移除了采样参数（`temperature`/`top_p`/`top_k`/`stop_sequences`），SDK 对 Anthropic 协议不再发送这些字段。
+Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。`Adaptive: true` 时改发 `type: "adaptive"`（模型自定预算，与 `BudgetTokens`/`Effort` 互斥）。Anthropic 在 2026-10-21 版本移除了**采样参数**（`temperature`/`top_p`/`top_k`），SDK 对 Anthropic 协议不再发送这三个字段；`stop_sequences` 与 `service_tier` **未被移除**，仍按原生字段名下发。
 
 **工具调用之间的推理（交错思考）**：交错思考已在 Anthropic API 2026-10-21 转正，SDK 不再需要、也不再自动发送 beta 头——请求同时带 `Thinking` 与 `Tools` 时即自然交错。旧的 `WithInterleavedThinking` 保留为 no-op 以兼容旧代码。
 

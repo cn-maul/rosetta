@@ -3,9 +3,17 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/cn-maul/rosetta.svg)](https://pkg.go.dev/github.com/cn-maul/rosetta)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **v1.3.0** · 活跃维护 · 安全策略见 [SECURITY.md](SECURITY.md) · English: [README.en.md](README.en.md)
+> **v1.3.2** · 活跃维护 · 安全策略见 [SECURITY.md](SECURITY.md) · English: [README.en.md](README.en.md)
 
 统一接入 LLM API 的 Go SDK：同一套 API 说三种协议——**OpenAI Chat Completions**、**OpenAI Responses**、**Anthropic Messages**，以及兼容这些协议的第三方服务（DeepSeek、Moonshot、Qwen、GLM、OpenRouter、vLLM、Ollama 等）。协议差异（认证方式、system 位置、thinking 参数、流式事件、usage 字段）全部由 SDK 吸收。对话之外还覆盖同一套客户端下的 **Embeddings**（OpenAI 格式）与 **Rerank**（Cohere 格式），支持图文/音频/文档多模态输入。零第三方依赖。
+
+## 近期变更
+
+- **v1.3.2**：修复 Anthropic 适配器把 `stop_sequences` / `service_tier` 当成「已移除字段」丢弃的问题；新增 `ChatRequest.Speed`；`service_tier` / `speed` 增加协议级值域校验（本地报错，不等上游 400）；Anthropic 鉴权默认同时发送 `Authorization: Bearer` 与 `x-api-key`。
+- **v1.3.1**：`WithExtraOverrideKeys(keys...)` 按键放行 `Extra` 覆盖。
+- **v1.3.0**：结构化输出（`ResponseFormat`）、工具选择与并行、服务端内置工具、未知内容逃生口（`ChatResponse.Unknown`）、请求扩展点（`WithHeader` / `WithBeta` / `WithQueryParam` / `WithPathPrefix`）。
+
+完整差异见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安装
 

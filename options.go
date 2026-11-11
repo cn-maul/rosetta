@@ -117,6 +117,11 @@ func defaultSettings() *settings {
 		thinkingRectify: true,
 		timeout:         defaultUnaryTimeout,
 		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		// Anthropic's own SDKs authenticate with "Authorization: Bearer"
+		// as of API version 2026-10-21; the API still accepts x-api-key,
+		// so both go out by default. WithAnthropicBearerAuth(false) suppresses
+		// the Bearer header for gateways that want the legacy shape only.
+		anthropicBearer: true,
 	}
 }
 
@@ -131,7 +136,9 @@ func WithEndpoint(v string) Option {
 }
 
 // WithAPIKey sets the credential. It is sent as "Authorization: Bearer ..."
-// on OpenAI protocols and "x-api-key" on Anthropic.
+// on OpenAI protocols, and on Anthropic requests as both "Authorization:
+// Bearer ..." (the shape Anthropic's own SDKs use since API version
+// 2026-10-21) and the legacy "x-api-key".
 func WithAPIKey(v string) Option {
 	return func(s *settings) { s.apiKey = strings.TrimSpace(v) }
 }
@@ -384,11 +391,14 @@ func WithQuirks(q Quirks) Option {
 	return func(s *settings) { s.quirks = q }
 }
 
-// WithAnthropicBearerAuth additionally sends "Authorization: Bearer <key>"
-// on Anthropic requests. By default only the Anthropic-native "x-api-key"
-// header is sent, so the credential is not copied onto a second auth
-// channel that proxies and gateways may log differently. Enable this for
-// Anthropic-compatible gateways that authenticate exclusively via Bearer.
+// WithAnthropicBearerAuth controls the "Authorization: Bearer <key>" header
+// on Anthropic requests. It is sent by default since API version 2026-10-21,
+// where Anthropic's own SDKs switched to Bearer; the API still accepts the
+// legacy "x-api-key", which the SDK also sends, so both auth channels carry
+// the credential unless this is turned off.
+//
+// Pass false for gateways that reject or mis-handle a duplicate credential,
+// or that only implement the pre-2026-10-21 shape.
 func WithAnthropicBearerAuth(v bool) Option {
 	return func(s *settings) { s.anthropicBearer = v }
 }

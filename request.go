@@ -344,9 +344,16 @@ type ChatRequest struct {
 	// User is an end-user identifier used by providers for abuse
 	// monitoring. Sent as `user` (OpenAI) or metadata.user_id (Anthropic).
 	User string
-	// ServiceTier selects a provider service tier ("auto", "default",
-	// "flex", "priority", ...). Passed through where supported.
+	// ServiceTier selects a provider service tier. The vocabulary is
+	// per-protocol: OpenAI accepts "auto", "default", "flex", "priority";
+	// Anthropic accepts only "auto" and "standard_only", and rejects
+	// anything else with ErrInvalidRequest before the call goes out.
 	ServiceTier string
+	// Speed selects the inference speed mode on the Anthropic protocol:
+	// "standard" or "fast". "fast" needs the fast-mode-2026-02-01 beta
+	// header on some models — add it with WithBeta. Ignored by the OpenAI
+	// protocols, which have no equivalent field.
+	Speed string
 	// Store asks the Responses API to persist the response for later
 	// retrieval. nil leaves the provider default.
 	Store *bool
@@ -354,7 +361,11 @@ type ChatRequest struct {
 	PreviousResponseID string
 	// Verbosity controls answer length on the Responses API ("low",
 	// "medium", "high").
-	Verbosity     string
+	Verbosity string
+	// StopSequences halts generation when the model emits any of these
+	// strings. Sent as `stop` on OpenAI Chat and `stop_sequences` on
+	// Anthropic; the Responses API has no equivalent and drops them with
+	// a debug note.
 	StopSequences []string
 	// PromptCacheKey is a caller-chosen key used by OpenAI to partition the
 	// prompt cache, improving cache hit rates across requests that share a
@@ -441,6 +452,7 @@ var (
 		"model": true, "messages": true, "system": true, "stream": true,
 		"max_tokens":  true,
 		"temperature": true, "top_p": true, "top_k": true, "stop_sequences": true,
+		"service_tier": true, "speed": true,
 		"metadata": true,
 		"tools":    true, "tool_choice": true, "thinking": true,
 		"output_config": true,
