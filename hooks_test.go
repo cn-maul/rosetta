@@ -58,7 +58,11 @@ func TestHooksObserveCall(t *testing.T) {
 	if gotReqID != "rid-1" {
 		t.Fatalf("outbound X-Request-Id = %q", gotReqID)
 	}
-	if status != http.StatusOK || latency <= 0 {
+	// latency may legitimately be exactly 0: the call can finish within one
+	// clock tick (loopback + coarse Windows timer granularity). Only reject
+	// impossible (negative) or absurd values, so this stays a measurement
+	// sanity check rather than a flaky lower bound.
+	if status != http.StatusOK || latency < 0 || latency > 10*time.Second {
 		t.Fatalf("response info status=%d latency=%v", status, latency)
 	}
 }
