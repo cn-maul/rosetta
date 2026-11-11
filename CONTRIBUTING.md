@@ -26,7 +26,7 @@ CI 还会跑 staticcheck、覆盖率门槛（75%）、`go mod tidy -diff` 与 go
 ## 测试
 
 - 新增公开行为要有 httptest 用例；缺陷修复要有能复现原问题的回归用例。
-- 不要按审计批次命名测试文件（`audit_*_test.go` 是历史遗留）；新文件按功能命名。
+- 测试文件按功能命名（`provider_anthropic_test.go`、`streaming_test.go`）；不要用 `audit_*` / `fix_*` 这类批次名前缀——审计批次是一次性事件，不是测试的归属维度。
 - 外部包测试（`package rosetta_test`）用于验证公开 API 与 godoc 示例。
 
 ## 提交信息

@@ -6,3 +6,6 @@ coverage.html
 # Local assistant workspace state (memory, scratch). Never part of the
 # published module — keep it from being swept up by a blanket `git add -A`.
 .workbuddy/
+
+# Agent scratch worktrees (dsh / droid). Contain a full checkout each.
+.agents/
