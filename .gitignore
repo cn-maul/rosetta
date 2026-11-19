@@ -9,3 +9,7 @@ coverage.html
 
 # Agent scratch worktrees (dsh / droid). Contain a full checkout each.
 .agents/
+
+# AOCI agent host integration (machine-bound; do not commit)
+.mcp.json
+.mcp.json.backup.*
