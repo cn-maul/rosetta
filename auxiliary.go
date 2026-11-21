@@ -3,11 +3,12 @@ package rosetta
 // Plumbing shared by the auxiliary (non-chat) API families: embeddings and
 // rerank. Both speak OpenAI-style JSON over Bearer auth, ride on the
 // embedding endpoint override (WithEmbeddingEndpoint / WithEmbeddingAPIKey)
-// and are safe to retry (their payloads carry no side effects).
+// and are potentially billable.
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
@@ -52,15 +53,15 @@ func auxHeaders(c *Client) http.Header {
 // postAuxJSON posts an OpenAI-style JSON payload against the auxiliary
 // endpoint and returns the raw 200 body. Responses can be large (one
 // embedding vector per input), so the read cap is generous.
-func postAuxJSON(ctx context.Context, c *Client, path string, payload map[string]any) ([]byte, error) {
+func postAuxJSON(ctx context.Context, c *Client, path string, data []byte) ([]byte, error) {
 	const method = http.MethodPost
 	url := c.decorateURL(joinEndpoint(c.embedBase(), path))
 	call := &httpx.Call{
 		Method:      method,
 		URL:         url,
 		Header:      auxHeaders(c),
-		Body:        func() ([]byte, error) { return json.Marshal(payload) },
-		RetryPolicy: httpx.RetryIdempotent,
+		Body:        func() ([]byte, error) { return data, nil },
+		RetryPolicy: httpx.RetryRejected,
 	}
 	resp, err := c.call(ctx, call)
 	if err != nil {
@@ -74,4 +75,15 @@ func postAuxJSON(ctx context.Context, c *Client, path string, payload map[string
 		return nil, withRetryAfter(parseOpenAIError(resp.StatusCode, body, method, url, resp.Header.Get("X-Request-Id")), resp.Header)
 	}
 	return body, nil
+}
+
+func encodeAuxPayload(payload map[string]any, wire any, valid func() bool) ([]byte, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("%w: encoding auxiliary request: %w", ErrInvalidRequest, err)
+	}
+	if err := json.Unmarshal(data, wire); err != nil || !valid() {
+		return nil, fmt.Errorf("%w: invalid auxiliary payload after Extra merge", ErrInvalidRequest)
+	}
+	return data, nil
 }

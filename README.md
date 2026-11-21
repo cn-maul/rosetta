@@ -21,7 +21,7 @@
 go get github.com/cn-maul/rosetta
 ```
 
-要求 Go 1.27+（SDK 自身使用 `encoding/json/v2` 等新标准库能力；零第三方依赖）。
+要求 Go 1.27.4 或更新版本。SDK 使用 `encoding/json/v2`，零第三方依赖。
 
 ## 使用
 
@@ -59,7 +59,7 @@ func main() {
 
 换服务商只需换 endpoint、key 和 model id；协议不对时加一行 `rosetta.WithProtocol(...)`，或改用 `rosetta.DetectClient` 自动探测。
 
-> **Go 版本提示**：SDK 最低要求 Go 1.27。Go 1.26 引入的可选字段 `new(expr)` 写法（例如 `Temperature: new(0.7)`）可用于兼容代码；`Float`/`Bool` 仍然保留。错误匹配同理，`errors.AsType[*rosetta.APIError](err)` 可替代声明变量的 `errors.As`。
+> **Go 版本提示**：SDK 最低要求 Go 1.27.4。可选字段可使用 `new(expr)` 写法（例如 `Temperature: new(0.7)`），也可使用 `Float` 和 `Bool`。错误匹配可使用 `errors.AsType[*rosetta.APIError](err)`。
 
 ## 范围与边界
 

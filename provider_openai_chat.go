@@ -108,8 +108,17 @@ func (p *openaiChatProvider) buildPayload(req *ChatRequest, stream bool, st *oaS
 		// emitting an empty reasoning_effort.
 		if eff := req.effortWire(); eff != "" {
 			pl["reasoning_effort"] = eff
-			emitReasoning = true
+			emitReasoning = eff != "none"
 		}
+	} else if req.Thinking == nil && st.reasoning && strings.HasPrefix(req.Model, "gpt-5.1") {
+		// GPT-5.1 defaults to reasoning_effort=none.
+		emitReasoning = false
+	} else if req.Thinking == nil && st.reasoning {
+		model := strings.ToLower(req.Model)
+		emitReasoning = model == "gpt-5" || strings.HasPrefix(model, "gpt-5-20") ||
+			strings.HasPrefix(model, "gpt-5-mini") || strings.HasPrefix(model, "gpt-5-nano") ||
+			model == "o1" || strings.HasPrefix(model, "o1-") || model == "o3" || strings.HasPrefix(model, "o3-") ||
+			model == "o4-mini" || strings.HasPrefix(model, "o4-mini-")
 	}
 	if emitReasoning {
 		if req.Temperature != nil {
@@ -312,10 +321,14 @@ func (p *openaiChatProvider) encodeMessages(req *ChatRequest) ([]map[string]any,
 				if b.Type != BlockToolResult {
 					continue
 				}
+				output, err := openAIToolResultText(b)
+				if err != nil {
+					return nil, err
+				}
 				out = append(out, map[string]any{
 					"role":         "tool",
 					"tool_call_id": b.ToolCallID,
-					"content":      b.Content,
+					"content":      output,
 				})
 			}
 		default:
@@ -491,10 +504,8 @@ func (p *openaiChatProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatR
 			return nil, err
 		}
 		hdr := p.headers("application/json")
-		retry := httpx.RetryIdempotent
-		if p.c.settings.quirks.NoIdempotencyKey {
-			retry = httpx.RetryDefault
-		} else {
+		retry := p.c.chatRetryPolicy()
+		if !p.c.settings.quirks.NoIdempotencyKey {
 			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
@@ -537,10 +548,8 @@ func (p *openaiChatProvider) StreamChat(ctx context.Context, req *ChatRequest) (
 			return nil, err
 		}
 		hdr := p.headers("text/event-stream")
-		retry := httpx.RetryIdempotent
-		if p.c.settings.quirks.NoIdempotencyKey {
-			retry = httpx.RetryDefault
-		} else {
+		retry := p.c.chatRetryPolicy()
+		if !p.c.settings.quirks.NoIdempotencyKey {
 			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
@@ -842,13 +851,15 @@ type oaUsage struct {
 }
 
 func (u *oaUsage) toUsage() Usage {
-	total := u.TotalTokens.Value
+	input := max(u.PromptTokens.Value, 0)
+	output := max(u.CompletionTokens.Value, 0)
+	total := max(u.TotalTokens.Value, 0)
 	if total == 0 {
-		total = u.PromptTokens.Value + u.CompletionTokens.Value
+		total = saturatingAdd(input, output)
 	}
 	out := Usage{
-		InputTokens:     u.PromptTokens.Value,
-		OutputTokens:    u.CompletionTokens.Value,
+		InputTokens:     input,
+		OutputTokens:    output,
 		TotalTokens:     total,
 		CacheHitTokens:  u.PromptCacheHitTokens.Value,
 		CacheMissTokens: u.PromptCacheMissTokens.Value,

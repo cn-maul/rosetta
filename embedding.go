@@ -3,9 +3,11 @@ package rosetta
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
+	"math"
 	"slices"
-	"strings"
 )
 
 // EmbeddingRequest asks for embedding vectors of one or more inputs.
@@ -93,40 +95,66 @@ func (c *Client) Embed(ctx context.Context, req *EmbeddingRequest) (*EmbeddingRe
 	if err := mergeExtra(payload, req.Extra, c.settings.canExtraOverride, embeddingsReservedPayloadKeys); err != nil {
 		return nil, err
 	}
-	body, err := postAuxJSON(ctx, c, "/embeddings", payload)
+	var wire struct {
+		Model          string
+		Input          []*string
+		Dimensions     *int
+		User           *string
+		EncodingFormat string `json:"encoding_format"`
+	}
+	data, err := encodeAuxPayload(payload, &wire, func() bool {
+		return wire.Model != "" && len(wire.Input) > 0 &&
+			!slices.Contains(wire.Input, nil) && (wire.Dimensions == nil || *wire.Dimensions > 0) &&
+			(wire.EncodingFormat == "" || wire.EncodingFormat == "float")
+	})
 	if err != nil {
 		return nil, err
 	}
-	// An allowed override (WithExtraOverrides, or a whitelisted key via
-	// WithExtraOverrideKeys) lets Extra replace input/dimensions; the
-	// response must then be validated against what is actually on the
-	// wire, not the original request fields. Normalize through JSON so an
-	// override of any shape ([]any, float64) is read, not just the SDK's
-	// []string/int — and an override to an empty list is a hard error, not a
-	// skipped count check (audit C20). When no override is in play the SDK's
-	// own []string/int is authoritative, so the expensive JSON round-trip is
-	// skipped.
-	expected := len(req.Input)
-	if c.settings.canExtraOverride("input") && len(req.Extra) > 0 {
-		if n, ok := wireSliceLen(payload["input"]); ok {
-			if n == 0 {
-				return nil, fmt.Errorf("%w: embeddings input is empty after Extra override", ErrInvalidRequest)
-			}
-			expected = n
-		}
-	}
-	dimensions := req.Dimensions
-	if c.settings.canExtraOverride("dimensions") && len(req.Extra) > 0 {
-		if v, ok := wireInt(payload["dimensions"]); ok {
-			dimensions = v
-		}
-	}
-	resp, err := decodeEmbeddingsResponse(body, expected, dimensions)
+	ctx, observation := c.observeCall(ctx)
+	body, err := postAuxJSON(ctx, c, "/embeddings", data)
 	if err != nil {
+		c.recordCall(wire.Model, Usage{}, observation, err)
 		return nil, err
 	}
-	c.record(req.Model, resp.Usage, resp.Usage.IsZero())
+	dimensions := 0
+	if wire.Dimensions != nil {
+		dimensions = *wire.Dimensions
+	}
+	resp, err := decodeEmbeddingsResponse(body, len(wire.Input), dimensions)
+	if err != nil {
+		c.recordCall(wire.Model, Usage{}, observation, err)
+		return nil, err
+	}
+	c.recordCall(wire.Model, resp.Usage, observation, nil)
 	return resp, nil
+}
+
+type embeddingVector []float32
+
+func (v *embeddingVector) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	start, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	if start.Kind() != '[' {
+		return fmt.Errorf("embedding must be an array")
+	}
+	for dec.PeekKind() != ']' {
+		token, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		if token.Kind() != '0' {
+			return fmt.Errorf("embedding coordinate must be a number")
+		}
+		value, err := token.Float()
+		if err != nil || math.IsInf(float64(float32(value)), 0) {
+			return fmt.Errorf("embedding coordinate out of float32 range")
+		}
+		*v = append(*v, float32(value))
+	}
+	_, err = dec.ReadToken()
+	return err
 }
 
 // decodeEmbeddingsResponse decodes and sanity-checks the reply: one
@@ -140,8 +168,8 @@ func decodeEmbeddingsResponse(body []byte, expected, dimensions int) (*Embedding
 	var wire struct {
 		Model string `json:"model"`
 		Data  []struct {
-			Index     *int               `json:"index"`
-			Embedding *[]json.RawMessage `json:"embedding"`
+			Index     *int            `json:"index"`
+			Embedding embeddingVector `json:"embedding"`
 		} `json:"data"`
 		Usage *struct {
 			InputTokens  *int64 `json:"input_tokens"`
@@ -149,7 +177,7 @@ func decodeEmbeddingsResponse(body []byte, expected, dimensions int) (*Embedding
 			TotalTokens  *int64 `json:"total_tokens"`
 		} `json:"usage"`
 	}
-	if err := json.Unmarshal(body, &wire); err != nil {
+	if err := jsonv2.Unmarshal(body, &wire); err != nil {
 		// Unary upstream body decode failure — see ErrUpstreamMalformed.
 		// A caller that gets this should retry elsewhere, not edit its request.
 		return nil, fmt.Errorf("%w: embeddings response: %w", ErrUpstreamMalformed, err)
@@ -176,20 +204,10 @@ func decodeEmbeddingsResponse(body []byte, expected, dimensions int) (*Embedding
 			return nil, fmt.Errorf("rosetta: embeddings response repeats index %d", idx)
 		}
 		seen[idx] = true
-		if d.Embedding == nil || len(*d.Embedding) == 0 {
+		if len(d.Embedding) == 0 {
 			return nil, fmt.Errorf("rosetta: embeddings response has an empty vector at index %d", idx)
 		}
-		vec := make([]float32, 0, len(*d.Embedding))
-		for j, raw := range *d.Embedding {
-			if trimmed := strings.TrimSpace(string(raw)); trimmed == "null" || trimmed == "" {
-				return nil, fmt.Errorf("rosetta: embeddings response vector %d element %d is null", idx, j)
-			}
-			var f float32
-			if err := json.Unmarshal(raw, &f); err != nil {
-				return nil, fmt.Errorf("rosetta: embeddings response vector %d element %d is not a number", idx, j)
-			}
-			vec = append(vec, f)
-		}
+		vec := d.Embedding
 		if wantDim == 0 {
 			wantDim = len(vec)
 		}

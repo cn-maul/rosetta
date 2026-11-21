@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cn-maul/rosetta/internal/sse"
 )
@@ -168,6 +170,53 @@ func BenchmarkChatStream200Events(b *testing.B) {
 			b.Fatal(err)
 		}
 		if _, err := st.Collect(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkChatStreamParallelWithIdleTimeout(b *testing.B) {
+	server := benchStreamServer(200)
+	b.Cleanup(server.Close)
+	client, err := NewClient(WithEndpoint(server.URL), WithAPIKey("bench"), WithStreamIdleTimeout(time.Second))
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(worker *testing.PB) {
+		request := &ChatRequest{Model: "gpt-4o", Messages: []Message{User("hi")}}
+		for worker.Next() {
+			stream, err := client.ChatStream(context.Background(), request)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			if _, err := stream.Collect(); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
+}
+
+func BenchmarkDecodeEmbeddingsBatch(b *testing.B) {
+	const vectors, dimensions = 32, 1536
+	var body strings.Builder
+	body.WriteString(`{"data":[`)
+	coords := strings.Repeat("0.125,", dimensions-1) + "-0.125"
+	for index := range vectors {
+		if index > 0 {
+			body.WriteByte(',')
+		}
+		fmt.Fprintf(&body, `{"index":%d,"embedding":[%s]}`, index, coords)
+	}
+	body.WriteString(`]}`)
+	data := []byte(body.String())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(data)))
+	for b.Loop() {
+		if _, err := decodeEmbeddingsResponse(data, vectors, dimensions); err != nil {
 			b.Fatal(err)
 		}
 	}

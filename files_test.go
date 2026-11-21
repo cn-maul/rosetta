@@ -95,7 +95,7 @@ func TestAnthropicFiles(t *testing.T) {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Errorf("multipart: %v", err)
 		}
-		io.WriteString(w, `{"id":"file-2","type":"file","size_bytes":9,"created_at":1700000000,"filename":"b.pdf","mime_type":"application/pdf"}`)
+		io.WriteString(w, `{"id":"file-2","type":"file","size_bytes":9,"created_at":"2025-01-02T03:04:05Z","filename":"b.pdf","mime_type":"application/pdf"}`)
 	}))
 	defer srv.Close()
 
@@ -110,7 +110,7 @@ func TestAnthropicFiles(t *testing.T) {
 	if !strings.Contains(gotBeta, anthropicFilesBeta) {
 		t.Fatalf("anthropic-beta = %q", gotBeta)
 	}
-	if f.Bytes != 9 || f.MimeType != "application/pdf" || f.Object != "file" {
+	if f.Bytes != 9 || f.MimeType != "application/pdf" || f.Object != "file" || f.CreatedAt.Unix() != 1735787045 {
 		t.Fatalf("normalized file = %+v", f)
 	}
 }

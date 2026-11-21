@@ -3,6 +3,7 @@ package rosetta
 import (
 	"context"
 	"maps"
+	"math"
 	"sync"
 	"time"
 )
@@ -159,6 +160,13 @@ func NewMemoryUsageTracker() *MemoryUsageTracker {
 // (audit C21); clamping the input bounds keeps every sum monotonic.
 const maxAggregateTokens = 1 << 40
 
+func saturatingAdd(total, amount int64) int64 {
+	if amount > math.MaxInt64-total {
+		return math.MaxInt64
+	}
+	return total + amount
+}
+
 // clampTokens bounds one token count to [0, maxAggregateTokens]: negatives
 // (which no provider should send, but a hostile or buggy one can) and
 // absurd magnitudes are both folded back into range.
@@ -201,25 +209,25 @@ func (t *MemoryUsageTracker) Record(_ context.Context, r UsageRecord) {
 	r.Usage.CacheHitTokens = clampTokens(r.Usage.CacheHitTokens)
 	r.Usage.CacheMissTokens = clampTokens(r.Usage.CacheMissTokens)
 	add := func(m *ModelUsage) {
-		m.Requests++
-		m.InputTokens += r.Usage.InputTokens
-		m.OutputTokens += r.Usage.OutputTokens
-		m.TotalTokens += r.Usage.TotalTokens
-		m.CachedInputTokens += r.Usage.CachedInputTokens
-		m.CachedCreationTokens += r.Usage.CachedCreationTokens
-		m.ReasoningTokens += r.Usage.ReasoningTokens
-		m.AudioInputTokens += r.Usage.AudioInputTokens
-		m.AudioOutputTokens += r.Usage.AudioOutputTokens
-		m.AcceptedPredictionTokens += r.Usage.AcceptedPredictionTokens
-		m.RejectedPredictionTokens += r.Usage.RejectedPredictionTokens
-		m.CacheCreation5mTokens += r.Usage.CacheCreation5mTokens
-		m.CacheCreation1hTokens += r.Usage.CacheCreation1hTokens
-		m.CacheCreation30mTokens += r.Usage.CacheCreation30mTokens
-		m.CacheCreation12hTokens += r.Usage.CacheCreation12hTokens
-		m.CacheHitTokens += r.Usage.CacheHitTokens
-		m.CacheMissTokens += r.Usage.CacheMissTokens
+		m.Requests = saturatingAdd(m.Requests, 1)
+		m.InputTokens = saturatingAdd(m.InputTokens, r.Usage.InputTokens)
+		m.OutputTokens = saturatingAdd(m.OutputTokens, r.Usage.OutputTokens)
+		m.TotalTokens = saturatingAdd(m.TotalTokens, r.Usage.TotalTokens)
+		m.CachedInputTokens = saturatingAdd(m.CachedInputTokens, r.Usage.CachedInputTokens)
+		m.CachedCreationTokens = saturatingAdd(m.CachedCreationTokens, r.Usage.CachedCreationTokens)
+		m.ReasoningTokens = saturatingAdd(m.ReasoningTokens, r.Usage.ReasoningTokens)
+		m.AudioInputTokens = saturatingAdd(m.AudioInputTokens, r.Usage.AudioInputTokens)
+		m.AudioOutputTokens = saturatingAdd(m.AudioOutputTokens, r.Usage.AudioOutputTokens)
+		m.AcceptedPredictionTokens = saturatingAdd(m.AcceptedPredictionTokens, r.Usage.AcceptedPredictionTokens)
+		m.RejectedPredictionTokens = saturatingAdd(m.RejectedPredictionTokens, r.Usage.RejectedPredictionTokens)
+		m.CacheCreation5mTokens = saturatingAdd(m.CacheCreation5mTokens, r.Usage.CacheCreation5mTokens)
+		m.CacheCreation1hTokens = saturatingAdd(m.CacheCreation1hTokens, r.Usage.CacheCreation1hTokens)
+		m.CacheCreation30mTokens = saturatingAdd(m.CacheCreation30mTokens, r.Usage.CacheCreation30mTokens)
+		m.CacheCreation12hTokens = saturatingAdd(m.CacheCreation12hTokens, r.Usage.CacheCreation12hTokens)
+		m.CacheHitTokens = saturatingAdd(m.CacheHitTokens, r.Usage.CacheHitTokens)
+		m.CacheMissTokens = saturatingAdd(m.CacheMissTokens, r.Usage.CacheMissTokens)
 		if r.UsageMissing {
-			m.UsageMissing++
+			m.UsageMissing = saturatingAdd(m.UsageMissing, 1)
 		}
 	}
 	add(&t.total)

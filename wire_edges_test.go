@@ -240,8 +240,9 @@ func TestAuditFixEmbeddingWireValidation(t *testing.T) {
 		want string
 	}{
 		{"null index", `{"data":[{"index":null,"embedding":[1]}]}`, "missing its index"},
-		{"null element", `{"data":[{"index":0,"embedding":[null,0.5]}]}`, "element 0 is null"},
-		{"non-numeric element", `{"data":[{"index":0,"embedding":["x"]}]}`, "not a number"},
+		{"null element", `{"data":[{"index":0,"embedding":[null,0.5]}]}`, "coordinate must be a number"},
+		{"non-numeric element", `{"data":[{"index":0,"embedding":["x"]}]}`, "coordinate must be a number"},
+		{"overflow element", `{"data":[{"index":0,"embedding":[1e80]}]}`, "out of float32 range"},
 		{"missing embedding", `{"data":[{"index":0}]}`, "empty vector"},
 	}
 	for _, tc := range cases {

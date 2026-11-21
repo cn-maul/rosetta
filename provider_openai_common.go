@@ -155,5 +155,22 @@ func listOpenAIModelsOnce(ctx context.Context, c *Client, method, url string) ([
 		}
 		models = append(models, mi)
 	}
+	if len(*list.Data) > 0 && len(models) == 0 {
+		return nil, false, fmt.Errorf("%w: model list contains no valid ids", ErrUpstreamMalformed)
+	}
 	return models, false, nil
+}
+
+func openAIToolResultText(block Block) (string, error) {
+	if len(block.ResultBlocks) == 0 {
+		return block.Content, nil
+	}
+	parts := make([]string, 0, len(block.ResultBlocks))
+	for _, part := range block.ResultBlocks {
+		if part.Type != BlockText {
+			return "", fmt.Errorf("%w: OpenAI Chat tool results do not support %s blocks", ErrNotSupported, part.Type)
+		}
+		parts = append(parts, part.Text)
+	}
+	return strings.Join(parts, "\n"), nil
 }

@@ -19,6 +19,65 @@ func startTestServer(t *testing.T, h http.Handler) *httptest.Server {
 	return httptest.NewTestServer(t, h)
 }
 
+type closeCountBody struct {
+	io.Reader
+	closed int
+}
+
+func (body *closeCountBody) Close() error {
+	body.closed++
+	return nil
+}
+
+type retryTestTransport func(*http.Request) (*http.Response, error)
+
+func (transport retryTestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return transport(req)
+}
+
+func TestRetrySnapshotClosesOriginalBodies(t *testing.T) {
+	for _, scenario := range []struct {
+		name         string
+		maxRetries   int
+		cancelAfter  time.Duration
+		wantAttempts int
+	}{
+		{"disabled", 0, 0, 1},
+		{"exhausted", 2, 0, 3},
+		{"budget", 10, 0, 4},
+		{"cancelled", 10, time.Second, 1},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				client := New()
+				client.MaxRetries = scenario.maxRetries
+				var bodies []*closeCountBody
+				client.HTTP.Transport = retryTestTransport(func(*http.Request) (*http.Response, error) {
+					body := &closeCountBody{Reader: http.NoBody}
+					bodies = append(bodies, body)
+					return &http.Response{StatusCode: 503, Header: http.Header{"Retry-After": {"60"}}, Body: body}, nil
+				})
+				ctx := context.Background()
+				if scenario.cancelAfter != 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, scenario.cancelAfter)
+					defer cancel()
+				}
+				resp, err := client.Do(ctx, &Call{Method: http.MethodGet, URL: "http://api.test"})
+				if err != nil || resp == nil || resp.StatusCode != 503 || len(bodies) != scenario.wantAttempts {
+					t.Fatalf("response = %+v, err = %v, attempts = %d", resp, err, len(bodies))
+				}
+				resp.Body.Close()
+				for index, body := range bodies {
+					if body.closed != 1 {
+						t.Errorf("body %d closed %d times", index, body.closed)
+					}
+				}
+			})
+		})
+	}
+}
+
 func TestDoSuccess(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var calls atomic.Int32

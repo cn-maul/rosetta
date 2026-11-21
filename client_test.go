@@ -294,8 +294,8 @@ func TestModelInfoAppliesTimeout(t *testing.T) {
 		c := newTestClient(t, WithHTTPClient(srv.Client()), WithTimeout(1*time.Second))
 		start := time.Now()
 		_, err := c.ModelInfo(context.Background(), "unknown-model")
-		if !errors.Is(err, ErrUnknownModel) {
-			t.Fatalf("err = %v, want ErrUnknownModel", err)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want context deadline exceeded", err)
 		}
 		if d := time.Since(start); d > 2*time.Second {
 			t.Fatalf("elapsed = %s, timeout not applied", d)

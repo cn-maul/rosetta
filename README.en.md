@@ -27,7 +27,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff.
 go get github.com/cn-maul/rosetta
 ```
 
-Requires Go 1.27+. No third-party dependencies.
+Requires Go 1.27.4 or later. No third-party dependencies.
 
 ## Quick start
 

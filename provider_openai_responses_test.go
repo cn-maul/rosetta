@@ -382,8 +382,8 @@ func TestResponsesStreamConflictingSealFails(t *testing.T) {
 			break
 		}
 	}
-	if !errors.Is(lastErr, ErrUpstreamMalformed) {
-		t.Fatalf("err = %v, want ErrUpstreamMalformed", lastErr)
+	if !errors.Is(lastErr, errSealConflict) || errors.Is(lastErr, ErrUpstreamMalformed) {
+		t.Fatalf("err = %v, want stream seal conflict", lastErr)
 	}
 }
 
@@ -403,8 +403,8 @@ func TestResponsesStreamIDConflictFails(t *testing.T) {
 			break
 		}
 	}
-	if !errors.Is(lastErr, ErrUpstreamMalformed) {
-		t.Fatalf("err = %v, want ErrUpstreamMalformed", lastErr)
+	if lastErr == nil || !strings.Contains(lastErr.Error(), "conflicting item ids") || errors.Is(lastErr, ErrUpstreamMalformed) {
+		t.Fatalf("err = %v, want stream identity conflict", lastErr)
 	}
 }
 

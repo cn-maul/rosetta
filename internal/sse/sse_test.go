@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 )
 
 // collect drains all events from input; the stream must end with io.EOF.
@@ -141,6 +142,30 @@ func TestVeryLongLine(t *testing.T) {
 	evs := collect(t, "data: "+long+"\n\n", nil)
 	if len(evs) != 1 || string(evs[0].Data) != long {
 		t.Fatalf("long line mangled: %d events, data len %d", len(evs), len(evs[0].Data))
+	}
+}
+
+func TestCRDispatchesBeforeTransportCloses(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	go func() { _, _ = io.WriteString(writer, "data: one\r\r") }()
+	type result struct {
+		event *Event
+		err   error
+	}
+	completed := make(chan result, 1)
+	go func() {
+		event, err := New(reader).Next()
+		completed <- result{event, err}
+	}()
+	select {
+	case got := <-completed:
+		if got.err != nil || string(got.event.Data) != "one" {
+			t.Fatalf("event = %+v, err = %v", got.event, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CR-only event waited for more bytes")
 	}
 }
 

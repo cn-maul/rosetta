@@ -62,7 +62,7 @@ func (c *Client) UploadFile(ctx context.Context, r io.Reader, filename, purpose 
 	if _, err := part.Write(data); err != nil {
 		return nil, fmt.Errorf("%w: writing multipart: %v", ErrInvalidRequest, err)
 	}
-	if purpose != "" {
+	if purpose != "" && c.Protocol() != ProtoAnthropic {
 		if err := mw.WriteField("purpose", purpose); err != nil {
 			return nil, fmt.Errorf("%w: writing purpose: %v", ErrInvalidRequest, err)
 		}
@@ -82,27 +82,69 @@ func (c *Client) UploadFile(ctx context.Context, r io.Reader, filename, purpose 
 		return nil, fmt.Errorf("%w: files response: %w", ErrUpstreamMalformed, err)
 	}
 	f := w.file()
+	if f.ID == "" {
+		return nil, fmt.Errorf("%w: file response missing id", ErrUpstreamMalformed)
+	}
 	return &f, nil
 }
 
 // ListFiles returns the files visible to this credential.
 func (c *Client) ListFiles(ctx context.Context) ([]File, error) {
-	u := c.decorateURL(joinEndpoint(c.settings.endpoint, "/files"))
-	out, err := c.doFilesJSON(ctx, http.MethodGet, u, c.filesHeaders("application/json"), nil)
+	ctx, cancel := c.unaryContext(ctx)
+	defer cancel()
+	endpoint, err := url.Parse(c.decorateURL(joinEndpoint(c.settings.endpoint, "/files")))
 	if err != nil {
 		return nil, err
 	}
-	var list struct {
-		Data []fileWire `json:"data"`
+	files := []File{}
+	seen := map[string]bool{}
+	for range 100 {
+		out, err := c.doFilesJSON(ctx, http.MethodGet, endpoint.String(), c.filesHeaders("application/json"), nil)
+		if err != nil {
+			return nil, err
+		}
+		var list struct {
+			Data     []fileWire `json:"data"`
+			HasMore  bool       `json:"has_more"`
+			LastID   string     `json:"last_id"`
+			NextPage string     `json:"next_page"`
+		}
+		if err := json.Unmarshal(out, &list); err != nil {
+			return nil, fmt.Errorf("%w: files list: %w", ErrUpstreamMalformed, err)
+		}
+		if list.Data == nil {
+			return nil, fmt.Errorf("%w: files list missing data", ErrUpstreamMalformed)
+		}
+		for _, entry := range list.Data {
+			if entry.ID == "" {
+				return nil, fmt.Errorf("%w: file response missing id", ErrUpstreamMalformed)
+			}
+			files = append(files, entry.file())
+		}
+		if !list.HasMore && list.NextPage == "" {
+			return files, nil
+		}
+		key, cursor := "after", list.LastID
+		if c.Protocol() == ProtoAnthropic {
+			key = "after_id"
+		}
+		if list.NextPage != "" {
+			key, cursor = "page", list.NextPage
+		} else if cursor == "" && len(list.Data) != 0 {
+			cursor = list.Data[len(list.Data)-1].ID
+		}
+		if cursor == "" || seen[cursor] {
+			return nil, fmt.Errorf("%w: invalid files page cursor", ErrUpstreamMalformed)
+		}
+		seen[cursor] = true
+		query := endpoint.Query()
+		query.Del("after")
+		query.Del("after_id")
+		query.Del("page")
+		query.Set(key, cursor)
+		endpoint.RawQuery = query.Encode()
 	}
-	if err := json.Unmarshal(out, &list); err != nil {
-		return nil, fmt.Errorf("%w: files list: %w", ErrUpstreamMalformed, err)
-	}
-	files := make([]File, 0, len(list.Data))
-	for _, w := range list.Data {
-		files = append(files, w.file())
-	}
-	return files, nil
+	return nil, fmt.Errorf("%w: files pagination limit exceeded", ErrUpstreamMalformed)
 }
 
 // GetFile fetches one file's metadata.
@@ -120,6 +162,9 @@ func (c *Client) GetFile(ctx context.Context, id string) (*File, error) {
 		return nil, fmt.Errorf("%w: file response: %w", ErrUpstreamMalformed, err)
 	}
 	f := w.file()
+	if f.ID == "" {
+		return nil, fmt.Errorf("%w: file response missing id", ErrUpstreamMalformed)
+	}
 	return &f, nil
 }
 
@@ -129,6 +174,8 @@ func (c *Client) DeleteFile(ctx context.Context, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: file id is required", ErrInvalidRequest)
 	}
+	ctx, cancel := c.unaryContext(ctx)
+	defer cancel()
 	u := c.decorateURL(joinEndpoint(c.settings.endpoint, "/files/"+url.PathEscape(id)))
 	call := &httpx.Call{
 		Method: http.MethodDelete,
@@ -139,10 +186,9 @@ func (c *Client) DeleteFile(ctx context.Context, id string) error {
 	if err != nil {
 		return transport(err, http.MethodDelete, u)
 	}
-	defer resp.Body.Close()
-	body, rerr := io.ReadAll(io.LimitReader(resp.Body, bodyLimit))
+	body, rerr := readBody(resp, http.MethodDelete, u, bodyLimit)
 	if rerr != nil {
-		return transport(rerr, http.MethodDelete, u)
+		return rerr
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return withRetryAfter(c.parseFilesError(resp.StatusCode, body, http.MethodDelete, u, resp.Header), resp.Header)
@@ -174,6 +220,8 @@ func (c *Client) filesHeaders(contentType string) http.Header {
 
 // doFilesJSON issues a Files call and returns the raw 2xx body.
 func (c *Client) doFilesJSON(ctx context.Context, method, u string, hdr http.Header, body []byte) ([]byte, error) {
+	ctx, cancel := c.unaryContext(ctx)
+	defer cancel()
 	call := &httpx.Call{Method: method, URL: u, Header: hdr}
 	if body != nil {
 		call.Body = func() ([]byte, error) { return body, nil }
@@ -182,10 +230,9 @@ func (c *Client) doFilesJSON(ctx context.Context, method, u string, hdr http.Hea
 	if err != nil {
 		return nil, transport(err, method, u)
 	}
-	defer resp.Body.Close()
-	out, rerr := io.ReadAll(io.LimitReader(resp.Body, bodyLimit))
+	out, rerr := readBody(resp, method, u, bodyLimit)
 	if rerr != nil {
-		return nil, transport(rerr, method, u)
+		return nil, rerr
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, withRetryAfter(c.parseFilesError(resp.StatusCode, out, method, u, resp.Header), resp.Header)
@@ -202,15 +249,15 @@ func (c *Client) parseFilesError(status int, body []byte, method, url string, h 
 
 // fileWire accepts both providers' metadata shapes.
 type fileWire struct {
-	ID        string `json:"id"`
-	Object    string `json:"object"`
-	Type      string `json:"type"`
-	Bytes     int64  `json:"bytes"`
-	SizeBytes int64  `json:"size_bytes"`
-	CreatedAt int64  `json:"created_at"`
-	Filename  string `json:"filename"`
-	Purpose   string `json:"purpose"`
-	MimeType  string `json:"mime_type"`
+	ID        string        `json:"id"`
+	Object    string        `json:"object"`
+	Type      string        `json:"type"`
+	Bytes     int64         `json:"bytes"`
+	SizeBytes int64         `json:"size_bytes"`
+	CreatedAt fileTimestamp `json:"created_at"`
+	Filename  string        `json:"filename"`
+	Purpose   string        `json:"purpose"`
+	MimeType  string        `json:"mime_type"`
 }
 
 func (w fileWire) file() File {
@@ -228,8 +275,22 @@ func (w fileWire) file() File {
 	if f.Bytes == 0 {
 		f.Bytes = w.SizeBytes
 	}
-	if w.CreatedAt > 0 {
-		f.CreatedAt = time.Unix(w.CreatedAt, 0)
-	}
+	f.CreatedAt = w.CreatedAt.Time
 	return f
+}
+
+type fileTimestamp struct{ time.Time }
+
+func (stamp *fileTimestamp) UnmarshalJSON(data []byte) error {
+	if len(data) > 0 && data[0] == '"' {
+		return stamp.Time.UnmarshalJSON(data)
+	}
+	var seconds int64
+	if err := json.Unmarshal(data, &seconds); err != nil {
+		return err
+	}
+	if seconds > 0 {
+		stamp.Time = time.Unix(seconds, 0)
+	}
+	return nil
 }

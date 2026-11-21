@@ -104,31 +104,32 @@ func (c *Client) Rerank(ctx context.Context, req *RerankRequest) (*RerankRespons
 	if err := mergeExtra(payload, req.Extra, c.settings.canExtraOverride, rerankReservedPayloadKeys); err != nil {
 		return nil, err
 	}
-	body, err := postAuxJSON(ctx, c, "/rerank", payload)
+	var wire struct {
+		Model           string
+		Query           string
+		Documents       []*string
+		TopN            *int  `json:"top_n"`
+		ReturnDocuments *bool `json:"return_documents"`
+	}
+	data, err := encodeAuxPayload(payload, &wire, func() bool {
+		return wire.Model != "" && wire.Query != "" && len(wire.Documents) > 0 &&
+			!slices.Contains(wire.Documents, nil) && (wire.TopN == nil || *wire.TopN > 0)
+	})
 	if err != nil {
 		return nil, err
 	}
-	// An allowed override (WithExtraOverrides, or a whitelisted key via
-	// WithExtraOverrideKeys) lets Extra replace documents; validate the
-	// reply against what is actually on the wire. Normalize through JSON so
-	// an override of any shape is read, and reject an override to an empty
-	// list rather than skipping the index range check (audit C20). When no
-	// override is in play the SDK's own []string is authoritative, so the
-	// expensive JSON round-trip is skipped.
-	expectedDocs := len(req.Documents)
-	if c.settings.canExtraOverride("documents") && len(req.Extra) > 0 {
-		if n, ok := wireSliceLen(payload["documents"]); ok {
-			if n == 0 {
-				return nil, fmt.Errorf("%w: rerank documents is empty after Extra override", ErrInvalidRequest)
-			}
-			expectedDocs = n
-		}
-	}
-	resp, err := decodeRerankResponse(body, expectedDocs)
+	ctx, observation := c.observeCall(ctx)
+	body, err := postAuxJSON(ctx, c, "/rerank", data)
 	if err != nil {
+		c.recordCall(wire.Model, Usage{}, observation, err)
 		return nil, err
 	}
-	c.record(req.Model, resp.Usage, resp.Usage.IsZero())
+	resp, err := decodeRerankResponse(body, len(wire.Documents))
+	if err != nil {
+		c.recordCall(wire.Model, Usage{}, observation, err)
+		return nil, err
+	}
+	c.recordCall(wire.Model, resp.Usage, observation, nil)
 	return resp, nil
 }
 

@@ -41,7 +41,8 @@ type ModelInfo struct {
 	// the value carries no information and must not be read as "does not
 	// support thinking" — that reading would strip reasoning from every
 	// model whose vendor simply omitted the field.
-	SupportsThinking bool `json:"supports_thinking,omitempty"`
+	SupportsThinking bool     `json:"supports_thinking,omitempty"`
+	ThinkingModes    []string `json:"thinking_modes,omitempty"`
 	// ThinkingReported reports whether SupportsThinking reflects an explicit
 	// source declaration rather than a zero-value default. It preserves the
 	// three-way distinction "unknown / supports / does not support":
@@ -124,6 +125,9 @@ func applyModelCapability(dst *ModelInfo, cap ModelInfo) {
 	}
 	if len(cap.EffortLevels) > 0 {
 		dst.EffortLevels = cap.EffortLevels
+	}
+	if len(cap.ThinkingModes) > 0 {
+		dst.ThinkingModes = cap.ThinkingModes
 	}
 	if cap.Type != "" {
 		dst.Type = cap.Type

@@ -107,6 +107,9 @@ var (
 	// stream for an unspecified reason; prefer passing an explicit cause
 	// (e.g. ErrStreamIdleTimeout) so downstream code can distinguish.
 	ErrStreamAborted = errors.New("rosetta: stream aborted by caller")
+	// ErrRequestOutcomeUnknown indicates that an upstream POST may already
+	// have run when its connection or response body failed.
+	ErrRequestOutcomeUnknown = errors.New("rosetta: upstream request outcome unknown")
 )
 
 // TransportError wraps a lower-level network failure (DNS, connect, TLS,
@@ -344,6 +347,9 @@ var (
 
 // transport wraps a network error with request context.
 func transport(err error, method, url string) error {
+	if method == http.MethodPost && !errors.Is(err, httpx.ErrPermanent) {
+		err = errors.Join(ErrRequestOutcomeUnknown, err)
+	}
 	return &TransportError{Method: method, URL: url, Err: err}
 }
 

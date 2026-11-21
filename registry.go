@@ -169,6 +169,7 @@ func normalizeInfo(m *ModelInfo) {
 	if m.DisableThinking {
 		m.SupportsThinking = false
 		m.EffortLevels = nil
+		m.ThinkingModes = nil
 	}
 }
 
@@ -233,6 +234,9 @@ func mergeInfo(high, low ModelInfo) ModelInfo {
 	if len(out.EffortLevels) == 0 {
 		out.EffortLevels = low.EffortLevels
 	}
+	if len(out.ThinkingModes) == 0 {
+		out.ThinkingModes = low.ThinkingModes
+	}
 	// Declaring levels is itself a thinking claim, so it must light the
 	// boolean up rather than leaving an entry that says "levels exist" but
 	// "cannot reason" — a combination no caller can act on sensibly. The
@@ -264,6 +268,7 @@ func mergeInfo(high, low ModelInfo) ModelInfo {
 		// model must not keep advertising levels to callers that will offer
 		// them. This also covers levels inherited from the lower layer.
 		out.EffortLevels = nil
+		out.ThinkingModes = nil
 	}
 	if out.Protocol == "" {
 		out.Protocol = low.Protocol
@@ -316,5 +321,6 @@ func (r *Registry) List() []ModelInfo {
 func cloneModelInfo(m ModelInfo) ModelInfo {
 	m.Aliases = slices.Clone(m.Aliases)
 	m.EffortLevels = slices.Clone(m.EffortLevels)
+	m.ThinkingModes = slices.Clone(m.ThinkingModes)
 	return m
 }

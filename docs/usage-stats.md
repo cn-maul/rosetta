@@ -24,7 +24,7 @@ client, _ := rosetta.NewClient(
 )
 ```
 
-每次 `Chat` 成功返回、每个 `Stream` 终止（正常、出错或中途 `Close`）记录一条 `UsageRecord`：
+已发起 HTTP 请求的 Chat 和 ChatStream 各记录一条 `UsageRecord`。失败记录包含错误，未收到用量就主动 `Close` 的流跳过记录。上游省略模型名时使用请求的模型名。`Latency` 覆盖整次调用，`Attempts` 包含重试与协议降级，`StatusCode` 和 `RequestID` 来自最后一次响应。
 
 ```go
 type UsageRecord struct {

@@ -24,9 +24,10 @@ client, err := rosetta.NewClient(
 | `WithAPIKey(key)` | 无（必填） | 凭证 |
 | `WithProtocol(p)` | `ProtoOpenAIChat` | `ProtoOpenAIChat` / `ProtoOpenAIResponses` / `ProtoAnthropic`；也可由 `DetectClient` 探测决定 |
 | `WithHTTPClient(c)` | SDK 自建 Transport | 自定义底层 HTTP 客户端（代理、TLS）；不要在它上面设总超时，会杀死流式；也用于 `DetectClient` 的协议探测。默认 Transport 的代理行为见[附注](#附注) |
-| `WithTimeout(d)` | 60s | 仅约束非流式调用（Chat / ListModels / ModelInfo / Embed / Rerank），以及 `DetectClient` 的协议探测；`WithTimeout(0)` 关闭默认上界。流式不受影响，由调用方 ctx 管辖 |
+| `WithTimeout(d)` | 60s | 约束非流式网络调用，包括 Files、CountTokens 和 DetectClient。`WithTimeout(0)` 关闭默认上界。流式调用由调用方 ctx 管辖 |
 | `WithStreamIdleTimeout(d)` | 关闭 | 流空闲看门狗：`d` 内没有新事件就以 `ErrStreamIdleTimeout` 中止。按「每次读」计时，慢但仍在输出的流不会被误杀；`Partial()` 保留已收内容，见[流式](streaming.md#看门狗流空闲超时) |
-| `WithMaxRetries(n)` | 2 | 可重试失败（网络错误、408/429/5xx/529）的重试次数，见[重试策略](protocols.md#重试策略) |
+| `WithMaxRetries(n)` | 2 | 每次符合条件的请求最多重试几次，见[重试策略](protocols.md#重试策略) |
+| `WithChatIdempotentRetries(v)` | false | 仅在上游保证按 `Idempotency-Key` 去重时开启，以允许 Chat 在执行状态不明时重试 |
 | `WithRetryBase(d)` | 400ms | 退避基数（逐次翻倍 ±20%，上限 8s） |
 | `WithDefaultMaxOutputTokens(n)` | 无 | 请求未指定输出上限时的默认值 |
 | `WithUsageTracker(t)` | 无（不记账） | 传 `rosetta.NewMemoryUsageTracker()` 启用，见[用量统计](usage-stats.md) |
@@ -210,7 +211,7 @@ Thinking: &rosetta.ThinkingConfig{Effort: rosetta.EffortMedium} // 低/中/高�
 | OpenAI Responses | `reasoning.effort` | 同上 |
 | Anthropic | `thinking.budget_tokens`（或 `Adaptive` → `type: adaptive`） | Effort ≈ 2048/8192/32768；显式预算原样；两者都没给默认 medium |
 
-Anthropic 约束由 SDK 主动满足：budget ≥ 1024；budget ≥ max_tokens 时抬高 max_tokens（预算优先）；上游仍报预算约束错误时自动改写重试一次（整流，`WithThinkingRectify(false)` 关闭）。`Adaptive: true` 时改发 `type: "adaptive"`（模型自定预算，与 `BudgetTokens`/`Effort` 互斥）。Anthropic 在 2026-10-21 版本移除了**采样参数**（`temperature`/`top_p`/`top_k`），SDK 对 Anthropic 协议不再发送这三个字段；`stop_sequences` 与 `service_tier` **未被移除**，仍按原生字段名下发。
+Anthropic 的固定思考预算至少为 1024，且低于 `max_tokens`。SDK 会提高输出预算以满足约束，并检查调整后的上下文预算。收到符合条件的预算错误时，SDK 最多调整并重试一次，`WithThinkingRectify(false)` 可关闭。显式设置 `Adaptive: true`，或目录报告支持且未指定固定预算时，SDK 可发送 `type: "adaptive"`。此时模型自行分配预算，显式思考强度通过 `output_config.effort` 传递。Anthropic 2026-10-21 请求仍发送 `stop_sequences` 与 `service_tier`，省略 `temperature`、`top_p` 和 `top_k`。
 
 **工具调用之间的推理（交错思考）**：交错思考已在 Anthropic API 2026-10-21 转正，SDK 不再需要、也不再自动发送 beta 头——请求同时带 `Thinking` 与 `Tools` 时即自然交错。旧的 `WithInterleavedThinking` 保留为 no-op 以兼容旧代码。
 
@@ -303,7 +304,7 @@ if errors.Is(err, rosetta.ErrUpstreamMalformed) {
 
 **流式事件解析失败刻意不带这个哨兵**：流式错误可能在事件已交付给调用方之后才出现，此时"换上游重试"会重放已交付的输出并可能重复计费。判断能否安全重试需要调用方自己的 committed 状态，错误本身不知道，所以流式保持无类型。
 
-`APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / InBand / RetryAfter / Category / AffectsModel / Raw`，由三协议的错误体归一而来。`InBand=true` 标记"信内"错误——HTTP 200 但响应体或流事件内嵌了 `error`：传输层确实成功，`StatusCode` 保持 200，**按 `StatusCode >= 400` 判定失败的调用方应同时检查 `InBand`**。`Raw` 存储前做保守脱敏（**先脱敏后截断**，超 4KB 的大错误体同样生效）：敏感键的值替换为 `[redacted]`，`sk-…` 密钥材料统一掩码；但错误信息与 Raw 仍可能包含 provider 回显的内容，请避免把完整错误对象直接写入公开日志。注意 `Retryable` 是给调用方的重试提示（408/429/5xx/529 为 true），**SDK 自身只按重试策略自动重试**：GET 类请求默认重试；chat POST（三协议）v0.6.0 起默认携带 `Idempotency-Key` 并对 429/503 做传输层退避重试（默认最多 2 次），对不识别该头或绝不能重放请求的网关，用 `WithQuirks(Quirks{NoIdempotencyKey: true})` 恢复 v0.5.x 行为（不发该头、429/503 立即报错）；embedding/rerank 幂等，按策略重试。流内错误（HTTP 200 但 SSE 事件报错，即 `InBand=true`）与流截断（`ErrStreamTruncated`）不看 HTTP 状态码判断。另外：第三方网关以 400 拒绝某个可选字段**取值**（如 `reasoning.effort: low`）时按配置错误原样报错，不会触发"删除整个字段"的降级；字段级拒绝的降级记忆按模型隔离。
+`APIError` 携带 `StatusCode / Code / Type / Message / RequestID / Method / URL / Retryable / InBand / RetryAfter / Category / AffectsModel / Raw`。`InBand=true` 表示 HTTP 200 响应或 SSE 事件内嵌上游错误。`Raw` 先脱敏再截断，错误文本仍可能包含上游回显。`Retryable` 是状态码级提示，SDK 按[重试策略](protocols.md#重试策略)决定是否重试。连接或响应体读取失败可能留下 `ErrRequestOutcomeUnknown`，此时上游可能已经执行请求。SDK 按模型记忆可选字段级别的降级，字段取值错误会原样返回。
 
 ### 错误归因：Category / AffectsModel
 
@@ -384,7 +385,7 @@ rr, err := client.Rerank(ctx, &rosetta.RerankRequest{
 ```
 
 - 调用走 `WithEmbeddingEndpoint` / `WithEmbeddingAPIKey`（未设置则用主 endpoint/key）。典型场景：chat 在 DeepSeek，embedding/rerank 在本地 Ollama、SiliconFlow 或其他向量服务商——这也是 Anthropic 客户端使用这两个 API 的唯一途径。
-- 均为幂等 POST，失败按重试策略重试；无流式、无 thinking 门控；usage 记入与 chat 同一个 tracker（rerank 各家返回口径不一，Cohere 计费单位、Jina 总 token 等尽力映射，取不到时 UsageMissing 计数）。
+- Embed 和 Rerank 默认只对 HTTP 429 自动重试。用量写入同一个 tracker，Rerank 只计入供应商明确返回的 token 数。
 - 上下文校验、thinking 门控等 chat 专属检查不适用。
 - **响应严格校验**：embedding 的 index 必须存在、在范围内且不重复，向量元素必须全为数字，整批维度必须一致（显式传了 `Dimensions` 时必须精确匹配），返回顺序按 Index 恢复为输入顺序；rerank 的 index/score 必须存在且合法，结果按分数降序重排。负数 token 用量视为协议错误。空结果、数量不匹配、缺字段/`null` 一律报错而不是按零值成功。
 

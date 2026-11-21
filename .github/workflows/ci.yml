@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -23,17 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          # Pinned to an exact patch, not a bare "1.27". staticcheck v0.8.1
-          # vendors an x/tools whose gcexportdata reader tops out at export
-          # data version 4; newer 1.27.x patches emit version 5 for the
-          # standard library, which makes staticcheck fail with
-          #   internal error in importing "math/bits" ... version 5 is
-          #   greater than maximum supported version 4
-          # before it ever reaches this repo's code. A bare minor let the
-          # runner float onto such a patch and broke the build on toolchain
-          # releases rather than on anything we control. Bump this together
-          # with go.mod, and re-verify staticcheck locally after doing so.
-          go-version: '1.27.1'
+          go-version-file: go.mod
       - name: Format
         if: runner.os == 'Linux'
         run: |
@@ -71,7 +62,7 @@ jobs:
         if: runner.os == 'Linux'
         # Compiled and run against the pinned toolchain above; -checks=all
         # keeps the run honest about which analyzers actually executed.
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all ./...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 -checks=all ./...
       - name: Vulnerability scan
         if: runner.os == 'Linux'
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 ./...

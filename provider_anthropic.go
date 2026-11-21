@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/cn-maul/rosetta/internal/httpx"
@@ -117,6 +119,7 @@ type anthroPlan struct {
 	budget    int // 0 = thinking not requested
 	maxTokens int
 	rectified bool
+	adaptive  bool
 }
 
 func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
@@ -127,7 +130,17 @@ func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
 	if req.Thinking == nil {
 		return pl
 	}
-	if req.Thinking.Adaptive {
+	model, _ := p.c.registry.Lookup(req.Model)
+	pl.adaptive = req.Thinking.Adaptive || (slices.Contains(model.ThinkingModes, "adaptive") && (req.Thinking.BudgetTokens == 0 || !slices.Contains(model.ThinkingModes, "enabled")))
+	if len(model.ThinkingModes) == 0 && req.Thinking.BudgetTokens == 0 {
+		for _, family := range []string{"claude-opus-4-6", "claude-sonnet-4-6"} {
+			if req.Model == family || strings.HasPrefix(req.Model, family+"-") {
+				pl.adaptive = true
+				break
+			}
+		}
+	}
+	if pl.adaptive {
 		// Adaptive thinking lets the model pick its own budget; no
 		// budget_tokens is sent, so the budget stays 0.
 		return pl
@@ -150,7 +163,7 @@ func (p *anthropicProvider) plan(req *ChatRequest) *anthroPlan {
 	if b >= pl.maxTokens {
 		// Thinking budget must be strictly less than max_tokens; grow
 		// the output cap rather than silently shrinking the budget.
-		pl.maxTokens = b + 4096
+		pl.maxTokens = b + min(4096, math.MaxInt-b)
 	}
 	pl.budget = b
 	return pl
@@ -213,6 +226,9 @@ func (pl *anthroPlan) rectify(msg string) bool {
 // TTL / interleaved thinking / breakpoint count) so the caller derives the
 // beta headers without re-walking the tree (M3).
 func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anthroPlan) (map[string]any, anthroPayloadScan, error) {
+	if pl.budget > 0 && pl.budget >= pl.maxTokens {
+		return nil, anthroPayloadScan{}, fmt.Errorf("%w: thinking budget must be below max_tokens", ErrInvalidRequest)
+	}
 	system, msgs, err := p.encodeMessages(req)
 	if err != nil {
 		return nil, anthroPayloadScan{}, err
@@ -226,7 +242,10 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 		payload["system"] = system
 	}
 	if req.Thinking != nil {
-		if req.Thinking.Adaptive {
+		if pl.adaptive {
+			if req.Thinking.BudgetTokens > 0 && !req.Thinking.Adaptive {
+				return nil, anthroPayloadScan{}, fmt.Errorf("%w: model %s requires adaptive thinking and does not accept budget_tokens", ErrNotSupported, req.Model)
+			}
 			// Adaptive thinking: the model chooses its own budget.
 			payload["thinking"] = map[string]any{"type": "adaptive"}
 		} else {
@@ -309,7 +328,12 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 		}
 		payload["tools"] = tools
 	}
-	if tc := req.ToolChoice; tc != nil {
+	parallel, parallelSet := parallelToolCalls(req)
+	tc := req.ToolChoice
+	if tc == nil && parallelSet && len(req.Tools) > 0 {
+		tc = &ToolChoice{Mode: ToolChoiceAuto}
+	}
+	if tc != nil {
 		// Anthropic spells "required" as "any"; sending OpenAI's word
 		// verbatim is a 400.
 		wire := map[string]any{}
@@ -324,7 +348,7 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 			wire["type"] = "tool"
 			wire["name"] = tc.Name
 		}
-		if parallel, ok := parallelToolCalls(req); ok {
+		if parallelSet && tc.Mode != ToolChoiceNone {
 			wire["disable_parallel_tool_use"] = !parallel
 		}
 		// Anthropic rejects extended thinking when tool_choice forces a
@@ -347,11 +371,32 @@ func (p *anthropicProvider) buildPayload(req *ChatRequest, stream bool, pl *anth
 			return nil, anthroPayloadScan{}, fmt.Errorf("%w: anthropic has no json_object response format; use json_schema", ErrNotSupported)
 		}
 	}
+	if pl.adaptive && (req.Thinking.Effort != EffortUnset || req.Thinking.EffortRaw != "") {
+		config, _ := payload["output_config"].(map[string]any)
+		if config == nil {
+			config = map[string]any{}
+			payload["output_config"] = config
+		}
+		config["effort"] = req.effortWire()
+	}
 	if stream {
 		payload["stream"] = true
 	}
 	if err := mergeExtraWithTools(payload, req.Extra, p.c.settings.canExtraOverride, anthropicReservedPayloadKeys); err != nil {
 		return nil, anthroPayloadScan{}, err
+	}
+	if _, overridden := req.Extra["max_tokens"]; overridden && p.c.settings.canExtraOverride("max_tokens") {
+		out, ok := wireInt(payload["max_tokens"])
+		if !ok || out <= pl.budget {
+			return nil, anthroPayloadScan{}, fmt.Errorf("%w: invalid anthropic max_tokens override", ErrInvalidRequest)
+		}
+		if err := p.c.checkContextWithOutput(req, out); err != nil {
+			return nil, anthroPayloadScan{}, err
+		}
+	} else if pl.rectified {
+		if err := p.c.checkContextWithOutput(req, pl.maxTokens); err != nil {
+			return nil, anthroPayloadScan{}, err
+		}
 	}
 	scan := scanAnthropicPayload(payload)
 	if scan.breakpoints > maxCacheBreakpoints {
@@ -423,8 +468,41 @@ func (p *anthropicProvider) encodeMessages(req *ChatRequest) (any, []map[string]
 		}
 	}
 	out := make([]map[string]any, 0, len(msgs))
+	var pendingTools map[string]bool
 	for _, m := range msgs {
 		blocks := make([]map[string]any, 0, len(m.blocks))
+		if m.role == "user" {
+			foundContent := false
+			for _, block := range m.blocks {
+				if block.Type == BlockToolResult && foundContent {
+					return nil, nil, fmt.Errorf("%w: anthropic tool results must precede user content in the same turn", ErrInvalidRequest)
+				}
+				if block.Type == BlockToolResult {
+					if !pendingTools[block.ToolCallID] {
+						return nil, nil, fmt.Errorf("%w: anthropic tool result %q does not match an outstanding call", ErrInvalidRequest, block.ToolCallID)
+					}
+					delete(pendingTools, block.ToolCallID)
+				}
+				foundContent = foundContent || block.Type != BlockToolResult
+			}
+			if len(pendingTools) != 0 {
+				return nil, nil, fmt.Errorf("%w: anthropic user turn omits outstanding tool results", ErrInvalidRequest)
+			}
+		} else {
+			pendingTools = nil
+			for _, block := range m.blocks {
+				if block.Type != BlockToolCall {
+					continue
+				}
+				if pendingTools == nil {
+					pendingTools = make(map[string]bool)
+				}
+				if pendingTools[block.ToolCallID] {
+					return nil, nil, fmt.Errorf("%w: duplicate anthropic tool call %q", ErrInvalidRequest, block.ToolCallID)
+				}
+				pendingTools[block.ToolCallID] = true
+			}
+		}
 		hadThinking := false
 		for _, b := range m.blocks {
 			switch b.Type {
@@ -705,10 +783,8 @@ func (p *anthropicProvider) Chat(ctx context.Context, req *ChatRequest) (*ChatRe
 		if beta := p.betaHeaders(); beta != "" {
 			hdr.Set("anthropic-beta", beta)
 		}
-		retry := httpx.RetryIdempotent
-		if p.c.settings.quirks.NoIdempotencyKey {
-			retry = httpx.RetryDefault
-		} else {
+		retry := p.c.chatRetryPolicy()
+		if !p.c.settings.quirks.NoIdempotencyKey {
 			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
@@ -754,10 +830,8 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 		if beta := p.betaHeaders(); beta != "" {
 			hdr.Set("anthropic-beta", beta)
 		}
-		retry := httpx.RetryIdempotent
-		if p.c.settings.quirks.NoIdempotencyKey {
-			retry = httpx.RetryDefault
-		} else {
+		retry := p.c.chatRetryPolicy()
+		if !p.c.settings.quirks.NoIdempotencyKey {
 			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
@@ -812,11 +886,12 @@ func (p *anthropicProvider) StreamChat(ctx context.Context, req *ChatRequest) (S
 func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
-		stop      StopReason
-		usage     anthroUsage
-		hasUsage  bool
-		ended     bool
-		truncated bool
+		stop        StopReason
+		usage       anthroUsage
+		hasUsage    bool
+		ended       bool
+		truncated   bool
+		clientTools = make(map[int]bool)
 	)
 	endEvent := func() *Event {
 		// No stop reason seen: the stream ended without the provider's
@@ -929,6 +1004,12 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 				if ch.ContentBlock == nil {
 					continue
 				}
+				if ch.ContentBlock.Type == "tool_use" {
+					if len(clientTools) >= maxStreamBlocks && !clientTools[ch.Index] {
+						return nil, ErrStreamOverflow
+					}
+					clientTools[ch.Index] = true
+				}
 				switch ch.ContentBlock.Type {
 				case "tool_use":
 					return &Event{
@@ -950,6 +1031,10 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 							BlockIndex: ch.Index,
 						}, nil
 					}
+				default:
+					if p.c.settings.unknownEvents && ch.ContentBlock.Type != "text" && ch.ContentBlock.Type != "thinking" {
+						return &Event{Type: EventUnknown, Raw: ssev.Data}, nil
+					}
 				}
 			case "content_block_delta":
 				if ch.Delta == nil {
@@ -969,14 +1054,19 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 						return &Event{Type: EventThinkingDelta, Signature: ch.Delta.Signature, BlockIndex: ch.Index}, nil
 					}
 				case "input_json_delta":
-					if ch.Delta.PartialJSON != "" {
+					if ch.Delta.PartialJSON != "" && clientTools[ch.Index] {
 						return &Event{
 							Type:           EventToolCall,
 							ToolIndex:      ch.Index,
 							ArgumentsDelta: ch.Delta.PartialJSON,
 						}, nil
 					}
+					if p.c.settings.unknownEvents && !clientTools[ch.Index] {
+						return &Event{Type: EventUnknown, Raw: ssev.Data}, nil
+					}
 				}
+			case "content_block_stop":
+				delete(clientTools, ch.Index)
 			case "message_delta":
 				if ch.Delta != nil && ch.Delta.StopReason != nil && *ch.Delta.StopReason != "" {
 					stop = mapAnthropicStop(*ch.Delta.StopReason)
@@ -1025,15 +1115,32 @@ func (p *anthropicProvider) streamEvents(body io.Reader, method, url, requestID 
 func (p *anthropicProvider) CountTokens(ctx context.Context, req *ChatRequest) (int, error) {
 	const method = http.MethodPost
 	url := p.c.decorateURL(joinEndpoint(p.c.settings.endpoint, "/messages/count_tokens"))
-	pl := p.plan(req)
-	payload, _, err := p.buildPayload(req, false, pl)
+	countReq := *req
+	countReq.Extra = nil
+	pl := p.plan(&countReq)
+	payload, _, err := p.buildPayload(&countReq, false, pl)
 	if err != nil {
 		return 0, err
 	}
-	// The endpoint takes the Messages body but max_tokens and stream are
-	// meaningless there; some gateways reject them.
-	delete(payload, "max_tokens")
-	delete(payload, "stream")
+	countFields := map[string]bool{
+		"model": true, "messages": true, "system": true, "speed": true,
+		"cache_control": true, "output_config": true, "thinking": true,
+		"tool_choice": true, "tools": true,
+	}
+	for key := range payload {
+		if !countFields[key] {
+			delete(payload, key)
+		}
+	}
+	extra := make(map[string]any)
+	for key, value := range req.Extra {
+		if countFields[key] || !anthropicReservedPayloadKeys[key] {
+			extra[key] = value
+		}
+	}
+	if err := mergeExtraWithTools(payload, extra, p.c.settings.canExtraOverride, anthropicReservedPayloadKeys); err != nil {
+		return 0, err
+	}
 	hdr := p.headers(false)
 	if beta := p.betaHeaders(); beta != "" {
 		hdr.Set("anthropic-beta", beta)
@@ -1062,6 +1169,9 @@ func (p *anthropicProvider) CountTokens(ctx context.Context, req *ChatRequest) (
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return 0, fmt.Errorf("%w: count_tokens response: %w", ErrUpstreamMalformed, err)
+	}
+	if !out.InputTokens.Set || out.InputTokens.Value < 0 || out.InputTokens.Value > maxWireInt {
+		return 0, fmt.Errorf("%w: count_tokens response missing valid input_tokens", ErrUpstreamMalformed)
 	}
 	return int(out.InputTokens.Value), nil
 }
@@ -1096,6 +1206,7 @@ func (p *anthropicProvider) listAnthropicModelsOnce(ctx context.Context, base st
 	}
 	var models []ModelInfo
 	after := ""
+	seenCursors := map[string]bool{}
 	for page := 0; ; page++ {
 		q := parsed.Query()
 		q.Set("limit", "100")
@@ -1144,6 +1255,7 @@ func (p *anthropicProvider) listAnthropicModelsOnce(ctx context.Context, base st
 			return nil, false, fmt.Errorf("%w: model list response is missing the required \"data\" field", ErrUpstreamMalformed)
 		}
 		parser := p.c.settings.modelCapability
+		previousCount := len(models)
 		for _, raw := range *list.Data {
 			var entry struct {
 				ID          string `json:"id"`
@@ -1160,15 +1272,19 @@ func (p *anthropicProvider) listAnthropicModelsOnce(ctx context.Context, base st
 			}
 			models = append(models, mi)
 		}
-		if !list.HasMore || page > 100 {
+		if len(*list.Data) > 0 && len(models) == previousCount {
+			return nil, false, fmt.Errorf("%w: model page contains no valid ids", ErrUpstreamMalformed)
+		}
+		if !list.HasMore {
 			return models, false, nil
 		}
-		if next := list.LastID; next != "" && len(*list.Data) > 0 {
+		if next := list.LastID; page < 99 && next != "" && len(*list.Data) > 0 && !seenCursors[next] {
+			seenCursors[next] = true
 			after = next
 			continue
 		}
 		// has_more without a usable cursor: stop rather than loop forever.
-		return models, false, nil
+		return nil, false, fmt.Errorf("%w: invalid or exhausted Anthropic model pagination", ErrUpstreamMalformed)
 	}
 }
 
@@ -1207,19 +1323,20 @@ func (u *anthroUsage) toUsage() Usage {
 	// cache read/write counts are disjoint. The unified Usage follows OpenAI
 	// semantics where CachedInputTokens ⊆ InputTokens, so fold the cache
 	// counts into the input (and therefore total) baseline.
-	cached := u.CacheReadInputTokens.Value
-	creation := u.CacheCreationInputTokens.Value
-	input := u.InputTokens.Value + cached + creation
+	cached := max(u.CacheReadInputTokens.Value, 0)
+	creation := max(u.CacheCreationInputTokens.Value, 0)
+	input := saturatingAdd(saturatingAdd(max(u.InputTokens.Value, 0), cached), creation)
+	output := max(u.OutputTokens.Value, 0)
 	out := Usage{
 		InputTokens:          input,
-		OutputTokens:         u.OutputTokens.Value,
-		TotalTokens:          input + u.OutputTokens.Value,
+		OutputTokens:         output,
+		TotalTokens:          saturatingAdd(input, output),
 		CachedInputTokens:    cached,
 		CachedCreationTokens: creation,
 	}
 	if u.CacheCreation != nil {
-		out.CacheCreation5mTokens = u.CacheCreation.Ephemeral5mInputTokens.Value
-		out.CacheCreation1hTokens = u.CacheCreation.Ephemeral1hInputTokens.Value
+		out.CacheCreation5mTokens = max(u.CacheCreation.Ephemeral5mInputTokens.Value, 0)
+		out.CacheCreation1hTokens = max(u.CacheCreation.Ephemeral1hInputTokens.Value, 0)
 	}
 	return out
 }
@@ -1266,21 +1383,23 @@ type anthroChunk struct {
 }
 
 type anthroResponse struct {
-	ID      string `json:"id"`
-	Model   string `json:"model"`
-	Content []struct {
-		Type      string          `json:"type"`
-		Text      string          `json:"text"`
-		Thinking  string          `json:"thinking"`
-		Signature string          `json:"signature"`
-		Data      string          `json:"data"`
-		ID        string          `json:"id"`
-		Name      string          `json:"name"`
-		Input     json.RawMessage `json:"input"`
-	} `json:"content"`
-	StopReason string           `json:"stop_reason"`
-	Usage      *anthroUsage     `json:"usage"`
-	Error      *anthroErrorBody `json:"error"`
+	ID         string            `json:"id"`
+	Model      string            `json:"model"`
+	Content    []json.RawMessage `json:"content"`
+	StopReason string            `json:"stop_reason"`
+	Usage      *anthroUsage      `json:"usage"`
+	Error      *anthroErrorBody  `json:"error"`
+}
+
+type anthroResponseBlock struct {
+	Type      string          `json:"type"`
+	Text      string          `json:"text"`
+	Thinking  string          `json:"thinking"`
+	Signature string          `json:"signature"`
+	Data      string          `json:"data"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
 }
 
 func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
@@ -1303,7 +1422,23 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 	}
 	out := &ChatResponse{ID: r.ID, Model: r.Model, Raw: truncateBody(body)}
 	sawToolCall := false
-	for _, blk := range r.Content {
+	for _, raw := range r.Content {
+		var discriminator struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &discriminator); err != nil {
+			return nil, fmt.Errorf("%w: anthropic content: %w", ErrUpstreamMalformed, err)
+		}
+		switch discriminator.Type {
+		case "text", "thinking", "redacted_thinking", "tool_use":
+		default:
+			out.Unknown = append(out.Unknown, Block{Type: BlockType("unknown:" + discriminator.Type), Raw: raw})
+			continue
+		}
+		var blk anthroResponseBlock
+		if err := json.Unmarshal(raw, &blk); err != nil {
+			return nil, fmt.Errorf("%w: anthropic content: %w", ErrUpstreamMalformed, err)
+		}
 		switch blk.Type {
 		case "text":
 			if blk.Text != "" {
@@ -1323,16 +1458,6 @@ func decodeAnthropicResponse(body []byte, rc ...string) (*ChatResponse, error) {
 				ToolName:   blk.Name,
 				Arguments:  string(blk.Input),
 			})
-		default:
-			// Server tool use/results (server_tool_use,
-			// web_search_tool_result, ...) and any future block type are
-			// preserved instead of skipped, so a gateway can forward them.
-			if raw, err := json.Marshal(blk); err == nil {
-				out.Unknown = append(out.Unknown, Block{
-					Type: BlockType("unknown:" + blk.Type),
-					Raw:  raw,
-				})
-			}
 		}
 	}
 	switch {

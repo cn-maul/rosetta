@@ -33,11 +33,11 @@ type Event struct {
 // are handled transparently (bytes are only interpreted once a full line
 // has arrived).
 type Scanner struct {
-	r       *bufio.Reader
-	name    string
-	id      string
-	data    [][]byte
-	pending []byte // remainder after a lone-CR split, awaiting the next readLine
+	r      *bufio.Reader
+	name   string
+	id     string
+	data   [][]byte
+	skipLF bool
 	// dataBytes is the running total of bytes accumulated in data for the
 	// event currently being assembled. It is maintained incrementally as
 	// each data line arrives, so the size guard is O(1) per line; summing
@@ -86,7 +86,7 @@ func (s *Scanner) Next() (*Event, error) {
 				}
 				// readLine returns a slice into the reusable bufio buffer, so
 				// the value must be copied before it is stored — the next
-				// ReadSlice would otherwise overwrite these bytes.
+				// read would otherwise overwrite these bytes.
 				s.data = append(s.data, append([]byte(nil), value...))
 				s.dataBytes = size
 			case "id":
@@ -118,76 +118,49 @@ func (s *Scanner) take() *Event {
 	}
 	ev := &Event{Name: s.name, ID: s.id, Data: data}
 	s.name, s.id = "", ""
+	clear(s.data)
 	s.data = s.data[:0]
 	s.dataBytes = 0
 	return ev
 }
 
-// readLine returns the next line without its terminator. It uses
-// bufio.Reader.ReadSlice('\n') so a line that fits in the buffer is returned
-// as a slice into the buffer with no per-byte ReadByte loop or copy; only a
-// line spanning a buffer boundary is accumulated. The returned slice is only
-// valid until the next read, so callers that retain it (data values) must
-// copy it. Terminators follow the SSE spec — LF, CRLF, or a lone CR — and
-// the maxLineBytes guard fires before the buffer grows unbounded.
+// readLine returns a line as soon as either terminator arrives. An LF
+// following CR is skipped on the next read, even across transport reads.
 func (s *Scanner) readLine() ([]byte, error) {
-	// Drain any pending remainder from a previous lone-CR split.
-	if len(s.pending) > 0 {
-		line := s.pending
-		s.pending = nil
-		return s.splitCR(line), nil
-	}
 	var buf []byte
 	for {
-		line, err := s.r.ReadSlice('\n')
-		if err == nil {
-			line = line[:len(line)-1] // strip the '\n' terminator
-			if len(buf) == 0 {
-				return s.splitCR(line), nil
+		if _, err := s.r.Peek(1); err != nil {
+			if errors.Is(err, io.EOF) && len(buf) != 0 {
+				return buf, nil
 			}
-			buf = append(buf, line...)
-			return s.splitCR(buf), nil
+			return nil, err
 		}
-		if errors.Is(err, bufio.ErrBufferFull) {
-			// The line spans a buffer boundary; accumulate and keep reading.
-			buf = append(buf, line...)
-			if len(buf) > maxLineBytes {
+		chunk, _ := s.r.Peek(s.r.Buffered())
+		if s.skipLF {
+			s.skipLF = false
+			if chunk[0] == '\n' {
+				_, _ = s.r.Discard(1)
+				chunk = chunk[1:]
+			}
+		}
+		end := bytes.IndexAny(chunk, "\r\n")
+		if end >= 0 {
+			if end > maxLineBytes-len(buf) {
 				return nil, ErrTooLarge
 			}
-			continue
-		}
-		if errors.Is(err, io.EOF) {
-			if len(buf) > 0 {
-				buf = append(buf, line...)
-			} else {
-				buf = line
-			}
+			s.skipLF = chunk[end] == '\r'
+			_, _ = s.r.Discard(end + 1)
 			if len(buf) == 0 {
-				return nil, io.EOF
+				return chunk[:end], nil
 			}
-			return s.splitCR(buf), nil // final line without a terminator
+			return append(buf, chunk[:end]...), nil
 		}
-		return nil, err
-	}
-}
-
-// splitCR handles CR as a line terminator (the SSE spec allows LF, CRLF, or
-// a lone CR). It strips a trailing CR (CRLF) and, when a CR appears
-// mid-line (a lone CR), splits there and buffers the remainder for the next
-// readLine call.
-func (s *Scanner) splitCR(line []byte) []byte {
-	if len(line) > 0 && line[len(line)-1] == '\r' {
-		line = line[:len(line)-1]
-	}
-	if i := bytes.IndexByte(line, '\r'); i >= 0 {
-		rest := line[i+1:]
-		if len(rest) > 0 && rest[0] == '\n' {
-			rest = rest[1:] // CRLF: consume the LF
+		if len(chunk) > maxLineBytes-len(buf) {
+			return nil, ErrTooLarge
 		}
-		s.pending = rest
-		line = line[:i]
+		buf = append(buf, chunk...)
+		_, _ = s.r.Discard(len(chunk))
 	}
-	return line
 }
 
 // splitField splits "field: value" / "field:value" / "field".

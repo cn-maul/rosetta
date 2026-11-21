@@ -95,6 +95,7 @@ func TestMultimodalControls(t *testing.T) {
 	ap := ac.provider.(*anthropicProvider)
 	areq := &ChatRequest{Model: "m", Messages: []Message{
 		User("hi"),
+		AssistantBlocks(Block{Type: BlockToolCall, ToolCallID: "call_1", ToolName: "screenshot", Arguments: `{}`}),
 		{Role: RoleTool, Blocks: []Block{{
 			Type: BlockToolResult, ToolCallID: "call_1",
 			ResultBlocks: []Block{
@@ -102,16 +103,15 @@ func TestMultimodalControls(t *testing.T) {
 				{Type: BlockImage, ImageURL: "data:image/png;base64,AAAA"},
 			},
 		}}},
+		User("describe it"),
 	}}
 	apl, _, err := ap.buildPayload(areq, false, ap.plan(areq))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Consecutive user-role turns merge, so the tool_result rides the same
-	// Anthropic message as the preceding user text.
 	amsgs := apl["messages"].([]map[string]any)
 	var tr map[string]any
-	for _, blk := range amsgs[0]["content"].([]map[string]any) {
+	for _, blk := range amsgs[2]["content"].([]map[string]any) {
 		if blk["type"] == "tool_result" {
 			tr = blk
 		}

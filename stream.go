@@ -69,6 +69,7 @@ type Event struct {
 	// materialized content and is not a merging key. The accumulator copies
 	// the value, so the producer must not mutate it afterwards.
 	OutputIndex    *int
+	partIndex      int
 	BlockIndex     int // content-block index for text/thinking merging (Anthropic); 0 elsewhere
 	ToolIndex      int
 	ToolID         string
@@ -212,6 +213,7 @@ type accBlock struct {
 	// block's identity, so they never move an accumulator slot.
 	order      int
 	orderKnown bool
+	partIndex  int
 	toolID     string
 	toolName   string
 	args       strings.Builder
@@ -264,7 +266,7 @@ func bufferedStream(cr *ChatResponse) Stream {
 	u := cr.Usage
 	events = append(events, &Event{Type: EventMessageEnd, StopReason: cr.StopReason, Usage: &u})
 	i := 0
-	return newStream(func() (*Event, error) {
+	stream := newStream(func() (*Event, error) {
 		if i >= len(events) {
 			return nil, io.EOF
 		}
@@ -272,6 +274,11 @@ func bufferedStream(cr *ChatResponse) Stream {
 		i++
 		return ev, nil
 	}, nil)
+	stream.partial = *cr
+	stream.partial.ID, stream.partial.Model, stream.partial.StopReason = "", "", ""
+	stream.partial.Content = nil
+	stream.partial.Usage = Usage{}
+	return stream
 }
 
 // attachCancel lets the owner release the HTTP context when the stream
@@ -447,6 +454,12 @@ func (s *streamCore) Partial() *ChatResponse {
 		s.contentDirty = false
 	}
 	cp.Content = append([]Block(nil), s.contentCache...)
+	cp.Raw = append(json.RawMessage(nil), cp.Raw...)
+	cp.Logprobs = append(json.RawMessage(nil), cp.Logprobs...)
+	cp.Unknown = append([]Block(nil), cp.Unknown...)
+	for index := range cp.Unknown {
+		cp.Unknown[index].Raw = append(json.RawMessage(nil), cp.Unknown[index].Raw...)
+	}
 	return &cp
 }
 
@@ -582,6 +595,7 @@ func (s *streamCore) apply(ev *Event) {
 			b.text.WriteString(ev.Text)
 			if ev.OutputIndex != nil {
 				b.setOrder(*ev.OutputIndex)
+				b.partIndex = ev.partIndex
 			}
 			s.contentDirty = true
 		}
@@ -795,6 +809,9 @@ func orderKeyLess(a, b *accBlock) bool {
 	}
 	if !a.orderKnown {
 		return false
+	}
+	if a.order == b.order {
+		return a.partIndex < b.partIndex
 	}
 	return a.order < b.order
 }

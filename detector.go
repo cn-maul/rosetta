@@ -55,27 +55,33 @@ func newProbeClient() *http.Client {
 // result reports whether a definitive classification was made; when false
 // the returned protocol is the OpenAI Chat fallback. logger (optional) is
 // told why detection was inconclusive.
-func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client, logger *slog.Logger) (Protocol, bool, error) {
+func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client, logger *slog.Logger, opts ...*settings) (Protocol, bool, error) {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	probeURL := joinEndpoint(endpoint, "/models")
+	probe := &Client{settings: &settings{endpoint: endpoint}}
+	if len(opts) != 0 {
+		probe.settings = opts[0]
+	}
 	// classify reads the live body so an oversized catalog still classifies
 	// from its first page (see classifyCatalog).
-	try := func(auth string) (Protocol, bool, int, error) {
+	try := func(probeURL, auth string) (Protocol, bool, int, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, probeURL, nil)
 		if err != nil {
 			return "", false, 0, err
 		}
 		req.Header.Set("Accept", "application/json")
+		if auth == "x-api-key" {
+			req.Header.Set("anthropic-version", anthropicVersion)
+		}
 		if apiKey != "" {
 			if auth == "bearer" {
 				req.Header.Set("Authorization", "Bearer "+apiKey)
 			} else {
 				req.Header.Set("x-api-key", apiKey)
-				req.Header.Set("anthropic-version", anthropicVersion)
 			}
 		}
+		probe.applyHeaders(req.Header)
 		resp, err := hc.Do(req)
 		if err != nil {
 			return "", false, 0, err
@@ -87,28 +93,30 @@ func detectByProbe(ctx context.Context, endpoint, apiKey string, hc *http.Client
 		proto, ok := classifyCatalog(io.LimitReader(resp.Body, detectBodyLimit))
 		return proto, ok, resp.StatusCode, nil
 	}
-	for _, auth := range []string{"bearer", "x-api-key"} {
-		proto, ok, status, err := try(auth)
-		if err != nil {
-			if ctx.Err() != nil {
-				return "", false, ctx.Err()
+	for _, probeURL := range probe.modelListURLs() {
+		for _, auth := range []string{"bearer", "x-api-key"} {
+			proto, ok, status, err := try(probeURL, auth)
+			if err != nil {
+				if ctx.Err() != nil {
+					return "", false, ctx.Err()
+				}
+				// err is a *url.Error whose Error() embeds the full probe URL,
+				// which can carry a path-embedded credential. Log the redacted
+				// endpoint and only the underlying cause, never the URL itself
+				// (N1).
+				logger.Warn("rosetta: protocol probe transport failure",
+					"auth", auth, "endpoint", displayEndpoint(endpoint), "err", probeCause(err))
+				continue
 			}
-			// err is a *url.Error whose Error() embeds the full probe URL,
-			// which can carry a path-embedded credential. Log the redacted
-			// endpoint and only the underlying cause, never the URL itself
-			// (N1).
-			logger.Warn("rosetta: protocol probe transport failure",
-				"auth", auth, "endpoint", displayEndpoint(endpoint), "err", probeCause(err))
-			continue
+			if status != http.StatusOK {
+				logger.Debug("rosetta: protocol probe non-200", "auth", auth, "status", status)
+				continue
+			}
+			if ok {
+				return proto, true, nil
+			}
+			logger.Debug("rosetta: protocol probe could not classify /models catalog", "auth", auth)
 		}
-		if status != http.StatusOK {
-			logger.Debug("rosetta: protocol probe non-200", "auth", auth, "status", status)
-			continue
-		}
-		if ok {
-			return proto, true, nil
-		}
-		logger.Debug("rosetta: protocol probe could not classify /models catalog", "auth", auth)
 	}
 	logger.Warn("rosetta: protocol undetermined, defaulting to OpenAI Chat", "endpoint", displayEndpoint(endpoint))
 	return ProtoOpenAIChat, false, nil
@@ -148,18 +156,17 @@ func classifyCatalog(r io.Reader) (Protocol, bool) {
 		if d, ok := dt.(json.Delim); !ok || d != '[' {
 			return "", false
 		}
-		if !dec.More() {
-			return "", false
-		}
-		var first map[string]json.RawMessage
-		if dec.Decode(&first) != nil {
-			return "", false
-		}
-		if v, ok := first["type"]; ok && string(v) == `"model"` {
-			return ProtoAnthropic, true
-		}
-		if v, ok := first["object"]; ok && string(v) == `"model"` {
-			return ProtoOpenAIChat, true
+		for dec.More() {
+			var entry map[string]json.RawMessage
+			if dec.Decode(&entry) != nil {
+				return "", false
+			}
+			if v, ok := entry["type"]; ok && string(v) == `"model"` {
+				return ProtoAnthropic, true
+			}
+			if v, ok := entry["object"]; ok && string(v) == `"model"` {
+				return ProtoOpenAIChat, true
+			}
 		}
 		return "", false
 	}
@@ -215,7 +222,7 @@ func DetectClient(ctx context.Context, opts ...Option) (*Client, error) {
 		ctx, cancel = context.WithTimeout(ctx, st.timeout)
 		defer cancel()
 	}
-	proto, _, err := detectByProbe(ctx, st.endpoint, st.apiKey, hc, st.logger)
+	proto, _, err := detectByProbe(ctx, st.endpoint, st.apiKey, hc, st.logger, st)
 	if err != nil {
 		return nil, fmt.Errorf("rosetta: detecting protocol for %s: %w", displayEndpoint(st.endpoint), err)
 	}

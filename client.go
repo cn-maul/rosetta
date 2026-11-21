@@ -28,19 +28,29 @@ type protocolProvider interface {
 // Client is a unified client for one endpoint+credential pair. It is safe
 // for concurrent use by multiple goroutines.
 type Client struct {
-	settings         *settings
-	http             *httpx.Client
-	provider         protocolProvider
-	registry         *Registry
-	modelsMu         sync.Mutex
-	modelsRefreshing bool
-	modelsDone       chan struct{}
-	modelsErr        error
+	settings     *settings
+	http         *httpx.Client
+	provider     protocolProvider
+	registry     *Registry
+	modelsMu     sync.Mutex
+	modelRefresh *modelRefresh
 	// unknownMu guards the short-TTL negative cache of model ids that were
 	// not found even after a remote refresh, so a serial batch of lookups
 	// for the same unknown id does not hammer /models 1:1 (G7).
 	unknownMu sync.Mutex
 	unknown   map[string]time.Time
+}
+
+type modelRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+func (c *Client) unaryContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.settings.timeout > 0 {
+		return context.WithTimeout(ctx, c.settings.timeout)
+	}
+	return ctx, func() {}
 }
 
 // buildSettings applies options and resolves protocol/endpoint defaults.
@@ -195,11 +205,17 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest) (*ChatResponse, err
 		ctx, cancel = context.WithTimeout(ctx, c.settings.timeout)
 		defer cancel()
 	}
+	ctx, observation := c.observeCall(ctx)
 	resp, err := c.provider.Chat(ctx, req)
 	if err != nil {
+		c.recordCall(req.Model, Usage{}, observation, err)
 		return nil, err
 	}
-	c.record(resp.Model, resp.Usage, resp.Usage.IsZero())
+	model := resp.Model
+	if model == "" {
+		model = req.Model
+	}
+	c.recordCall(model, resp.Usage, observation, nil)
 	return resp, nil
 }
 
@@ -214,6 +230,9 @@ func (c *Client) CountTokens(ctx context.Context, req *ChatRequest) (int, error)
 	tc, ok := c.provider.(tokenCounterProvider)
 	if !ok {
 		return 0, fmt.Errorf("%w: this protocol has no count_tokens endpoint; use Client.EstimateTokens or WithTokenCounter", ErrNotSupported)
+	}
+	if model, ok := c.registry.Lookup(req.Model); ok {
+		req.Model = model.ID
 	}
 	if c.settings.timeout > 0 {
 		var cancel context.CancelFunc
@@ -236,10 +255,12 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, erro
 	if err != nil {
 		return nil, err
 	}
+	ctx, observation := c.observeCall(ctx)
 	sctx, cancel := context.WithCancel(ctx)
 	stream, err := c.provider.StreamChat(sctx, req)
 	if err != nil {
 		cancel()
+		c.recordCall(req.Model, Usage{}, observation, err)
 		return nil, err
 	}
 	sc, ok := stream.(*streamCore)
@@ -260,7 +281,14 @@ func (c *Client) ChatStream(ctx context.Context, req *ChatRequest) (Stream, erro
 		// ordering argument (the model is what identifies the record). A
 		// caller-abandoned stream (Close before usage) is not a
 		// missing-usage response, so it is not counted as UsageMissing (G9).
-		c.record(sc.model(), u, err == nil && u.IsZero() && !sc.aborted())
+		if sc.aborted() && u.IsZero() {
+			return
+		}
+		model := sc.model()
+		if model == "" {
+			model = req.Model
+		}
+		c.recordCall(model, u, observation, err)
 	})
 	return stream, nil
 }
@@ -274,11 +302,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		ctx, cancel = context.WithTimeout(ctx, c.settings.timeout)
 		defer cancel()
 	}
-	infos, err := c.provider.ListModels(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.registry.SetRemote(infos); err != nil {
+	if err := c.refreshModels(ctx); err != nil {
 		return nil, err
 	}
 	return c.registry.List(), nil
@@ -292,24 +316,17 @@ func (c *Client) RefreshModels(ctx context.Context) ([]ModelInfo, error) {
 
 func (c *Client) refreshModels(ctx context.Context) error {
 	c.modelsMu.Lock()
-	if c.modelsRefreshing {
-		done := c.modelsDone
+	if refresh := c.modelRefresh; refresh != nil {
 		c.modelsMu.Unlock()
 		select {
-		case <-done:
-			// Waiters share the refresh outcome: a failed refresh must
-			// not read as success to whoever waited on it.
-			c.modelsMu.Lock()
-			err := c.modelsErr
-			c.modelsMu.Unlock()
-			return err
+		case <-refresh.done:
+			return refresh.err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	}
-	c.modelsRefreshing = true
-	c.modelsDone = make(chan struct{})
-	done := c.modelsDone
+	refresh := &modelRefresh{done: make(chan struct{})}
+	c.modelRefresh = refresh
 	c.modelsMu.Unlock()
 
 	infos, err := c.provider.ListModels(ctx)
@@ -317,9 +334,9 @@ func (c *Client) refreshModels(ctx context.Context) error {
 		err = c.registry.SetRemote(infos)
 	}
 	c.modelsMu.Lock()
-	c.modelsRefreshing = false
-	c.modelsErr = err
-	close(done)
+	c.modelRefresh = nil
+	refresh.err = err
+	close(refresh.done)
 	c.modelsMu.Unlock()
 	return err
 }
@@ -345,13 +362,11 @@ func (c *Client) ModelInfo(ctx context.Context, id string) (ModelInfo, error) {
 		}
 		// Route through refreshModels so concurrent unknown-model lookups
 		// share one /models request instead of stampeding the endpoint.
-		if err := c.refreshModels(ctx); err != nil {
-			c.settings.logger.Debug("rosetta: remote model discovery failed",
-				"model", id, "err", err.Error())
-		}
-		// After refresh, if the id is still unknown, remember it so the next
-		// lookup within the TTL skips the refresh.
+		err := c.refreshModels(ctx)
 		if _, ok := c.registry.Lookup(id); !ok {
+			if err != nil {
+				return ModelInfo{}, fmt.Errorf("rosetta: discovering model %q: %w", id, err)
+			}
 			c.rememberUnknown(id)
 		}
 	}
@@ -385,7 +400,18 @@ func (c *Client) rememberUnknown(id string) {
 	if c.unknown == nil {
 		c.unknown = make(map[string]time.Time)
 	}
-	c.unknown[id] = time.Now().Add(unknownModelCacheTTL)
+	now := time.Now()
+	if len(c.unknown) >= 1024 {
+		for key, expiry := range c.unknown {
+			if !now.Before(expiry) {
+				delete(c.unknown, key)
+			}
+		}
+		if len(c.unknown) >= 1024 {
+			return
+		}
+	}
+	c.unknown[id] = now.Add(unknownModelCacheTTL)
 }
 
 // prepare runs registry-backed request gating before dispatch. It first
@@ -445,20 +471,19 @@ type outputResolver interface {
 // checkContext compares the heuristic prompt estimate against the model's
 // context window. Default behavior is a warning; strict mode errors.
 func (c *Client) checkContext(req *ChatRequest) error {
+	out := c.effectiveMaxOutput(req)
+	if resolver, ok := c.provider.(outputResolver); ok {
+		out = resolver.resolvedMaxOutput(req)
+	}
+	return c.checkContextWithOutput(req, out)
+}
+
+func (c *Client) checkContextWithOutput(req *ChatRequest, out int) error {
 	mi, ok := c.registry.Lookup(req.Model)
 	if !ok || mi.ContextWindow <= 0 {
 		return nil
 	}
 	in := c.estimateInputTokens(req)
-	out := c.effectiveMaxOutput(req)
-	if out <= 0 {
-		// Zero is "let the provider decide", but on Anthropic the provider
-		// decides a concrete 4096 (or more), so the output side would
-		// otherwise never participate in the check on that protocol.
-		if r, ok := c.provider.(outputResolver); ok {
-			out = r.resolvedMaxOutput(req)
-		}
-	}
 	// Wrap-free overrun test: `in+out <= window` overflows to a negative when
 	// out is near MaxInt, wrongly reading a huge request as "fits" (audit B14).
 	if in > mi.ContextWindow || (out > 0 && out > mi.ContextWindow-in) {
@@ -485,19 +510,48 @@ func (c *Client) Stats() UsageSnapshot {
 	return c.settings.tracker.Snapshot()
 }
 
-// record feeds one usage observation to the tracker, if any. The model id
-// is normalized to its canonical form first so an alias request and its
-// full-name twin are accounted under one key instead of being split across
-// two (M2).
-// CallInfo carries per-call observability data the transport does not
-// otherwise expose. It is optional: record's variadic form keeps every
-// existing call site working.
+// CallInfo carries observability data for one logical request.
 type CallInfo struct {
 	Latency    time.Duration
 	Attempts   int
 	StatusCode int
 	RequestID  string
 	Err        error
+}
+
+type callObservationKey struct{}
+
+type callObservation struct {
+	started time.Time
+	info    CallInfo
+}
+
+func (c *Client) observeCall(ctx context.Context) (context.Context, *callObservation) {
+	if c.settings.tracker == nil {
+		return ctx, nil
+	}
+	observation := &callObservation{started: time.Now()}
+	return context.WithValue(ctx, callObservationKey{}, observation), observation
+}
+
+func (c *Client) recordCall(model string, usage Usage, observation *callObservation, err error) {
+	if observation == nil || observation.info.Attempts == 0 {
+		return
+	}
+	info := observation.info
+	info.Latency = time.Since(observation.started)
+	info.Err = err
+	c.record(model, usage, err == nil && usage.IsZero(), info)
+}
+
+func (c *Client) chatRetryPolicy() httpx.RetryPolicy {
+	if c.settings.quirks.NoIdempotencyKey {
+		return httpx.RetryNever
+	}
+	if c.settings.chatIdempotentRetries {
+		return httpx.RetryIdempotent
+	}
+	return httpx.RetryRejected
 }
 
 func (c *Client) record(model string, u Usage, missing bool, info ...CallInfo) {
@@ -557,6 +611,15 @@ func (c *Client) call(ctx context.Context, call *httpx.Call) (*http.Response, er
 	}
 	start := time.Now()
 	resp, err := c.http.Do(ctx, call)
+	if observation, ok := ctx.Value(callObservationKey{}).(*callObservation); ok {
+		observation.info.Attempts += call.Attempts
+		observation.info.StatusCode = 0
+		observation.info.RequestID = ""
+		if resp != nil {
+			observation.info.StatusCode = resp.StatusCode
+			observation.info.RequestID = requestID(resp.Header)
+		}
+	}
 	if h := c.settings.hooks.OnResponse; h != nil {
 		info := ResponseInfo{
 			Method:  call.Method,

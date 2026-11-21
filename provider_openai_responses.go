@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -126,10 +127,8 @@ func (p *openaiResponsesProvider) Chat(ctx context.Context, req *ChatRequest) (*
 			return nil, err
 		}
 		hdr := openAIHeaders(p.c, "application/json")
-		retry := httpx.RetryIdempotent
-		if p.c.settings.quirks.NoIdempotencyKey {
-			retry = httpx.RetryDefault
-		} else {
+		retry := p.c.chatRetryPolicy()
+		if !p.c.settings.quirks.NoIdempotencyKey {
 			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
@@ -171,10 +170,8 @@ func (p *openaiResponsesProvider) StreamChat(ctx context.Context, req *ChatReque
 			return nil, err
 		}
 		hdr := openAIHeaders(p.c, "text/event-stream")
-		retry := httpx.RetryIdempotent
-		if p.c.settings.quirks.NoIdempotencyKey {
-			retry = httpx.RetryDefault
-		} else {
+		retry := p.c.chatRetryPolicy()
+		if !p.c.settings.quirks.NoIdempotencyKey {
 			hdr.Set("Idempotency-Key", idempotencyKey(req))
 		}
 		call := &httpx.Call{
@@ -494,10 +491,25 @@ func (p *openaiResponsesProvider) encodeInput(req *ChatRequest) ([]map[string]an
 		case RoleTool:
 			for _, b := range m.Blocks {
 				if b.Type == BlockToolResult {
+					var output any = b.Content
+					if len(b.ResultBlocks) > 0 {
+						parts := make([]map[string]any, 0, len(b.ResultBlocks))
+						for _, part := range b.ResultBlocks {
+							switch part.Type {
+							case BlockText:
+								parts = append(parts, map[string]any{"type": "input_text", "text": part.Text})
+							case BlockImage:
+								parts = append(parts, map[string]any{"type": "input_image", "image_url": part.ImageURL, "detail": "auto"})
+							default:
+								return nil, fmt.Errorf("%w: unsupported Responses tool result type %s", ErrNotSupported, part.Type)
+							}
+						}
+						output = parts
+					}
 					items = append(items, map[string]any{
 						"type":    "function_call_output",
 						"call_id": b.ToolCallID,
-						"output":  b.Content,
+						"output":  output,
 					})
 				}
 			}
@@ -589,20 +601,20 @@ func encodeResponsesUser(m Message) (map[string]any, error) {
 func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requestID string) func() (*Event, error) {
 	sc := sse.New(body)
 	var (
-		stop        StopReason
-		usage       *Usage
-		ended       bool
-		truncated   bool
-		sawToolCall bool
-		// announced guards output_item.added vs output_item.done so a
-		// minimal emitter that skips the incremental events still has its
-		// finalized function_call delivered once.
-		announced     = map[int]bool{}
-		argDeltaSeen  = map[int]bool{}
-		textDeltaSeen = map[int]bool{}
+		stop         StopReason
+		usage        *Usage
+		ended        bool
+		truncated    bool
+		sawToolCall  bool
+		argDeltaSeen = map[int]bool{}
+		textSlots    = map[[2]int]int{}
+		toolComplete = map[int]bool{}
+		unknownDone  = map[int]bool{}
 		// toolIdxByID keys function-call events by item_id so argument
 		// deltas coalesce even when output_index is absent or reused.
-		toolIdxByID map[string]int
+		toolIdxByID      map[string]int
+		toolIDBySlot     = map[int]string{}
+		toolSlotByOutput = map[int]int{}
 		// nextToolIdx allocates a fresh unified index when an emitter omits
 		// output_index; lastToolIdx tracks the most recent call for orphan
 		// argument deltas.
@@ -622,7 +634,7 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 		return items.finalize(&cp, ev.OutputIndex)
 	}
 	malformed := func(what string) error {
-		return fmt.Errorf("rosetta: responses stream (%s %s): %s: %w", method, url, what, ErrUpstreamMalformed)
+		return fmt.Errorf("rosetta: responses stream (%s %s): malformed event: %s", method, url, what)
 	}
 	// queue holds events a terminating event contributed but that have not
 	// been delivered yet. It is drained before the single end event, so
@@ -647,49 +659,49 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 	resolveToolIdx := func(itemID string, outIdx *int) int {
 		if itemID != "" {
 			if i, ok := toolIdxByID[itemID]; ok {
+				if outIdx != nil {
+					toolSlotByOutput[*outIdx] = i
+				}
 				return i
 			}
 		}
 		idx := -1
 		if outIdx != nil {
-			idx = *outIdx
+			if slot, ok := toolSlotByOutput[*outIdx]; ok && (itemID == "" || toolIDBySlot[slot] == "") {
+				idx = slot
+			}
 		}
 		if idx == -1 {
 			idx = nextToolIdx
 			nextToolIdx++
-		} else if idx >= nextToolIdx {
-			nextToolIdx = idx + 1
+		}
+		if outIdx != nil {
+			toolSlotByOutput[*outIdx] = idx
 		}
 		if itemID != "" {
 			if toolIdxByID == nil {
 				toolIdxByID = map[string]int{}
 			}
 			toolIdxByID[itemID] = idx
+			toolIDBySlot[idx] = itemID
 		}
 		return idx
 	}
-	// deltaToolIdx maps an argument delta to its call. Deltas must attach to
-	// an already-announced call, so it never allocates: item_id first, then
-	// output_index, then the most recent call.
+	// A delta may arrive before its announcement. Preserve its slot so the
+	// announcement can fill the metadata without losing the fragment.
 	deltaToolIdx := func(itemID string, outIdx *int) int {
 		if itemID != "" {
 			if i, ok := toolIdxByID[itemID]; ok {
 				return i
 			}
 		}
-		if outIdx != nil {
-			if itemID != "" {
-				if toolIdxByID == nil {
-					toolIdxByID = map[string]int{}
-				}
-				toolIdxByID[itemID] = *outIdx
-			}
-			return *outIdx
+		if outIdx != nil || itemID != "" {
+			return resolveToolIdx(itemID, outIdx)
 		}
 		if lastToolIdx >= 0 {
 			return lastToolIdx
 		}
-		return 0
+		return resolveToolIdx("", nil)
 	}
 	endEvent := func() *Event {
 		// A completed turn that requested a tool call ends as tool_use, not
@@ -710,6 +722,78 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 			ev.Usage = usage
 		}
 		return ev
+	}
+	textPart := func(outputIndex, contentIndex int, text string, final bool) *Event {
+		key := [2]int{outputIndex, contentIndex}
+		slot, exists := textSlots[key]
+		if text == "" || (final && exists) {
+			return nil
+		}
+		if !exists {
+			slot = len(textSlots)
+			textSlots[key] = slot
+		}
+		return &Event{Type: EventTextDelta, Text: text, BlockIndex: slot, OutputIndex: &outputIndex, partIndex: contentIndex}
+	}
+	finalizeOutput := func(item *oaRespOutputItem, outputIndex *int, itemID string) error {
+		index := 0
+		if outputIndex != nil {
+			index = *outputIndex
+			if index < 0 {
+				return mapItemErr(errIndexNegative, method, url)
+			}
+		}
+		switch item.Type {
+		case "reasoning":
+			copy := *item
+			copy.eventID = itemID
+			events, err := finalizeItem(&copy, outputIndex)
+			if err != nil {
+				return mapItemErr(err, method, url)
+			}
+			enqueue(events...)
+		case "message", "refusal":
+			if item.Type == "refusal" {
+				if event := textPart(index, 0, item.Refusal, true); event != nil {
+					enqueue(event)
+				}
+			}
+			for partIndex, part := range item.Content {
+				text := part.Text
+				if part.Type == "refusal" {
+					text = part.Refusal
+				} else if part.Type != "output_text" {
+					continue
+				}
+				if event := textPart(index, partIndex, text, true); event != nil {
+					enqueue(event)
+				}
+			}
+		case "function_call":
+			id, err := idFrom(itemID, item.ID)
+			if err != nil {
+				return mapItemErr(err, method, url)
+			}
+			sawToolCall = true
+			toolIndex := resolveToolIdx(id, outputIndex)
+			if !toolComplete[toolIndex] {
+				toolComplete[toolIndex] = true
+				arguments := ""
+				if !argDeltaSeen[toolIndex] {
+					arguments = item.Arguments.Value
+				}
+				enqueue(&Event{Type: EventToolCall, ToolIndex: toolIndex, ToolID: item.CallID, ToolName: item.Name, ArgumentsDelta: arguments, OutputIndex: outputIndex})
+			}
+		default:
+			if p.c.settings.unknownEvents && len(item.raw) != 0 && !unknownDone[index] {
+				if len(unknownDone) >= maxStreamBlocks {
+					return ErrStreamOverflow
+				}
+				unknownDone[index] = true
+				enqueue(&Event{Type: EventUnknown, Raw: item.raw})
+			}
+		}
+		return nil
 	}
 	return func() (*Event, error) {
 		for {
@@ -789,14 +873,18 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				}
 				if ev.Item != nil && ev.Item.Type == "function_call" {
 					sawToolCall = true
-					idx := resolveToolIdx(ev.ItemID, ev.OutputIndex)
-					announced[idx] = true
+					id, err := idFrom(ev.ItemID, ev.Item.ID)
+					if err != nil {
+						return nil, mapItemErr(err, method, url)
+					}
+					idx := resolveToolIdx(id, ev.OutputIndex)
 					lastToolIdx = idx
 					return &Event{
-						Type:      EventToolCall,
-						ToolIndex: idx,
-						ToolID:    ev.Item.CallID,
-						ToolName:  ev.Item.Name,
+						Type:        EventToolCall,
+						ToolIndex:   idx,
+						ToolID:      ev.Item.CallID,
+						ToolName:    ev.Item.Name,
+						OutputIndex: ev.OutputIndex,
 					}, nil
 				}
 			case "response.output_item.done":
@@ -820,74 +908,37 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 						return ev, nil
 					}
 					continue
-				case "function_call":
-					sawToolCall = true
-					idx := resolveToolIdx(ev.ItemID, ev.OutputIndex)
-					if !announced[idx] {
-						announced[idx] = true
-						lastToolIdx = idx
-						return &Event{
-							Type:           EventToolCall,
-							ToolIndex:      idx,
-							ToolID:         ev.Item.CallID,
-							ToolName:       ev.Item.Name,
-							ArgumentsDelta: ev.Item.Arguments.Value,
-						}, nil
+				case "function_call", "message", "refusal":
+					if err := finalizeOutput(ev.Item, ev.OutputIndex, ev.ItemID); err != nil {
+						return nil, err
 					}
-					// Announced earlier but no argument delta ever arrived:
-					// fill in the finalized arguments (the block's args are
-					// still empty, so this completes rather than corrupts).
-					if !argDeltaSeen[idx] && ev.Item.Arguments.Value != "" {
-						return &Event{
-							Type:           EventToolCall,
-							ToolIndex:      idx,
-							ToolID:         ev.Item.CallID,
-							ToolName:       ev.Item.Name,
-							ArgumentsDelta: ev.Item.Arguments.Value,
-						}, nil
+					if event, ok := nextQueued(); ok {
+						return event, nil
 					}
-				case "message":
-					// A minimal emitter may finalize a message only here,
-					// with no output_text.delta events; surface its text so
-					// the reply is never lost.
-					ti := 0
-					if ev.OutputIndex != nil {
-						ti = *ev.OutputIndex
-					}
-					if !textDeltaSeen[ti] {
-						var sb strings.Builder
-						for _, part := range ev.Item.Content {
-							if part.Type == "output_text" && part.Text != "" {
-								if sb.Len() > 0 {
-									sb.WriteString("\n")
-								}
-								sb.WriteString(part.Text)
+				default:
+					if p.c.settings.unknownEvents {
+						if ev.OutputIndex != nil {
+							if len(unknownDone) >= maxStreamBlocks && !unknownDone[*ev.OutputIndex] {
+								return nil, ErrStreamOverflow
 							}
+							unknownDone[*ev.OutputIndex] = true
 						}
-						if sb.Len() > 0 {
-							return &Event{Type: EventTextDelta, Text: sb.String()}, nil
-						}
+						return &Event{Type: EventUnknown, Raw: bytes.Clone(data)}, nil
 					}
 				}
-			case "response.output_text.delta", "response.text.delta":
-				if ev.Delta != "" {
-					// Each message item is its own block: without an index a
-					//// second message item's text would fold into the first.
-					ti := 0
-					if ev.OutputIndex != nil {
-						ti = *ev.OutputIndex
-					}
-					textDeltaSeen[ti] = true
-					out := &Event{Type: EventTextDelta, Text: ev.Delta, BlockIndex: ti}
-					if ev.OutputIndex != nil {
-						idx := *ev.OutputIndex
-						out.OutputIndex = &idx
-					}
-					return out, nil
+			case "response.output_text.delta", "response.text.delta", "response.refusal.delta":
+				outputIndex, contentIndex := 0, 0
+				if ev.OutputIndex != nil {
+					outputIndex = *ev.OutputIndex
 				}
-			case "response.refusal.delta":
-				if ev.Delta != "" {
-					return &Event{Type: EventTextDelta, Text: ev.Delta}, nil
+				if ev.ContentIndex != nil {
+					contentIndex = *ev.ContentIndex
+				}
+				if outputIndex < 0 || contentIndex < 0 {
+					return nil, mapItemErr(errIndexNegative, method, url)
+				}
+				if event := textPart(outputIndex, contentIndex, ev.Delta, false); event != nil {
+					return event, nil
 				}
 			case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 				if ev.Delta != "" {
@@ -923,6 +974,7 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 				if ev.Delta != "" {
 					sawToolCall = true
 					idx := deltaToolIdx(ev.ItemID, ev.OutputIndex)
+					lastToolIdx = idx
 					argDeltaSeen[idx] = true
 					return &Event{
 						Type:           EventToolCall,
@@ -942,14 +994,9 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 					// before the end event rather than dropped.
 					for i := range ev.Response.Output {
 						item := &ev.Response.Output[i]
-						if item.Type != "reasoning" {
-							continue
+						if err := finalizeOutput(item, &i, ""); err != nil {
+							return nil, err
 						}
-						evs, ferr := finalizeItem(item, itemOutputIndex(&ev.Response.Output, i))
-						if ferr != nil {
-							return nil, mapItemErr(ferr, method, url)
-						}
-						enqueue(evs...)
 					}
 				}
 				if !ended {
@@ -971,14 +1018,9 @@ func (p *openaiResponsesProvider) streamEvents(body io.Reader, method, url, requ
 					stop = mapResponsesStop(ev.Response.Status, ev.Response.IncompleteReason())
 					for i := range ev.Response.Output {
 						item := &ev.Response.Output[i]
-						if item.Type != "reasoning" {
-							continue
+						if err := finalizeOutput(item, &i, ""); err != nil {
+							return nil, err
 						}
-						evs, ferr := finalizeItem(item, itemOutputIndex(&ev.Response.Output, i))
-						if ferr != nil {
-							return nil, mapItemErr(ferr, method, url)
-						}
-						enqueue(evs...)
 					}
 				}
 				if !ended {
@@ -1075,13 +1117,15 @@ type oaRespUsage struct {
 }
 
 func (u *oaRespUsage) toUsage() Usage {
-	total := u.TotalTokens.Value
+	input := max(u.InputTokens.Value, 0)
+	output := max(u.OutputTokens.Value, 0)
+	total := max(u.TotalTokens.Value, 0)
 	if total == 0 {
-		total = u.InputTokens.Value + u.OutputTokens.Value
+		total = saturatingAdd(input, output)
 	}
 	out := Usage{
-		InputTokens:  u.InputTokens.Value,
-		OutputTokens: u.OutputTokens.Value,
+		InputTokens:  input,
+		OutputTokens: output,
 		TotalTokens:  total,
 	}
 	if u.InputTokensDetails != nil {
@@ -1103,6 +1147,7 @@ func (u *oaRespUsage) toUsage() Usage {
 }
 
 type oaRespOutputItem struct {
+	raw  json.RawMessage
 	Type string `json:"type"`
 	ID   string `json:"id"` // reasoning items; replayed verbatim
 	// eventID is the enclosing event's item_id when it carried one. It is
@@ -1132,6 +1177,28 @@ type oaRespOutputItem struct {
 		Type string `json:"type"` // summary_text
 		Text string `json:"text"`
 	} `json:"summary"`
+}
+
+func (item *oaRespOutputItem) UnmarshalJSON(data []byte) error {
+	var discriminator struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(data, &discriminator); err != nil {
+		return err
+	}
+	switch discriminator.Type {
+	case "message", "refusal", "reasoning", "function_call":
+	default:
+		*item = oaRespOutputItem{Type: discriminator.Type, raw: bytes.Clone(data)}
+		return nil
+	}
+	type wireItem oaRespOutputItem
+	var decoded wireItem
+	if err := jsonv2.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*item = oaRespOutputItem(decoded)
+	return nil
 }
 
 type oaRespResponse struct {
@@ -1258,16 +1325,7 @@ func decodeResponsesResponse(body []byte, rc ...string) (*ChatResponse, error) {
 				Arguments:  item.Arguments.Value,
 			})
 		default:
-			// Server-side tool calls/results (web_search_call,
-			// code_interpreter_call, mcp_call, ...) and any future item
-			// type are preserved instead of skipped. Raw is reconstructed
-			// from the decoded item, so a gateway can forward it.
-			if raw, err := json.Marshal(item); err == nil {
-				out.Unknown = append(out.Unknown, Block{
-					Type: BlockType("unknown:" + item.Type),
-					Raw:  raw,
-				})
-			}
+			out.Unknown = append(out.Unknown, Block{Type: BlockType("unknown:" + item.Type), Raw: item.raw})
 		}
 	}
 	out.StopReason = mapResponsesStop(r.Status, r.IncompleteReason())
@@ -1309,8 +1367,6 @@ type itemRegistry struct {
 type respItem struct {
 	slot      int
 	id        string
-	order     int
-	orderSet  bool
 	indexBind map[int]bool // output indices claimed for this item
 
 	// partOut[channel][index] records that a part's text has already been
@@ -1544,15 +1600,6 @@ func (it *respItem) allPartsSeen(item *oaRespOutputItem, parts int) bool {
 	return true
 }
 
-// itemOutputIndex returns the position an item occupies in the terminating
-// output array. It is used as the fallback when no event named the index.
-func itemOutputIndex(output *[]oaRespOutputItem, i int) *int {
-	if output == nil {
-		return nil
-	}
-	return &[]int{i}[0]
-}
-
 // itemReadableText renders an item's readable summary text, joining parts
 // with a newline. The second return value reports how many parts carried
 // text, so callers can tell "no parts" from "parts, all empty".
@@ -1581,15 +1628,14 @@ func itemReadableText(item *oaRespOutputItem) (string, int) {
 }
 
 // mapItemErr reports a registry failure as a stream error. Identity
-// conflicts are upstream inconsistencies, so they fail the stream with
-// ErrUpstreamMalformed and the request context, leaving whatever has
-// already been accumulated in Partial.
+// conflicts fail the stream while preserving Partial and avoiding the
+// unary failover sentinel.
 func mapItemErr(err error, method, url string) error {
 	switch {
 	case errors.Is(err, errIDConflict), errors.Is(err, errIndexTaken),
 		errors.Is(err, errUnidentified), errors.Is(err, errSealConflict),
 		errors.Is(err, errIndexNegative):
-		return fmt.Errorf("rosetta: responses stream (%s %s): %s: %w", method, url, err, ErrUpstreamMalformed)
+		return fmt.Errorf("rosetta: responses stream (%s %s): malformed event: %w", method, url, err)
 	case errors.Is(err, errTooManyItems):
 		return fmt.Errorf("rosetta: responses stream (%s %s): %s: %w", method, url, err, ErrStreamOverflow)
 	}

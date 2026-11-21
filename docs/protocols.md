@@ -145,9 +145,10 @@ rosetta.WithQuirks(rosetta.Quirks{
 
 ## 重试策略
 
-- 触发条件：网络层错误（DNS/连接/TLS/读失败）与状态码 408 / 429 / 500 / 502 / 503 / 504 / 529。
+- GET 等幂等操作可对网络错误、408、429 和 5xx 重试。Chat、Embeddings 和 Rerank 默认只对 HTTP 429 重试。
 - 退避：`400ms × 2^n`（±20% 抖动，上限 8s）；`Retry-After` 头（秒数或 HTTP 日期）优先且只增不减。退避期间调用方 deadline 到期时，最后一次响应（若有）原样带回且 body 仍可读——调用方能看到 provider 的真实错误（如 429 body），而不是裸的 `context deadline exceeded`。
-- **chat POST（三协议）v0.6.0 起默认按幂等策略重试**：请求携带每逻辑请求随机生成的 `Idempotency-Key`（传输层重试复用同一 key，provider 可据此去重），429/503 走同样的退避。不识别该头或绝不能重放请求的网关用 `Quirks.NoIdempotencyKey` 恢复 v0.5.x 行为（不发头、429/503 立即报错）。
+- 三协议 Chat 都会为每个逻辑请求生成 `Idempotency-Key`。仅在上游保证按该键去重时使用 `WithChatIdempotentRetries(true)`，以恢复网络错误、408 和 5xx 后的自动重试。`Quirks.NoIdempotencyKey` 禁用该请求头和 Chat 传输重试。
+- POST 出现连接或响应体读取错误时，通过 `errors.Is(err, rosetta.ErrRequestOutcomeUnknown)` 判断执行结果是否不明。调用方的故障转移策略应考虑上游可能已经完成并计费。
 - 每次重试重建请求体（Body 函数重发），Header 逐次克隆；重试日志对 URL 脱敏（userinfo/query/fragment 剥离、路径内嵌凭据掩码），与错误字符串共用同一套凭据正则。
 - 流式请求仅在拿到 200 之前重试（状态码阶段）；已经开始消费响应体后的一切失败都通过 `Stream.Err()` / `Partial()` 交给调用方。
 - 跨主机重定向被默认守卫拒绝时是**永久错误**，立即返回、不消耗退避序列（每次重试的结果都相同，退避纯属浪费）。

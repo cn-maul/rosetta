@@ -20,7 +20,7 @@ cover:
 	go tool cover -func=coverage.out
 
 staticcheck:
-	go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 -checks=all ./...
+	go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 -checks=all ./...
 
 tidy:
 	go mod tidy -diff
@@ -30,6 +30,7 @@ tidy:
 # on purpose.
 work-test:
 	cd work/anthropic-stopseq-repro && go test ./...
+	cd work/anthropic-live-check && go test ./...
 
 # Live smoke against a real Anthropic-compatible endpoint. Needs
 # TIANTOKEN_KEY (and a reachable host in work/anthropic-live-check/main.go).

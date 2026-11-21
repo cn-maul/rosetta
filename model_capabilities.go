@@ -20,7 +20,16 @@ type rawModelEntry struct {
 	MaxInputTokens      int `json:"max_input_tokens"`
 	MaxCompletionTokens int `json:"max_completion_tokens"`
 	MaxOutputTokens     int `json:"max_output_tokens"`
-	TopProvider         struct {
+	MaxTokens           int `json:"max_tokens"`
+	Capabilities        struct {
+		Thinking *struct {
+			Supported *bool `json:"supported"`
+			Types     map[string]struct {
+				Supported bool `json:"supported"`
+			} `json:"types"`
+		} `json:"thinking"`
+	} `json:"capabilities"`
+	TopProvider struct {
 		ContextLength       int `json:"context_length"`
 		MaxCompletionTokens int `json:"max_completion_tokens"`
 	} `json:"top_provider"`
@@ -198,6 +207,23 @@ func parseModelCapabilities(raw json.RawMessage) ModelInfo {
 		// existing "levels imply thinking" invariant).
 		out.SupportsThinking = true
 		out.ThinkingReported = true
+	}
+	if out.MaxOutputTokens == 0 && e.MaxTokens > 0 {
+		out.MaxOutputTokens = e.MaxTokens
+	}
+	if thinking := e.Capabilities.Thinking; thinking != nil {
+		if thinking.Supported != nil {
+			out.ThinkingReported = true
+			out.SupportsThinking = *thinking.Supported
+		}
+		for _, mode := range []string{"adaptive", "enabled"} {
+			if thinking.Types[mode].Supported {
+				out.ThinkingModes = append(out.ThinkingModes, mode)
+			}
+		}
+		if len(out.ThinkingModes) > 0 {
+			out.ThinkingReported, out.SupportsThinking = true, true
+		}
 	}
 	return out
 }

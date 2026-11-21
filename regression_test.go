@@ -211,16 +211,23 @@ func TestRefreshModelsErrorPropagation(t *testing.T) {
 	})
 }
 
-// ModelInfo must surface ErrUnknownModel after a failed remote discovery,
-// never a stale success.
-func TestModelInfoUnknownAfterFailedRefresh(t *testing.T) {
+func TestModelInfoFailedRefreshIsNotCached(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
+		var calls atomic.Int32
 		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(404)
+			if calls.Add(1) == 1 {
+				w.WriteHeader(401)
+				return
+			}
+			_, _ = io.WriteString(w, `{"data":[{"id":"nope"}]}`)
 		}))
 		c := newTestClient(t, WithHTTPClient(srv.Client()))
-		if _, err := c.ModelInfo(context.Background(), "nope"); !errors.Is(err, ErrUnknownModel) {
-			t.Fatalf("err = %v, want ErrUnknownModel", err)
+		var apiErr *APIError
+		if _, err := c.ModelInfo(context.Background(), "nope"); !errors.As(err, &apiErr) || apiErr.StatusCode != 401 {
+			t.Fatalf("err = %v, want 401 APIError", err)
+		}
+		if model, err := c.ModelInfo(context.Background(), "nope"); err != nil || model.ID != "nope" {
+			t.Fatalf("retry model = %+v, err = %v", model, err)
 		}
 	})
 }

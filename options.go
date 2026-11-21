@@ -51,7 +51,7 @@ type Quirks struct {
 	// sends a usage chunk unprompted; otherwise stream usage is missing.
 	NoStreamUsage bool
 	// NoIdempotencyKey disables the Idempotency-Key header and the
-	// transport-level retry of chat POSTs (429/503) that this SDK enables by
+	// transport-level retry of chat POSTs (429) that this SDK enables by
 	// default. Set it for OpenAI-compatible gateways that reject or
 	// mishandle the header, or that must never receive a replayed request.
 	// Chat then reverts to the pre-v0.6.0 behavior: a 429/503 surfaces to
@@ -61,22 +61,23 @@ type Quirks struct {
 
 // settings carries all client configuration.
 type settings struct {
-	endpoint         string
-	apiKey           string
-	embedEndpoint    string
-	embedAPIKey      string
-	protocol         Protocol
-	protocolSet      bool // WithProtocol supplied explicitly (B12)
-	httpClient       *http.Client
-	timeout          time.Duration
-	streamIdle       time.Duration
-	maxRetries       int
-	retryBase        time.Duration
-	defaultMaxOutput int
-	tracker          UsageTracker
-	logger           *slog.Logger
-	thinkingFallback bool
-	thinkingRectify  bool
+	endpoint              string
+	apiKey                string
+	embedEndpoint         string
+	embedAPIKey           string
+	protocol              Protocol
+	protocolSet           bool // WithProtocol supplied explicitly (B12)
+	httpClient            *http.Client
+	timeout               time.Duration
+	streamIdle            time.Duration
+	maxRetries            int
+	chatIdempotentRetries bool
+	retryBase             time.Duration
+	defaultMaxOutput      int
+	tracker               UsageTracker
+	logger                *slog.Logger
+	thinkingFallback      bool
+	thinkingRectify       bool
 	// interleavedThinking is retained for API compatibility only: the
 	// interleaved-thinking beta went GA in Anthropic API 2026-10-21, so the
 	// value is no longer read by the adapter. WithInterleavedThinking still
@@ -320,6 +321,13 @@ func WithMaxRetries(n int) Option {
 			s.maxRetries = n
 		}
 	}
+}
+
+// WithChatIdempotentRetries enables retries after ambiguous failures for
+// Chat and ChatStream. Enable it only if the endpoint guarantees deduplication
+// using Idempotency-Key. Quirks.NoIdempotencyKey takes precedence.
+func WithChatIdempotentRetries(enabled bool) Option {
+	return func(s *settings) { s.chatIdempotentRetries = enabled }
 }
 
 // WithRetryBase sets the initial backoff duration (doubled per attempt,

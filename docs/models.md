@@ -47,8 +47,8 @@ models, err := client.ListModels(ctx)              // 拉取远端目录并返�
 models, err := client.RefreshModels(ctx)           // 同 ListModels（显式刷新语义）
 ```
 
-- `ListModels` 每次调用都拉取远端并写入注册表的 remote 层；`Chat`/`ChatStream` 的门控只用手动层，**不会**暗中发起网络请求。
-- `ModelInfo` 在手动层查不到时，会做一次 best-effort 的远端发现再查一次，仍无则返回 `ErrUnknownModel`。确认未知的 id 记 30 秒负缓存，期间重复查询不再打 `/models`（串行批量校验同一未知 id 不会放大流量）；TTL 过后下次查询重试发现。
+- `ListModels` 拉取完整目录并更新远端层。并发刷新共享同一轮请求。`Chat` 和 `ChatStream` 使用当前注册表快照。
+- `ModelInfo` 查不到本地记录时触发远端发现。发现失败时保留上游错误。成功刷新后仍查不到模型才返回 `ErrUnknownModel`，并写入有容量上限的 30 秒负缓存。
 
 ## 协议探测
 
@@ -61,7 +61,7 @@ client, err := rosetta.DetectClient(ctx,
 
 判定方式：主动探测 `GET /models`（先 Bearer 后 x-api-key），响应条目含 `type:"model"` → Anthropic，含 `object:"model"` → OpenAI；探测失败兜底 OpenAI Chat（兼容服务的最大公约数；需要 Responses 语义时用 `WithProtocol` 显式指定）。
 
-`DetectClient` 的探测尊重 `WithHTTPClient`（自定义传输/代理）与 `WithTimeout`（探测总时限）；单独调用 `DetectProtocol` 则使用内置的 10s 超时客户端。
+`DetectClient` 的探测应用 `WithHTTPClient`、`WithTimeout`、路径前缀、查询参数和自定义请求头。根地址沿用 `ListModels` 的 `/v1/models` 和 `/models` 候选路径。单独调用 `DetectProtocol` 使用内置的 10s 超时客户端。
 
 ## 能力门控
 

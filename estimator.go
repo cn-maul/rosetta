@@ -126,7 +126,19 @@ func (r *ChatRequest) estimateInputTokens(est MultimediaTokenEstimates, counters
 				addText(b.Arguments)
 				total += 16
 			case BlockToolResult:
-				addText(b.Content)
+				if len(b.ResultBlocks) == 0 {
+					addText(b.Content)
+				}
+				for _, part := range b.ResultBlocks {
+					switch part.Type {
+					case BlockText:
+						addText(part.Text)
+					case BlockImage:
+						total += est.Image
+					case BlockFile:
+						total += max(est.File, (base64TokenUnits(part.FileData)+3)/4)
+					}
+				}
 			}
 		}
 	}

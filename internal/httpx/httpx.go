@@ -43,6 +43,7 @@ const (
 	RetryIdempotent
 	// RetryAlways forces retries for any method.
 	RetryAlways
+	RetryRejected
 )
 
 // Call describes one HTTP request. Body is re-invoked on every retry
@@ -53,6 +54,7 @@ type Call struct {
 	Header      http.Header
 	Body        func() ([]byte, error) // nil for bodyless requests
 	RetryPolicy RetryPolicy
+	Attempts    int
 }
 
 // Client wraps *http.Client with bounded retries and exponential backoff.
@@ -139,6 +141,7 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 	// moment it arrives, because the retry path drains and closes the live one.
 	var kept *http.Response
 	for attempt := 0; ; attempt++ {
+		call.Attempts = attempt + 1
 		resp, err := c.attempt(ctx, call)
 		if err == nil && !RetryableStatus(resp.StatusCode) {
 			return resp, nil
@@ -146,19 +149,25 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 		if resp != nil && !errors.Is(err, ErrPermanent) {
 			// Remember this provider response before it is drained below, so
 			// a later attempt that dies on an expired ctx cannot erase it.
-			kept = storeKept(resp, kept)
+			kept = storeKept(resp)
+			if err == nil {
+				drain(resp)
+			}
 		}
 		// A permanent (non-network) failure - bad method/URL or a Body()
 		// that cannot serialize - will fail identically every time; never
 		// spend a retry on it.
-		if errors.Is(err, ErrPermanent) || !c.canRetry(call) || attempt >= c.MaxRetries || ctx.Err() != nil {
+		if errors.Is(err, ErrPermanent) || !c.canRetry(call, resp, err) || attempt >= c.MaxRetries || ctx.Err() != nil {
+			if err != nil && call.RetryPolicy == RetryRejected {
+				return resp, err
+			}
 			// Hand back the provider response we already hold: the ctx.Done
 			// branch of the backoff sleep below does the same for the same
 			// reason, and losing it here would replace a precise upstream
 			// error (429 with Retry-After, a classified APIError body) with an
 			// opaque context/transport error that no caller can act on.
 			if kept != nil {
-				return kept, err
+				return kept, nil
 			}
 			return resp, err
 		}
@@ -202,11 +211,6 @@ func (c *Client) Do(ctx context.Context, call *Call) (*http.Response, error) {
 			}
 			return nil, ctx.Err()
 		case <-timer.C:
-			// We are actually retrying: discard this attempt's body so its
-			// connection can be reused. Done after the sleep, not before.
-			if resp != nil {
-				drain(resp)
-			}
 		}
 	}
 }
@@ -221,7 +225,7 @@ const keptBodyLimit = 1 << 20
 // body is left in place so the existing drain() can still reuse the connection;
 // only a bounded prefix is copied into an in-memory body for the caller.
 // A newer response supersedes the previously kept one.
-func storeKept(resp *http.Response, prev *http.Response) *http.Response {
+func storeKept(resp *http.Response) *http.Response {
 	snapshot := *resp
 	buf, _ := io.ReadAll(io.LimitReader(resp.Body, keptBodyLimit))
 	snapshot.Body = io.NopCloser(bytes.NewReader(buf))
@@ -229,10 +233,12 @@ func storeKept(resp *http.Response, prev *http.Response) *http.Response {
 	return &snapshot
 }
 
-func (c *Client) canRetry(call *Call) bool {
+func (c *Client) canRetry(call *Call, resp *http.Response, err error) bool {
 	switch call.RetryPolicy {
 	case RetryNever:
 		return false
+	case RetryRejected:
+		return err == nil && resp != nil && resp.StatusCode == http.StatusTooManyRequests
 	case RetryAlways, RetryIdempotent:
 		return true
 	default:
@@ -263,6 +269,9 @@ func (c *Client) attempt(ctx context.Context, call *Call) (*http.Response, error
 	}
 	if call.Header != nil {
 		req.Header = call.Header.Clone()
+	}
+	if call.RetryPolicy == RetryRejected || call.RetryPolicy == RetryNever {
+		req.GetBody = nil
 	}
 	return c.HTTP.Do(req)
 }
